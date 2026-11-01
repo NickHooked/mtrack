@@ -37,6 +37,11 @@
   import type { TempoSection } from "../../lib/lighting/types";
   import { showConfirm } from "../../lib/dialog.svelte";
   import { registerDirtyGuard } from "../../lib/dirtyGuard";
+  import {
+    parseVideoConfig,
+    videoConfigError,
+  } from "../../lib/video/timeline-state";
+  import type { VideoConfig } from "../../lib/video/types";
   import { playbackStore } from "../../lib/ws/stores";
   import FileBrowser from "./FileBrowser.svelte";
   import FileUpload from "./FileUpload.svelte";
@@ -51,6 +56,7 @@
   import type { MidiEvent } from "../config/MidiEventEditor.svelte";
   import NotificationsSection from "../config/NotificationsSection.svelte";
   import type { NotifBrowseTarget } from "../config/NotificationsSection.svelte";
+  import VideoTimelineEditor from "../video/VideoTimelineEditor.svelte";
 
   interface TrackEntry {
     name: string;
@@ -69,6 +75,7 @@
       | "lighting"
       | "notifications"
       | "sections"
+      | "video"
       | "config";
   }
 
@@ -96,7 +103,13 @@
   let lightingEditorRef: SongLightingEditor | undefined = $state();
 
   // Tab state
-  type TabKey = "tracks" | "samples" | "sections" | "lighting" | "config";
+  type TabKey =
+    | "tracks"
+    | "samples"
+    | "sections"
+    | "lighting"
+    | "video"
+    | "config";
   function getInitialTab(): TabKey {
     // Redirect legacy tab names to their merged destinations
     if (initialTab === "midi") return "tracks";
@@ -122,6 +135,7 @@
     { key: "samples", labelKey: "songs.detail.tabs.samples" },
     { key: "sections", labelKey: "songs.detail.tabs.sections" },
     { key: "lighting", labelKey: "songs.detail.tabs.lighting" },
+    { key: "video", labelKey: "songs.detail.tabs.video" },
     { key: "config", labelKey: "songs.detail.tabs.config" },
   ];
 
@@ -160,6 +174,10 @@
 
   // Pilot hints state (the song.yaml `pilot:` block)
   let pilotConfig = $state<PilotConfig | null>(null);
+
+  // Lifted up so video edits survive tab switches and use the unified save.
+  let videoConfig = $state<VideoConfig | null>(null);
+  let videoValidationError = $state<string | null>(null);
 
   // Light shows with their own tempo maps — offered as import sources in
   // the timeline's base tempo marker dialog.
@@ -314,6 +332,10 @@
         const pilot = parsed.pilot;
         pilotConfig =
           pilot && typeof pilot === "object" ? (pilot as PilotConfig) : null;
+        videoConfig = parseVideoConfig(parsed.video);
+        videoValidationError = videoConfig
+          ? videoConfigError(videoConfig)
+          : null;
       }
     } catch {
       parsedConfig = null;
@@ -326,6 +348,8 @@
       tempoConfig = null;
       metronomeConfig = null;
       pilotConfig = null;
+      videoConfig = null;
+      videoValidationError = null;
     }
   }
 
@@ -371,6 +395,11 @@
       updated.pilot = pilotConfig;
     } else {
       delete updated.pilot;
+    }
+    if (videoConfig) {
+      updated.video = videoConfig;
+    } else {
+      delete updated.video;
     }
     if (Object.keys(songSamples).length > 0) {
       updated.samples = songSamples;
@@ -532,6 +561,15 @@
     editedYaml = buildYaml();
   }
 
+  function onVideoChange(video: VideoConfig) {
+    videoConfig = video;
+    editedYaml = buildYaml();
+  }
+
+  function onVideoValidityChange(validationError: string | null) {
+    videoValidationError = validationError;
+  }
+
   function onSampleBrowse(target: SampleBrowseTarget) {
     sampleBrowseTarget = target;
     browseTarget = { kind: "sample" };
@@ -548,6 +586,11 @@
   async function save() {
     if ($playbackStore.locked) {
       saveMsg = get(t)("common.locked");
+      saveOk = false;
+      return;
+    }
+    if (videoValidationError) {
+      saveMsg = videoValidationError;
       saveOk = false;
       return;
     }
@@ -805,6 +848,7 @@
     if (key === "tracks") return tracks.length > 0 || !!midiFile || !!midiEvent;
     if (key === "samples") return Object.keys(songSamples).length > 0;
     if (key === "lighting") return song?.has_lighting ?? false;
+    if (key === "video") return videoConfig !== null;
     if (key === "config")
       return configDirty || Object.keys(notificationAudio).length > 0;
     return false;
@@ -1194,6 +1238,14 @@
             onremovelightfile={removeLightingFile}
           />
         {/if}
+      {:else if activeTab === "video"}
+        <VideoTimelineEditor
+          video={videoConfig}
+          songDurationSeconds={(song?.duration_ms ?? 0) / 1000}
+          files={songFiles}
+          onchange={onVideoChange}
+          onvaliditychange={onVideoValidityChange}
+        />
       {:else if activeTab === "config"}
         <div class="config-section">
           <textarea

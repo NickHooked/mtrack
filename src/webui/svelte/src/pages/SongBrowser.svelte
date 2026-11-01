@@ -29,6 +29,7 @@
     "samples",
     "sections",
     "lighting",
+    "video",
     "notifications",
     "config",
   ];
@@ -59,6 +60,7 @@
         | "samples"
         | "sections"
         | "lighting"
+        | "video"
         | "notifications"
         | "config";
     }

@@ -490,6 +490,7 @@
   "songs.detail.tabs.tracks": "Tracks",
   "songs.detail.tabs.midi": "MIDI",
   "songs.detail.tabs.lighting": "Lighting",
+  "songs.detail.tabs.video": "Video",
   "songs.detail.tabs.notifications": "Notifications",
   "songs.detail.notificationHint": "Override profile-level notification sounds for this song only. Leave empty to use the profile defaults.",
   "songs.detail.tabs.config": "Config",
