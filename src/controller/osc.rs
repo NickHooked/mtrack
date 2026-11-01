@@ -341,7 +341,7 @@ impl Driver {
         let duration_string = format!(
             "{}/{}",
             util::duration_minutes_seconds(elapsed_duration),
-            util::duration_minutes_seconds(song.duration())
+            util::duration_minutes_seconds(song.length())
         );
         let playlist_songs: Vec<String> = playlist.songs().to_vec();
 
@@ -377,7 +377,7 @@ impl Driver {
         packets.push(build_timeline_packet(
             &osc_events.timeline,
             elapsed_duration.as_secs_f64(),
-            song.duration().as_secs_f64(),
+            song.length().as_secs_f64(),
             &section_timings,
         ));
 

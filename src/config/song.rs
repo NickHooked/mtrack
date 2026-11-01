@@ -26,6 +26,7 @@ use super::{
     samples::{SampleDefinition, SampleTrigger, SamplesConfig},
     tempo::TempoConfig,
     track::Track,
+    video::VideoConfig,
 };
 
 /// A YAML representation of a song.
@@ -76,6 +77,9 @@ pub struct Song {
     /// Per-song notification audio overrides.
     #[serde(default)]
     notification_audio: Option<SongNotificationConfig>,
+    /// The song's optional linear video timeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    video: Option<VideoConfig>,
 }
 
 /// A named section of a song defined by measure boundaries.
@@ -132,6 +136,7 @@ impl Song {
             metronome: None,
             pilot: None,
             notification_audio: None,
+            video: None,
         }
     }
 
@@ -309,6 +314,16 @@ impl Song {
             }
         }
 
+        if let Some(video) = &self.video {
+            if let Err(video_errors) = video.validate() {
+                errors.extend(
+                    video_errors
+                        .into_iter()
+                        .map(|error| format!("video: {error}")),
+                );
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -391,6 +406,11 @@ impl Song {
     /// Gets the per-song notification audio overrides.
     pub fn notification_audio(&self) -> Option<&SongNotificationConfig> {
         self.notification_audio.as_ref()
+    }
+
+    /// Gets the song's video timeline configuration.
+    pub fn video(&self) -> Option<&VideoConfig> {
+        self.video.as_ref()
     }
 
     /// Gets the song-specific samples configuration.
@@ -717,6 +737,7 @@ mod tests {
         assert_eq!(song.tracks().len(), 1);
         assert!(song.midi_playback().is_none());
         assert!(song.light_shows().is_none());
+        assert!(song.video().is_none());
     }
 
     #[test]
@@ -1128,5 +1149,60 @@ mod tests {
         .unwrap();
         let song = Song::deserialize(&path).unwrap();
         assert!(song.loop_playback());
+    }
+
+    #[test]
+    fn video_canvas_defaults_serialize_predictably() {
+        let yaml = r#"
+name: video only
+tracks: []
+video:
+  tracks: []
+"#;
+        let song: Song = config::Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        let canvas = song.video().unwrap().canvas();
+        assert_eq!(canvas.width(), 1920);
+        assert_eq!(canvas.height(), 1080);
+        assert_eq!(canvas.frame_rate(), 50.0);
+        assert_eq!(canvas.background(), "#000000");
+
+        let serialized = crate::util::to_yaml_string(&song).unwrap();
+        let documents = yaml_rust2::YamlLoader::load_from_str(&serialized).unwrap();
+        let video = &documents[0]["video"];
+        let canvas = &video["canvas"];
+        assert_eq!(canvas["width"].as_i64(), Some(1920));
+        assert_eq!(canvas["height"].as_i64(), Some(1080));
+        assert_eq!(canvas["frame_rate"].as_f64(), Some(50.0));
+        assert_eq!(canvas["background"].as_str(), Some("#000000"));
+        assert_eq!(video["tracks"].as_vec().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn song_validation_includes_video_errors() {
+        let yaml = r#"
+name: invalid video
+tracks: []
+video:
+  tracks:
+    - name: screen
+      clips:
+        - { id: clip, start: 0.0, duration: 0.0, file: clip.mp4 }
+"#;
+        let song: Song = config::Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert!(song
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("video:") && error.contains("duration")));
     }
 }

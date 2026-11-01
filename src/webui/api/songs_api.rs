@@ -71,7 +71,7 @@ pub(super) async fn get_songs(State(state): State<WebUiState>) -> impl IntoRespo
 
             json!({
                 "name": song.name(),
-                "duration_ms": song.duration().as_millis() as u64,
+                "duration_ms": song.length().as_millis() as u64,
                 "duration_display": song.duration_string(),
                 "num_channels": song.num_channels(),
                 "sample_format": format!("{}", song.sample_format()),
@@ -178,7 +178,7 @@ pub(super) async fn get_song(
                         StatusCode::OK,
                         Json(json!({
                             "name": song.name(),
-                            "duration_ms": song.duration().as_millis() as u64,
+                            "duration_ms": song.length().as_millis() as u64,
                             "duration_display": song.duration_string(),
                             "num_channels": song.num_channels(),
                             "sample_format": format!("{}", song.sample_format()),
@@ -1098,6 +1098,58 @@ mod test {
         let songs = parsed["songs"].as_array().unwrap();
         assert_eq!(songs.len(), 1);
         assert_eq!(songs[0]["name"], "Song A");
+    }
+
+    #[tokio::test]
+    async fn get_songs_reports_video_only_timeline_length() {
+        let (state, _dir) = test_state();
+        let song_dir = state.songs_path.join("VideoOnly");
+        std::fs::create_dir(&song_dir).unwrap();
+        std::fs::write(song_dir.join("visual.mp4"), b"video placeholder").unwrap();
+        std::fs::write(
+            song_dir.join("song.yaml"),
+            r#"name: Video Only
+tracks: []
+video:
+  tracks:
+    - name: screen
+      clips:
+        - id: visual
+          start: 2.5
+          duration: 7.0
+          file: visual.mp4
+"#,
+        )
+        .unwrap();
+
+        state.player.reload_songs(
+            &state.songs_path,
+            state.playlists_dir.as_deref(),
+            state.legacy_playlist_path.as_deref(),
+        );
+
+        let response = router()
+            .with_state(state)
+            .oneshot(
+                http::Request::builder()
+                    .uri("/songs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_body(response).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let song = parsed["songs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|song| song["name"] == "Video Only")
+            .unwrap();
+        assert_eq!(song["duration_ms"], 9_500);
+        assert_eq!(song["duration_display"], "0:09");
     }
 
     #[tokio::test]

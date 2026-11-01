@@ -35,6 +35,7 @@ mod tempo;
 mod track;
 mod trackmappings;
 pub mod trigger;
+pub mod video;
 
 pub use self::audio::{Audio, ResamplerType, StreamBufferSize};
 pub use self::controller::Controller;
@@ -78,6 +79,7 @@ pub use self::statusevents::StatusEvents;
 pub use self::store::ConfigStore;
 pub use self::tempo::{parse_time_signature, TempoChangeConfig, TempoConfig, TransitionConfig};
 pub use self::track::Track;
+pub use self::video::VideoConfig;
 
 mod kind;
 pub use self::kind::{peek_kind, ConfigKind};

@@ -77,7 +77,7 @@ impl App {
                 .unwrap_or_default(),
             current_song_duration: current
                 .as_ref()
-                .map(|s| s.duration())
+                .map(|s| s.length())
                 .unwrap_or(std::time::Duration::ZERO),
             current_song_tracks: current
                 .as_ref()
@@ -208,16 +208,21 @@ mod tests {
 
     /// Creates a test Player with no hardware devices.
     fn test_player(song_names: &[&str]) -> Arc<Player> {
-        let mut map = HashMap::new();
-        for name in song_names {
-            map.insert(
-                name.to_string(),
-                Arc::new(Song::new_for_test(name, &["track1"])),
-            );
-        }
+        let songs = song_names
+            .iter()
+            .map(|name| Arc::new(Song::new_for_test(name, &["track1"])))
+            .collect();
+        test_player_with_songs(songs)
+    }
+
+    fn test_player_with_songs(songs: Vec<Arc<Song>>) -> Arc<Player> {
+        let song_names: Vec<String> = songs.iter().map(|song| song.name().to_string()).collect();
+        let map = songs
+            .into_iter()
+            .map(|song| (song.name().to_string(), song))
+            .collect();
         let songs = Arc::new(Songs::new(map));
-        let playlist_config =
-            config::Playlist::new(&song_names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let playlist_config = config::Playlist::new(&song_names);
         let pl = playlist::Playlist::new("test", &playlist_config, songs.clone()).unwrap();
         let devices = PlayerDevices {
             audio: None,
@@ -330,6 +335,33 @@ mod tests {
 
     mod app_new_tests {
         use super::*;
+
+        #[test]
+        fn initializes_video_only_song_with_timeline_length() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("visual.mp4"), b"video placeholder").unwrap();
+            let config_path = dir.path().join("song.yaml");
+            std::fs::write(
+                &config_path,
+                r#"name: Video Only
+tracks: []
+video:
+  tracks:
+    - name: screen
+      clips:
+        - { id: visual, start: 2.5, duration: 7.0, file: visual.mp4 }
+"#,
+            )
+            .unwrap();
+            let config = config::Song::deserialize(&config_path).unwrap();
+            let song = Arc::new(Song::new(dir.path(), &config).unwrap());
+            let player = test_player_with_songs(vec![song]);
+            let (_state_tx, state_rx) = watch::channel(Arc::new(StateSnapshot::default()));
+
+            let app = App::new(player, state_rx);
+
+            assert_eq!(app.current_song_duration, Duration::from_secs_f64(9.5));
+        }
 
         #[test]
         fn initializes_playlist_name() {

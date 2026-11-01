@@ -173,6 +173,10 @@ pub struct Song {
     sections: Vec<config::Section>,
     /// Per-song notification audio overrides.
     notification_audio: Option<config::SongNotificationConfig>,
+    /// The optional video timeline, retained for browser-side playback.
+    video: Option<config::VideoConfig>,
+    /// Last configured video clip end on the song timeline.
+    video_end: Duration,
 }
 
 /// A simple sample for songs. Boils down to i32 or f32, which we can be reasonably assured that
@@ -261,6 +265,78 @@ impl Song {
             None => Vec::new(),
         };
 
+        let video = config.video().cloned();
+        let video_end = match &video {
+            Some(video) => {
+                video.validate().map_err(|errors| {
+                    format!(
+                        "song {:?}: invalid video timeline: {}",
+                        config.name(),
+                        errors.join("; ")
+                    )
+                })?;
+                let video_root = start_path.canonicalize().map_err(|error| {
+                    format!(
+                        "song {:?}: cannot resolve song directory {}: {}",
+                        config.name(),
+                        start_path.display(),
+                        error
+                    )
+                })?;
+                let mut video_end = Duration::ZERO;
+                for track in video.tracks() {
+                    for clip in track.clips() {
+                        let file = start_path.join(clip.file());
+                        let canonical_file = file.canonicalize().map_err(|error| {
+                            format!(
+                                "song {:?} video track {:?} clip {:?}: file {} does not exist or cannot be resolved: {}",
+                                config.name(),
+                                track.name(),
+                                clip.id(),
+                                file.display(),
+                                error
+                            )
+                        })?;
+                        if !canonical_file.starts_with(&video_root) {
+                            return Err(format!(
+                                "song {:?} video track {:?} clip {:?}: file {} resolves outside song directory {}",
+                                config.name(),
+                                track.name(),
+                                clip.id(),
+                                file.display(),
+                                video_root.display()
+                            )
+                            .into());
+                        }
+                        if !canonical_file.is_file() {
+                            return Err(format!(
+                                "song {:?} video track {:?} clip {:?}: file {} is not a regular file",
+                                config.name(),
+                                track.name(),
+                                clip.id(),
+                                canonical_file.display()
+                            )
+                            .into());
+                        }
+                        let clip_end = Duration::try_from_secs_f64(clip.end()).map_err(|error| {
+                            format!(
+                                "song {:?} video track {:?} clip {:?}: video end cannot be represented: {}",
+                                config.name(),
+                                track.name(),
+                                clip.id(),
+                                error
+                            )
+                        })?;
+                        video_end = video_end.max(clip_end);
+                    }
+                }
+                video_end
+            }
+            None => Duration::ZERO,
+        };
+
+        let lighting_end = lighting_end(&dsl_lighting_shows);
+
         let pilot_hints = match config.pilot() {
             Some(pilot) => Self::resolve_pilot_hints(pilot, beat_grid.as_ref(), start_path)
                 .map_err(|e| format!("song {}: {}", config.name(), e))?,
@@ -274,7 +350,7 @@ impl Song {
             midi_event: config.midi_event()?,
             midi_playback,
             light_shows,
-            lighting_end: lighting_end(&dsl_lighting_shows),
+            lighting_end,
             dsl_lighting_shows,
             num_channels,
             sample_rate,
@@ -290,6 +366,8 @@ impl Song {
             loop_playback: config.loop_playback(),
             sections: config.sections().to_vec(),
             notification_audio: config.notification_audio().cloned(),
+            video,
+            video_end,
         })
     }
 
@@ -618,16 +696,15 @@ impl Song {
         self.duration
     }
 
-    /// How long the song plays: its audio's duration, or, for a song with no
-    /// audio, when its last lighting effect ends — which is when the DMX
-    /// engine ends such a song. This is what a progress bar and a seek
-    /// bound want; the audio pipeline keeps sizing itself by [`Self::duration`].
+    /// How long the song plays across all configured timeline media.
+    /// Lighting determines the end only when there is no audio; video may
+    /// extend either kind of song.
     pub fn length(&self) -> Duration {
-        if self.duration.is_zero() {
+        self.video_end.max(if self.duration.is_zero() {
             self.lighting_end
         } else {
             self.duration
-        }
+        })
     }
 
     /// Gets the number of channels.
@@ -739,6 +816,11 @@ impl Song {
         self.notification_audio.as_ref()
     }
 
+    /// Gets the song's video timeline configuration, if configured.
+    pub fn video(&self) -> Option<&config::VideoConfig> {
+        self.video.as_ref()
+    }
+
     /// Resolves a named section to absolute time bounds using the beat grid.
     /// Returns `None` if no beat grid, section not found, or measures out of range.
     /// Times are returned as `(start_time, end_time)` in Duration.
@@ -813,9 +895,9 @@ impl Song {
         })
     }
 
-    /// Returns the duration string in minutes and seconds.
+    /// Returns the presentation timeline length in minutes and seconds.
     pub fn duration_string(&self) -> String {
-        let secs = self.duration.as_secs();
+        let secs = self.length().as_secs();
         format!("{}:{:02}", secs / 60, secs % 60)
     }
 
@@ -993,7 +1075,7 @@ impl Song {
 
     /// Returns a proto version of the song.
     pub fn to_proto(&self) -> Result<player::v1::Song, std::io::Error> {
-        let duration = match prost_types::Duration::try_from(self.duration) {
+        let duration = match prost_types::Duration::try_from(self.length()) {
             Ok(duration) => duration,
             Err(e) => return Err(std::io::Error::other(e.to_string())),
         };
@@ -1087,6 +1169,8 @@ impl Default for Song {
             loop_playback: false,
             sections: Vec::new(),
             notification_audio: None,
+            video: None,
+            video_end: Duration::ZERO,
         }
     }
 }
@@ -1724,6 +1808,7 @@ mod test {
         error::Error,
         fs, io,
         path::{Path, PathBuf},
+        time::Duration,
     };
 
     use thiserror::Error;
@@ -1732,6 +1817,150 @@ mod test {
         songs::{get_all_songs, initialize_songs},
         testutil::write_wav,
     };
+
+    #[test]
+    fn video_only_song_uses_configured_clip_end_without_decoding_video() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("visual.mp4"),
+            b"not an audio or video stream",
+        )
+        .unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            r#"name: Video Only
+tracks: []
+video:
+  tracks:
+    - name: screen
+      clips:
+        - id: visual
+          start: 2.5
+          duration: 7.0
+          file: visual.mp4
+"#,
+        )
+        .unwrap();
+
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+        let song = super::Song::new(dir.path(), &config).unwrap();
+
+        assert_eq!(song.duration(), Duration::ZERO);
+        assert_eq!(song.length(), Duration::from_secs_f64(9.5));
+        assert_eq!(song.duration_string(), "0:09");
+        let proto_duration = song.to_proto().unwrap().duration.unwrap();
+        assert_eq!(proto_duration.seconds, 9);
+        assert_eq!(proto_duration.nanos, 500_000_000);
+        let video = song.video().unwrap();
+        assert_eq!(video.tracks()[0].name(), "screen");
+        assert_eq!(video.tracks()[0].clips()[0].file(), "visual.mp4");
+    }
+
+    #[test]
+    fn rejects_video_end_too_large_for_duration_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("huge.mp4"), b"video placeholder").unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            r#"name: Huge Timeline
+tracks: []
+video:
+  tracks:
+    - name: screen
+      clips:
+        - id: huge
+          start: 1.0e300
+          duration: 1.0
+          file: huge.mp4
+"#,
+        )
+        .unwrap();
+
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+        let error = super::Song::new(dir.path(), &config)
+            .err()
+            .expect("an unrepresentable video end must fail")
+            .to_string();
+        for expected in ["Huge Timeline", "screen", "huge", "video end"] {
+            assert!(
+                error.contains(expected),
+                "missing {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_video_symlink_that_escapes_song_directory() {
+        let song_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("outside.mp4");
+        fs::write(&outside_file, b"outside video").unwrap();
+        std::os::unix::fs::symlink(&outside_file, song_dir.path().join("escape.mp4")).unwrap();
+        let config_path = song_dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            r#"name: Symlink Escape
+tracks: []
+video:
+  tracks:
+    - name: screen
+      clips:
+        - id: escape
+          start: 0.0
+          duration: 1.0
+          file: escape.mp4
+"#,
+        )
+        .unwrap();
+
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+        let error = super::Song::new(song_dir.path(), &config)
+            .err()
+            .expect("a symlink outside the song directory must fail")
+            .to_string();
+        for expected in ["Symlink Escape", "screen", "escape", "outside"] {
+            assert!(
+                error.contains(expected),
+                "missing {expected:?} in {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_video_file_identifies_song_track_and_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            r#"name: Missing Visual
+tracks: []
+video:
+  tracks:
+    - name: projector
+      clips:
+        - id: intro
+          start: 0.0
+          duration: 1.0
+          file: absent.mp4
+"#,
+        )
+        .unwrap();
+
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+        let error = super::Song::new(dir.path(), &config)
+            .err()
+            .expect("missing video must fail")
+            .to_string();
+        for expected in ["Missing Visual", "projector", "intro", "absent.mp4"] {
+            assert!(
+                error.contains(expected),
+                "missing {expected:?} in {error:?}"
+            );
+        }
+    }
 
     fn count_songs(path: &Path) -> Result<usize, TestError> {
         let songs = get_all_songs(path)?;
@@ -4064,6 +4293,43 @@ pilot:
         let proto = song.to_proto().unwrap();
         assert_eq!(proto.sections[0].start_beat, None);
         assert_eq!(proto.sections[0].end_beat, None);
+    }
+
+    #[test]
+    fn lighting_does_not_extend_a_song_with_audio() {
+        let song = super::Song {
+            duration: Duration::from_secs(10),
+            lighting_end: Duration::from_secs(20),
+            ..Default::default()
+        };
+
+        assert_eq!(song.duration(), Duration::from_secs(10));
+        assert_eq!(song.length(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn video_extends_a_song_with_shorter_audio() {
+        let song = super::Song {
+            duration: Duration::from_secs(10),
+            lighting_end: Duration::from_secs(30),
+            video_end: Duration::from_secs(20),
+            ..Default::default()
+        };
+
+        assert_eq!(song.duration(), Duration::from_secs(10));
+        assert_eq!(song.length(), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn video_extends_a_song_with_no_audio_beyond_lighting() {
+        let song = super::Song {
+            lighting_end: Duration::from_secs(10),
+            video_end: Duration::from_secs(20),
+            ..Default::default()
+        };
+
+        assert_eq!(song.duration(), Duration::ZERO);
+        assert_eq!(song.length(), Duration::from_secs(20));
     }
 
     /// A song with no audio is as long as its lighting: the last effect's
