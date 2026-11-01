@@ -40,7 +40,7 @@ jobs:
     - name: Build frontend
       run: make build-ui
     - name: Build mtrack
-      run: cargo build --all-targets --all-features
+      run: cargo build --all-targets
     - name: Check if Cargo.lock is up to date
       run: |
         if git diff --exit-code Cargo.lock; then
@@ -74,8 +74,8 @@ jobs:
         restore-keys: node-modules-${{ runner.os }}-
     - name: Build frontend
       run: make build-ui
-    - name: Run clippy
-      run: make lint-rust
+    - name: Run audio-only clippy
+      run: cargo clippy --all --all-targets --no-default-features
 
   # Make sure the code is properly formatted.
   rustfmt-check:
@@ -133,12 +133,36 @@ jobs:
       with:
         tool: cargo-tarpaulin
     - name: Test mtrack
-      run: cargo tarpaulin --skip-clean --all-features --timeout 120 --out xml
+      run: cargo tarpaulin --skip-clean --timeout 120 --out xml
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v7
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: mdwn/mtrack
+
+  # Exercise the optional backend separately so ordinary audio-only jobs do not
+  # install or link GStreamer.
+  video:
+    name: Video feature build and tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install system and GStreamer dependencies
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "cargo-video"
+    - name: Build all video targets
+      run: cargo build --all-targets --features video
+    - name: Lint video feature
+      run: cargo clippy --all --all-targets --features video
+    - name: Test video diagnostics and engine
+      run: |
+        cargo test --features video video
+        cargo test --features video --test video_engine
 
   # Installs the Debian package and checks what its maintainer scripts did.
   #
@@ -174,6 +198,8 @@ jobs:
     - uses: taiki-e/install-action@v2
       with:
         tool: cargo-deb
+    - name: Validate setup and package metadata
+      run: make test-packaging-metadata
     - name: Build and test the Debian package
       run: make test-deb
 

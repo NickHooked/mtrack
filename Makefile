@@ -15,7 +15,7 @@ ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SVELTE_DIR := $(ROOT_DIR)/src/webui/svelte
 DOCS_DIR := $(ROOT_DIR)/docs
 
-.PHONY: all setup setup-dev build gen-proto install-ui build-ui build-rust test test-ui test-systemd deb test-deb test-pi-image lint lint-ui lint-rust lint-shell fmt fmt-ui fmt-rust check fmt-ui-check fmt-rust-check clean dev-ui docs docs-serve docs-clean
+.PHONY: all setup setup-dev setup-video build build-video gen-proto install-ui build-ui build-rust test test-ui test-systemd deb deb-video test-packaging-metadata test-deb test-pi-image lint lint-ui lint-rust lint-shell fmt fmt-ui fmt-rust check fmt-ui-check fmt-rust-check clean dev-ui docs docs-serve docs-clean
 
 all: build
 
@@ -26,6 +26,10 @@ setup:
 ## Install system build + development dependencies
 setup-dev:
 	./setup.sh --dev
+
+## Install build dependencies including optional GStreamer video support
+setup-video:
+	./setup.sh --video
 
 ## Build everything
 build: build-ui build-rust
@@ -56,6 +60,10 @@ build-ui:
 build-rust:
 	cargo build --release --manifest-path $(ROOT_DIR)/Cargo.toml
 
+## Build mtrack with the optional GStreamer video backend
+build-video: build-ui
+	cargo build --release --features video --manifest-path $(ROOT_DIR)/Cargo.toml
+
 ## Run all tests
 test: test-ui
 	cargo test --manifest-path $(ROOT_DIR)/Cargo.toml
@@ -67,6 +75,14 @@ test-ui:
 ## Build the Debian package (expects a binary at target/release/mtrack)
 deb:
 	cargo deb --no-build --no-strip
+
+## Build a video-enabled Debian package (run make build-video first)
+deb-video:
+	cargo deb --variant video --no-build --no-strip
+
+## Check setup selection and base/video Debian metadata without installing
+test-packaging-metadata:
+	$(ROOT_DIR)/tests/packaging/metadata.sh
 
 ## Directory the package test builds in. Deliberately not the normal target/:
 ## the test stages a debug binary where cargo-deb expects a release one, and
@@ -144,7 +160,7 @@ lint-shell:
 
 ## Lint the Rust code
 lint-rust:
-	cargo clippy --manifest-path $(ROOT_DIR)/Cargo.toml --all --all-targets --all-features
+	cargo clippy --manifest-path $(ROOT_DIR)/Cargo.toml --all --all-targets --no-default-features
 
 ## Format everything
 fmt: fmt-ui fmt-rust

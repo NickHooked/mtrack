@@ -17,22 +17,30 @@
 # Usage:
 #   ./setup.sh          Install build dependencies only
 #   ./setup.sh --dev    Install build + development dependencies
+#   ./setup.sh --video  Also install GStreamer video build/runtime dependencies
 #   ./setup.sh --yes    Skip confirmation prompts
+#   ./setup.sh --dry-run Print selected commands without changing the system
 
 set -euo pipefail
 
 DEV=false
+VIDEO=false
 YES=false
+DRY_RUN=false
 
 for arg in "$@"; do
   case "$arg" in
     --dev) DEV=true ;;
+    --video) VIDEO=true ;;
     --yes|-y) YES=true ;;
+    --dry-run) DRY_RUN=true ;;
     --help|-h)
-      echo "Usage: $0 [--dev] [--yes]"
+      echo "Usage: $0 [--dev] [--video] [--yes] [--dry-run]"
       echo ""
       echo "  --dev   Install development tools (buf, cargo-tarpaulin, licensure, mdbook)"
+      echo "  --video Install optional GStreamer video build/runtime dependencies"
       echo "  --yes   Skip confirmation prompts"
+      echo "  --dry-run Print selected commands without changing the system"
       exit 0
       ;;
     *)
@@ -43,8 +51,18 @@ for arg in "$@"; do
   esac
 done
 
+run_command() {
+  if [ "$DRY_RUN" = true ]; then
+    printf 'DRY RUN:'
+    printf ' %s' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
 confirm() {
-  if [ "$YES" = true ]; then
+  if [ "$YES" = true ] || [ "$DRY_RUN" = true ]; then
     return 0
   fi
   echo ""
@@ -95,9 +113,21 @@ install_build_deps_debian() {
     libssl-dev
     protobuf-compiler
   )
+  if [ "$VIDEO" = true ]; then
+    pkgs+=(
+      libgstreamer1.0-dev
+      libgstreamer-plugins-base1.0-dev
+      gstreamer1.0-tools
+      gstreamer1.0-plugins-base
+      gstreamer1.0-plugins-good
+      gstreamer1.0-plugins-bad
+      gstreamer1.0-libav
+    )
+    echo "Including optional GStreamer video build/runtime packages."
+  fi
   confirm "Will install (apt): ${pkgs[*]}"
-  sudo apt-get update
-  sudo apt-get install -y "${pkgs[@]}"
+  run_command sudo apt-get update
+  run_command sudo apt-get install -y "${pkgs[@]}"
 }
 
 install_build_deps_fedora() {
@@ -109,8 +139,20 @@ install_build_deps_fedora() {
     openssl-devel
     protobuf-compiler
   )
+  if [ "$VIDEO" = true ]; then
+    pkgs+=(
+      gstreamer1-devel
+      gstreamer1-plugins-base-devel
+      gstreamer1-plugins-base
+      gstreamer1-plugins-good
+      gstreamer1-plugins-bad-free
+      gstreamer1-libav
+      gstreamer1-tools
+    )
+    echo "Including optional GStreamer video build/runtime packages."
+  fi
   confirm "Will install (dnf): ${pkgs[*]}"
-  sudo dnf install -y "${pkgs[@]}"
+  run_command sudo dnf install -y "${pkgs[@]}"
 }
 
 install_build_deps_arch() {
@@ -122,8 +164,12 @@ install_build_deps_arch() {
     openssl
     protobuf
   )
+  if [ "$VIDEO" = true ]; then
+    pkgs+=(gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav)
+    echo "Including optional GStreamer video build/runtime packages."
+  fi
   confirm "Will install (pacman): ${pkgs[*]}"
-  sudo pacman -S --needed --noconfirm "${pkgs[@]}"
+  run_command sudo pacman -S --needed --noconfirm "${pkgs[@]}"
 }
 
 install_build_deps_macos() {
@@ -137,8 +183,12 @@ install_build_deps_macos() {
     protobuf
     node
   )
+  if [ "$VIDEO" = true ]; then
+    pkgs+=(gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav)
+    echo "Including optional GStreamer video build/runtime packages."
+  fi
   confirm "Will install (brew): ${pkgs[*]}"
-  brew install "${pkgs[@]}"
+  run_command brew install "${pkgs[@]}"
 }
 
 # --- Dev dependencies ---
@@ -157,7 +207,7 @@ install_dev_deps() {
   # buf (protobuf code generation for frontend)
   if ! command -v buf &>/dev/null; then
     confirm "Will install buf via npm (global)"
-    npm install -g @bufbuild/buf
+    run_command npm install -g @bufbuild/buf
   else
     echo "buf $(buf --version) found."
   fi
@@ -185,13 +235,18 @@ install_dev_deps() {
 
   if [ ${#cargo_tools[@]} -gt 0 ]; then
     confirm "Will run: cargo install ${cargo_tools[*]}"
-    cargo install "${cargo_tools[@]}"
+    run_command cargo install "${cargo_tools[@]}"
   fi
 }
 
 # --- Rust toolchain ---
 
 check_rust() {
+  if [ "$DRY_RUN" = true ]; then
+    echo "DRY RUN: rustup component add clippy rustfmt"
+    return
+  fi
+
   if ! command -v rustup &>/dev/null; then
     echo ""
     echo "Rust toolchain not found. Install via: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
@@ -220,6 +275,10 @@ case "$OS" in
     echo "  - libudev development headers (Linux only)"
     echo "  - OpenSSL development headers"
     echo "  - protobuf compiler (protoc)"
+    if [ "$VIDEO" = true ]; then
+      echo "  - GStreamer development files, tools, and base/good/bad/libav plugins"
+      echo "    (the good plugin set must provide v4l2src on Linux)"
+    fi
     exit 1
     ;;
 esac
@@ -231,4 +290,8 @@ if [ "$DEV" = true ]; then
 fi
 
 echo ""
-echo "Setup complete! Run 'make build' to build mtrack."
+if [ "$VIDEO" = true ]; then
+  echo "Setup complete! Run 'cargo build --release --features video' to build video support."
+else
+  echo "Setup complete! Run 'make build' to build mtrack (without optional video support)."
+fi

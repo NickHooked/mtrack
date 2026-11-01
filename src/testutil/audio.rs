@@ -44,7 +44,7 @@ pub fn write_wav_with_bits<S: hound::Sample + Copy + 'static>(
     };
 
     let num_channels = samples.len();
-    assert!(num_channels <= u16::MAX.into(), "Too many channels!");
+    assert!(num_channels <= usize::from(u16::MAX), "Too many channels!");
     let mut writer = WavWriter::new(
         tempwav,
         WavSpec {

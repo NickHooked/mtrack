@@ -30,6 +30,9 @@ pub(super) async fn get_status(State(state): State<WebUiState>) -> impl IntoResp
         },
         "hardware": hardware,
         "controllers": controllers,
+        "capabilities": {
+            "video_preview": cfg!(feature = "video"),
+        },
         "locked": state.player.is_locked(),
     }))
 }
@@ -110,6 +113,10 @@ mod test {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
         // Build info is present.
+        assert_eq!(
+            parsed["capabilities"]["video_preview"],
+            cfg!(feature = "video")
+        );
         assert!(parsed["build"]["version"].is_string());
         assert!(parsed["build"]["git_hash"].is_string());
         assert!(parsed["build"]["build_time"].is_string());

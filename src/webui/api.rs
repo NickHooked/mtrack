@@ -109,6 +109,10 @@ pub fn router() -> Router<WebUiState> {
         )
         .route("/songs/{name}/waveform", get(songs_api::get_song_waveform))
         .route(
+            "/songs/{name}/video-preview/ws",
+            get(super::video_preview::ws_handler),
+        )
+        .route(
             "/songs/{name}/tempo-guess",
             get(songs_api::get_song_tempo_guess),
         )

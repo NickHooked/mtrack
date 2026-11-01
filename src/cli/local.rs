@@ -130,6 +130,43 @@ fn annotate_write(target: crate::util::WriteTarget<'_>, error: std::io::Error) -
     message.into()
 }
 
+#[cfg(feature = "video")]
+fn check_video_startup(
+    video_needed: bool,
+    diagnose: impl FnOnce() -> crate::video::gstreamer::GstreamerDiagnostics,
+) -> Result<Option<crate::video::gstreamer::GstreamerDiagnostics>, Box<dyn Error>> {
+    if !video_needed {
+        return Ok(None);
+    }
+    let report = diagnose();
+    if report.ready {
+        Ok(Some(report))
+    } else {
+        Err(report.actionable_error("configured song video").into())
+    }
+}
+
+#[cfg(feature = "video")]
+fn diagnose_configured_video(songs: &songs::Songs) -> Result<(), Box<dyn Error>> {
+    let video_needed = songs.list().iter().any(|song| {
+        song.video()
+            .is_some_and(|video| video.tracks().iter().any(|track| !track.clips().is_empty()))
+    });
+    if let Some(report) = check_video_startup(video_needed, || {
+        crate::video::gstreamer::diagnostics(
+            crate::video::gstreamer::DiagnosticRequest::file_preview(),
+        )
+    })? {
+        info!(
+            version = report.version.as_deref().unwrap_or("unknown"),
+            target_os = report.target_os,
+            target_arch = report.target_arch,
+            "GStreamer video diagnostics passed for configured song video"
+        );
+    }
+    Ok(())
+}
+
 pub async fn start(
     path: &str,
     playlist_path: Option<String>,
@@ -217,6 +254,8 @@ pub async fn start(
 
     let default_metronome = player_config.metronome().is_some_and(|m| m.enabled);
     let songs = songs::get_all_songs_with_defaults(&songs_path, default_metronome)?;
+    #[cfg(feature = "video")]
+    diagnose_configured_video(&songs)?;
 
     // Resolve playlists directory from config, defaulting to {config_dir}/playlists/.
     let playlists_dir = player_config
@@ -946,6 +985,60 @@ mod import_gdtf_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "video")]
+    mod video_startup_diagnostics_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn report(ready: bool) -> crate::video::gstreamer::GstreamerDiagnostics {
+            use crate::video::gstreamer::{
+                ElementGroup, ElementGroupDiagnostics, GstreamerDiagnostics,
+            };
+            GstreamerDiagnostics {
+                initialized: true,
+                initialization_error: None,
+                version: Some("1.24.2".to_string()),
+                feature: "video",
+                target_os: "linux",
+                target_arch: "x86_64",
+                groups: vec![ElementGroupDiagnostics {
+                    group: ElementGroup::FilePreview,
+                    required: true,
+                    available: Vec::new(),
+                    missing: (!ready)
+                        .then(|| "uridecodebin3".to_string())
+                        .into_iter()
+                        .collect(),
+                }],
+                ready,
+                jpeg_backend: "Rust image crate",
+            }
+        }
+
+        #[test]
+        fn audio_only_startup_does_not_invoke_gstreamer_diagnostics() {
+            let calls = AtomicUsize::new(0);
+
+            let result = check_video_startup(false, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                report(true)
+            });
+
+            assert!(result.unwrap().is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn video_configured_startup_reports_actionable_backend_error() {
+            let error = check_video_startup(true, || report(false)).unwrap_err();
+            let message = error.to_string();
+
+            assert!(message.contains("configured song video"), "{message}");
+            assert!(message.contains("uridecodebin3"), "{message}");
+            assert!(message.contains("sudo apt-get install"), "{message}");
+        }
+    }
 
     mod resolve_thread_priority_tests {
         use super::*;

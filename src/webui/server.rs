@@ -38,6 +38,11 @@ use crate::state::StateSnapshot;
 
 use super::state as ws_state;
 
+fn process_video_preview_permit() -> Arc<tokio::sync::Semaphore> {
+    static PERMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    Arc::clone(PERMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))))
+}
+
 #[derive(Embed)]
 #[folder = "src/webui/svelte/dist/"]
 #[allow_missing = true]
@@ -85,6 +90,9 @@ pub struct WebUiState {
     /// Active calibration session (at most one at a time).
     pub(crate) calibration:
         Arc<parking_lot::Mutex<Option<super::api::devices::CalibrationSession>>>,
+    /// Process-wide single editor video-preview session permit.
+    #[cfg_attr(not(feature = "video"), allow(dead_code))]
+    pub(crate) video_preview_permit: Arc<tokio::sync::Semaphore>,
 }
 
 /// Canonicalizes a path, falling back to the original if canonicalization fails
@@ -120,6 +128,7 @@ impl WebUiState {
             profiles_dir: params.profiles_dir.map(canonicalize_or_keep),
             waveform_cache: params.waveform_cache,
             calibration: Arc::new(parking_lot::Mutex::new(None)),
+            video_preview_permit: process_video_preview_permit(),
         }
     }
 }
@@ -782,6 +791,460 @@ mod test {
         let (state, _dir) = test_webui_state();
         let result = start(state, "not-an-ip".to_string(), 0).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(not(feature = "video"))]
+    #[tokio::test]
+    async fn video_preview_websocket_explicitly_reports_disabled_build() {
+        use futures_util::StreamExt;
+
+        let (handle, _, _dir) = start_test_server().await;
+        let ws_url = format!(
+            "ws://{}/api/songs/Song%20A/video-preview/ws",
+            handle.local_addr()
+        );
+        let (socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        let (_, mut read) = socket.split();
+        let message = read.next().await.unwrap().unwrap().into_text().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["state"], "disabled");
+        assert!(response["error"].as_str().unwrap().contains("disabled"));
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(video_preview_global)]
+    async fn video_preview_websocket_streams_frame_and_releases_on_disconnect() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::{collections::HashMap, process::Command};
+
+        let song_dir = tempfile::tempdir().unwrap();
+        let media = song_dir.path().join("clip.mkv");
+        let status = Command::new("timeout")
+            .args([
+                "10s",
+                "gst-launch-1.0",
+                "-q",
+                "videotestsrc",
+                "pattern=blue",
+                "num-buffers=8",
+                "!",
+                "video/x-raw,format=RGBA,width=4,height=4,framerate=4/1",
+                "!",
+                "videoconvert",
+                "!",
+                "avenc_ffv1",
+                "!",
+                "matroskamux",
+                "!",
+                "filesink",
+                &format!("location={}", media.display()),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let song_config = crate::config::Song::new(
+            "Preview Song",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            HashMap::new(),
+            Vec::new(),
+        );
+        let song = Arc::new(crate::songs::Song::new(song_dir.path(), &song_config).unwrap());
+        let mut songs = HashMap::new();
+        songs.insert("Preview Song".to_string(), song);
+        let (state, _state_dir) = super::super::api::test_helpers::test_state_with_registry(
+            Arc::new(crate::songs::Songs::new(songs)),
+        );
+        let observed_state = state.clone();
+        let handle = start(state, "127.0.0.1".to_string(), 0).await.unwrap();
+        let ws_url = format!(
+            "ws://{}/api/songs/Preview%20Song/video-preview/ws",
+            handle.local_addr()
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            r##"{"type":"start","request_id":"ws-1","config":{"canvas":{"width":4,"height":4,"frame_rate":4,"background":"#000000"},"tracks":[{"name":"screen","clips":[{"id":"clip","start":0,"duration":2,"file":"clip.mkv"}]}]},"position_ms":250,"autoplay":false}"##.into()
+        )).await.unwrap();
+
+        let mut got_frame = false;
+        let mut got_paused = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(got_frame && got_paused) {
+            let message = tokio::time::timeout_at(deadline, socket.next())
+                .await
+                .expect("timed out waiting for preview output")
+                .unwrap()
+                .unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(frame) => {
+                    let header = super::super::video_preview::decode_frame_message(&frame).unwrap();
+                    assert_eq!(header.epoch, 1);
+                    assert_eq!(header.position_ms, 250);
+                    assert!(header.jpeg.starts_with(&[0xff, 0xd8]));
+                    got_frame = true;
+                }
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(value["type"], "error", "{value}");
+                    got_paused |= value["state"] == "paused";
+                }
+                _ => {}
+            }
+        }
+        socket.close(None).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while observed_state.video_preview_permit.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("preview permit was not released after disconnect");
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(video_preview_global)]
+    async fn video_preview_pipelined_lifecycle_commands_do_not_deadlock_admission() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::collections::HashSet;
+
+        let (handle, _, _dir) = start_test_server().await;
+        let ws_url = format!(
+            "ws://{}/api/songs/Song%20A/video-preview/ws",
+            handle.local_addr()
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        const COMMANDS: usize = 40;
+
+        for request_id in 0..COMMANDS {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    format!(r#"{{"type":"play","request_id":"pipeline-{request_id}"}}"#).into(),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut correlated = HashSet::new();
+        while correlated.len() < COMMANDS {
+            let message = tokio::time::timeout_at(deadline, socket.next())
+                .await
+                .expect("pipelined command admission deadlocked")
+                .expect("preview socket closed before all commands completed")
+                .unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let request_id = value["request_id"].as_str().unwrap();
+                assert_eq!(value["type"], "error", "unexpected response: {value}");
+                assert_eq!(value["state"], "stopped", "unexpected response: {value}");
+                correlated.insert(request_id.to_string());
+            }
+        }
+        assert_eq!(correlated.len(), COMMANDS);
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(video_preview_global)]
+    async fn active_player_excludes_preview_start_play_and_seek_but_allows_pause_and_stop() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let song_dir = tempfile::tempdir().unwrap();
+        crate::testutil::write_wav(
+            song_dir.path().join("long.wav"),
+            vec![vec![0.0_f32; 80_000]],
+            8_000,
+        )
+        .unwrap();
+        let song_config = crate::config::Song::new(
+            "Playing Song",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![crate::config::Track::new(
+                "audio".to_string(),
+                "long.wav",
+                None,
+            )],
+            HashMap::new(),
+            Vec::new(),
+        );
+        let song = Arc::new(crate::songs::Song::new(song_dir.path(), &song_config).unwrap());
+        let songs = Arc::new(crate::songs::Songs::new(HashMap::from([(
+            "Playing Song".to_string(),
+            song,
+        )])));
+        let (mut state, _state_dir) =
+            super::super::api::test_helpers::test_state_with_registry(songs.clone());
+        let audio = Arc::new(crate::audio::mock::Device::get("preview-playing"));
+        let devices = PlayerDevices {
+            audio: Some(audio.clone()),
+            mappings: Some(Arc::new(HashMap::from([("audio".to_string(), vec![1])]))),
+            midi: None,
+            dmx_engine: None,
+            sample_engine: None,
+            trigger_engine: None,
+        };
+        let mut playlists = HashMap::new();
+        playlists.insert(
+            "all_songs".to_string(),
+            playlist::from_songs(songs).unwrap(),
+        );
+        state.player = Arc::new(
+            crate::player::Player::new_with_devices(
+                devices,
+                playlists,
+                "all_songs".to_string(),
+                None,
+            )
+            .unwrap(),
+        );
+        let player = state.player.clone();
+        let handle = start(state, "127.0.0.1".to_string(), 0).await.unwrap();
+        let ws_url = format!(
+            "ws://{}/api/songs/Playing%20Song/video-preview/ws",
+            handle.local_addr()
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r##"{"type":"start","request_id":"paused-start","config":{"canvas":{"width":4,"height":4,"frame_rate":4,"background":"#000000"},"tracks":[]},"position_ms":37,"autoplay":false}"##.into(),
+            ))
+            .await
+            .unwrap();
+        let paused = loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+                .await
+                .expect("paused preview timed out")
+                .expect("preview socket closed")
+                .unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["request_id"] == "paused-start" {
+                    break value;
+                }
+            }
+        };
+        assert_eq!(paused["state"], "paused");
+        assert_eq!(paused["epoch"], 1);
+        assert_eq!(paused["position_ms"], 37);
+
+        player.play().await.unwrap();
+        let active_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !audio.is_playing() && std::time::Instant::now() < active_deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(audio.is_playing(), "mock audio device never became active");
+        assert!(player.is_playing().await);
+
+        for (command, expected_position) in [
+            (
+                r##"{"type":"start","request_id":"blocked-start","config":{"canvas":{"width":4,"height":4,"frame_rate":4,"background":"#000000"},"tracks":[]},"position_ms":88,"autoplay":false}"##,
+                88,
+            ),
+            (r#"{"type":"play","request_id":"blocked-play"}"#, 37),
+            (
+                r#"{"type":"seek","request_id":"blocked-seek","position_ms":99}"#,
+                37,
+            ),
+        ] {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    command.into(),
+                ))
+                .await
+                .unwrap();
+            let response: serde_json::Value = loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    break serde_json::from_str(&text).unwrap();
+                }
+            };
+            assert_eq!(response["type"], "error");
+            assert_eq!(response["epoch"], 1);
+            assert_eq!(response["state"], "paused");
+            assert_eq!(response["position_ms"], expected_position);
+            assert!(response["error"]
+                .as_str()
+                .unwrap()
+                .contains("player is playing"));
+            assert!(player.is_playing().await);
+            assert!(audio.is_playing());
+        }
+
+        for (command, request_id, expected_state) in [
+            (
+                r#"{"type":"pause","request_id":"allowed-pause"}"#,
+                "allowed-pause",
+                "paused",
+            ),
+            (
+                r#"{"type":"stop","request_id":"allowed-stop"}"#,
+                "allowed-stop",
+                "stopped",
+            ),
+        ] {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    command.into(),
+                ))
+                .await
+                .unwrap();
+            let response: serde_json::Value = loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    break serde_json::from_str(&text).unwrap();
+                }
+            };
+            assert_eq!(response["type"], "state", "{response}");
+            assert_eq!(response["request_id"], request_id);
+            assert_eq!(response["state"], expected_state);
+            assert!(player.is_playing().await);
+            assert!(audio.is_playing());
+        }
+        player.stop().await.unwrap();
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test]
+    #[serial_test::serial(video_preview_global)]
+    async fn video_preview_reports_malformed_and_invalid_start_with_request_ids() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (handle, _, _dir) = start_test_server().await;
+        let ws_url = format!(
+            "ws://{}/api/songs/Song%20A/video-preview/ws",
+            handle.local_addr()
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r#"{"type":"play"}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let malformed: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(malformed["type"], "error");
+        assert_eq!(malformed["request_id"], "protocol");
+        assert!(malformed["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid video preview command"));
+
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                r##"{"type":"start","request_id":"invalid-start","config":{"canvas":{"width":0,"height":4,"frame_rate":4,"background":"#000000"},"tracks":[]},"position_ms":77,"autoplay":false}"##.into(),
+            ))
+            .await
+            .unwrap();
+        let invalid: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(invalid["type"], "error");
+        assert_eq!(invalid["request_id"], "invalid-start");
+        assert_eq!(invalid["position_ms"], 77);
+        assert!(invalid["error"].as_str().unwrap().contains("width"));
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test]
+    #[serial_test::serial(video_preview_global)]
+    async fn video_preview_transport_responses_keep_each_request_id() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (handle, _, _dir) = start_test_server().await;
+        let ws_url = format!(
+            "ws://{}/api/songs/Song%20A/video-preview/ws",
+            handle.local_addr()
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+        let commands = [
+            (r#"{"type":"play","request_id":"play-id"}"#, "play-id"),
+            (r#"{"type":"pause","request_id":"pause-id"}"#, "pause-id"),
+            (
+                r#"{"type":"seek","request_id":"seek-id","position_ms":321}"#,
+                "seek-id",
+            ),
+            (r#"{"type":"stop","request_id":"stop-id"}"#, "stop-id"),
+        ];
+
+        for (command, request_id) in commands {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    command.into(),
+                ))
+                .await
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(
+                &tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .into_text()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(response["request_id"], request_id, "{response}");
+            if request_id == "stop-id" {
+                assert_eq!(response["type"], "state");
+                assert_eq!(response["state"], "stopped");
+            } else {
+                assert_eq!(response["type"], "error");
+                assert!(response["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("has not been started"));
+            }
+        }
+    }
+
+    #[cfg(feature = "video")]
+    #[tokio::test]
+    #[serial_test::serial(video_preview_global)]
+    async fn second_video_preview_websocket_reports_busy() {
+        use futures_util::StreamExt;
+
+        let (handle, _, _dir) = start_test_server().await;
+        let ws_url = format!(
+            "ws://{}/api/songs/Song%20A/video-preview/ws",
+            handle.local_addr()
+        );
+        let (_first, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+        let (second, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
+        let (_, mut read) = second.split();
+        let message = read.next().await.unwrap().unwrap().into_text().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&message).unwrap();
+
+        assert_eq!(response["type"], "error");
+        assert_eq!(response["state"], "busy");
     }
 
     #[tokio::test]

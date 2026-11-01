@@ -71,7 +71,9 @@
 </script>
 
 {#if songName}
-  <SongDetail {songName} {initialTab} />
+  {#key songName}
+    <SongDetail {songName} {initialTab} />
+  {/key}
 {:else}
   <SongList
     initialSearch={savedSearch}

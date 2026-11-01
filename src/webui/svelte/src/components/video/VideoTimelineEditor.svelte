@@ -15,25 +15,31 @@
     videoEnd,
   } from "../../lib/video/timeline-state";
   import VideoPropertiesPanel from "./VideoPropertiesPanel.svelte";
+  import VideoPreview from "./VideoPreview.svelte";
   import VideoTrackLane from "./VideoTrackLane.svelte";
 
   interface Props {
     video: VideoConfig | null;
+    songName: string;
     songDurationSeconds?: number;
     files?: SongFile[];
+    previewAvailable?: boolean | null;
+    selectedClipId?: string | null;
     onchange?: (video: VideoConfig) => void;
     onvaliditychange?: (error: string | null) => void;
   }
 
   let {
     video,
+    songName,
     songDurationSeconds = 0,
     files = [],
+    previewAvailable = null,
+    selectedClipId = $bindable(null),
     onchange,
     onvaliditychange,
   }: Props = $props();
 
-  let selectedClipId = $state<string | null>(null);
   let error = $state("");
   let pixelsPerSecond = $state(10);
   let addTrackIndex = $state(0);
@@ -41,6 +47,7 @@
   let addStart = $state(0);
   let addDuration = $state(10);
   let addSourceIn = $state(0);
+  let previewStale = $state(false);
 
   let config = $derived(video ?? createVideoConfig());
   let validationError = $derived(videoConfigError(config));
@@ -79,6 +86,7 @@
 
   function emit(next: VideoConfig) {
     error = "";
+    previewStale = true;
     onchange?.(next);
   }
 
@@ -205,6 +213,15 @@
 </script>
 
 <div class="video-editor" data-testid="video-timeline-editor">
+  <VideoPreview
+    {songName}
+    {config}
+    durationMs={songDurationSeconds * 1000}
+    stale={previewStale}
+    available={previewAvailable}
+    onreloaded={() => (previewStale = false)}
+  />
+
   <div class="toolbar">
     <div>
       <strong>Video timeline</strong>
@@ -356,6 +373,7 @@
 <style>
   .video-editor {
     display: flex;
+    min-width: 0;
     flex-direction: column;
     gap: 12px;
   }
@@ -474,6 +492,15 @@
       grid-template-columns: repeat(3, minmax(120px, 1fr));
     }
     .file-control {
+      grid-column: span 2;
+    }
+  }
+  @media (max-width: 600px) {
+    .add-panel {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .file-control,
+    .add-panel button {
       grid-column: span 2;
     }
   }

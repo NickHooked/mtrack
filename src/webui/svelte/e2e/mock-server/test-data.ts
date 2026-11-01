@@ -184,6 +184,8 @@ export const STATUS = {
   controllers: [
     { kind: "osc", status: "running", detail: "0.0.0.0:9000", error: null },
   ],
+  capabilities: { video_preview: true },
+  locked: false,
 };
 
 export const AUDIO_DEVICES = [

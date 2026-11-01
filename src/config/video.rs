@@ -19,6 +19,21 @@ use serde::{Deserialize, Serialize};
 /// (for example, `0.1 + 0.2`) do not create a spurious overlap.
 const TIMELINE_EPSILON_SECONDS: f64 = 1.0e-9;
 
+/// Lowest supported canvas frame rate. This keeps the milliframes-per-second
+/// GStreamer fraction numerator non-zero and limits one frame period to 1,000s.
+pub const MIN_FRAME_RATE: f64 = 0.001;
+/// Highest supported canvas frame rate. This covers common high-frame-rate
+/// video while keeping preview scheduling and resource use bounded.
+pub const MAX_FRAME_RATE: f64 = 240.0;
+/// Largest supported canvas dimension. This bounds compositor allocations.
+pub const MAX_CANVAS_DIMENSION: u32 = 4096;
+/// Largest supported canvas area (DCI 4K: 4096 by 2160 pixels).
+pub const MAX_CANVAS_PIXELS: u64 = 8_847_360;
+/// Maximum number of composited timeline tracks.
+pub const MAX_VIDEO_TRACKS: usize = 32;
+/// Maximum number of clips across all tracks.
+pub const MAX_VIDEO_CLIPS: usize = 512;
+
 /// A song's linear video timeline.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct VideoConfig {
@@ -41,6 +56,35 @@ impl VideoConfig {
         &self.tracks
     }
 
+    /// Replaces clip file names with already validated canonical paths.
+    ///
+    /// This is crate-private because absolute paths are not part of the song
+    /// file format; the preview service uses it to bind validation and use to
+    /// the same filesystem targets.
+    #[cfg(feature = "video")]
+    pub(crate) fn replace_clip_files(&mut self, files: Vec<String>) -> Result<(), String> {
+        let expected = self
+            .tracks
+            .iter()
+            .map(|track| track.clips.len())
+            .sum::<usize>();
+        if files.len() != expected {
+            return Err(format!(
+                "expected {expected} clip files, got {}",
+                files.len()
+            ));
+        }
+        for (clip, file) in self
+            .tracks
+            .iter_mut()
+            .flat_map(|track| track.clips.iter_mut())
+            .zip(files)
+        {
+            clip.file = file;
+        }
+        Ok(())
+    }
+
     /// Validates the canvas and timeline structure.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -52,14 +96,45 @@ impl VideoConfig {
         if self.canvas.height == 0 {
             errors.push("canvas: height must be positive".to_string());
         }
-        if !self.canvas.frame_rate.is_finite() || self.canvas.frame_rate <= 0.0 {
+        if self.canvas.width > MAX_CANVAS_DIMENSION {
+            errors.push(format!(
+                "canvas: width must not exceed {MAX_CANVAS_DIMENSION}"
+            ));
+        }
+        if self.canvas.height > MAX_CANVAS_DIMENSION {
+            errors.push(format!(
+                "canvas: height must not exceed {MAX_CANVAS_DIMENSION}"
+            ));
+        }
+        let canvas_pixels = u64::from(self.canvas.width).checked_mul(u64::from(self.canvas.height));
+        if canvas_pixels.is_none_or(|pixels| pixels > MAX_CANVAS_PIXELS) {
+            errors.push(format!(
+                "canvas: pixel count must not exceed {MAX_CANVAS_PIXELS}"
+            ));
+        }
+        if !self.canvas.frame_rate.is_finite() {
             errors.push("canvas: frame_rate must be finite and positive".to_string());
+        } else if !(MIN_FRAME_RATE..=MAX_FRAME_RATE).contains(&self.canvas.frame_rate) {
+            errors.push(format!(
+                "canvas: frame_rate must be within the supported range {MIN_FRAME_RATE}..={MAX_FRAME_RATE} fps"
+            ));
         }
         if !is_hex_color(&self.canvas.background) {
             errors.push(format!(
                 "canvas: background must be a hex color like \"#000000\", got {:?}",
                 self.canvas.background
             ));
+        }
+
+        if self.tracks.len() > MAX_VIDEO_TRACKS {
+            errors.push(format!("video: tracks must not exceed {MAX_VIDEO_TRACKS}"));
+        }
+        let clip_count = self
+            .tracks
+            .iter()
+            .try_fold(0_usize, |count, track| count.checked_add(track.clips.len()));
+        if clip_count.is_none_or(|count| count > MAX_VIDEO_CLIPS) {
+            errors.push(format!("video: clips must not exceed {MAX_VIDEO_CLIPS}"));
         }
 
         for (track_index, track) in self.tracks.iter().enumerate() {
@@ -104,6 +179,49 @@ impl VideoConfig {
                     errors.push(format!(
                         "{clip_label}: source_in must be finite and non-negative"
                     ));
+                }
+                if clip.x > i32::MAX as u32 {
+                    errors.push(format!("{clip_label}: x is too large"));
+                }
+                if clip.y > i32::MAX as u32 {
+                    errors.push(format!("{clip_label}: y is too large"));
+                }
+                if clip.width == Some(0) {
+                    errors.push(format!("{clip_label}: width must be positive"));
+                } else if clip.width.is_some_and(|width| width > MAX_CANVAS_DIMENSION) {
+                    errors.push(format!(
+                        "{clip_label}: width must not exceed {MAX_CANVAS_DIMENSION}"
+                    ));
+                }
+                if clip.height == Some(0) {
+                    errors.push(format!("{clip_label}: height must be positive"));
+                } else if clip
+                    .height
+                    .is_some_and(|height| height > MAX_CANVAS_DIMENSION)
+                {
+                    errors.push(format!(
+                        "{clip_label}: height must not exceed {MAX_CANVAS_DIMENSION}"
+                    ));
+                }
+                let layout_width = clip.width.unwrap_or(self.canvas.width);
+                let layout_height = clip.height.unwrap_or(self.canvas.height);
+                let layout_pixels = u64::from(layout_width).checked_mul(u64::from(layout_height));
+                if layout_pixels.is_none_or(|pixels| pixels > MAX_CANVAS_PIXELS) {
+                    errors.push(format!(
+                        "{clip_label}: pixel count must not exceed {MAX_CANVAS_PIXELS}"
+                    ));
+                }
+                if !clip.opacity.is_finite() || !(0.0..=1.0).contains(&clip.opacity) {
+                    errors.push(format!(
+                        "{clip_label}: opacity must be finite and within 0..=1"
+                    ));
+                }
+                for (field, fade) in [("fade_in", clip.fade_in), ("fade_out", clip.fade_out)] {
+                    if !fade.is_finite() || fade < 0.0 {
+                        errors.push(format!(
+                            "{clip_label}: {field} must be finite and non-negative"
+                        ));
+                    }
                 }
                 if clip.file.trim().is_empty() {
                     errors.push(format!("{clip_label}: file must not be empty"));
@@ -158,6 +276,7 @@ pub struct VideoCanvas {
     #[serde(default = "default_height")]
     height: u32,
     #[serde(default = "default_frame_rate")]
+    /// Frames per second, in the inclusive supported range 0.001..=240.
     frame_rate: f64,
     #[serde(default = "default_background")]
     background: String,
@@ -219,6 +338,30 @@ pub struct VideoClip {
     file: String,
     #[serde(default)]
     source_in: f64,
+    #[serde(default)]
+    /// Horizontal position in output-canvas pixels (not a normalized value).
+    x: u32,
+    #[serde(default)]
+    /// Vertical position in output-canvas pixels (not a normalized value).
+    y: u32,
+    #[serde(default)]
+    /// Optional output width in pixels; omitted uses the canvas width.
+    width: Option<u32>,
+    #[serde(default)]
+    /// Optional output height in pixels; omitted uses the canvas height.
+    height: Option<u32>,
+    #[serde(
+        default = "default_opacity",
+        skip_serializing_if = "is_default_opacity"
+    )]
+    /// Base compositor opacity in the inclusive range 0..=1.
+    opacity: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    /// Linear fade-in duration in seconds.
+    fade_in: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    /// Linear fade-out duration in seconds.
+    fade_out: f64,
 }
 
 impl VideoClip {
@@ -242,6 +385,34 @@ impl VideoClip {
         self.source_in
     }
 
+    pub fn x(&self) -> u32 {
+        self.x
+    }
+
+    pub fn y(&self) -> u32 {
+        self.y
+    }
+
+    pub fn width(&self) -> Option<u32> {
+        self.width
+    }
+
+    pub fn height(&self) -> Option<u32> {
+        self.height
+    }
+
+    pub fn opacity(&self) -> f64 {
+        self.opacity
+    }
+
+    pub fn fade_in(&self) -> f64 {
+        self.fade_in
+    }
+
+    pub fn fade_out(&self) -> f64 {
+        self.fade_out
+    }
+
     /// End position on the song timeline, in seconds.
     pub fn end(&self) -> f64 {
         self.start + self.duration
@@ -262,6 +433,18 @@ fn default_frame_rate() -> f64 {
 
 fn default_background() -> String {
     "#000000".to_string()
+}
+
+fn default_opacity() -> f64 {
+    1.0
+}
+
+fn is_default_opacity(value: &f64) -> bool {
+    *value == 1.0
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
 
 fn is_hex_color(value: &str) -> bool {
@@ -331,6 +514,29 @@ tracks:
         assert_eq!(clip.duration(), 4.0);
         assert_eq!(clip.file(), "video/intro.mp4");
         assert_eq!(clip.source_in(), 0.25);
+        assert_eq!(clip.x(), 0);
+        assert_eq!(clip.y(), 0);
+        assert_eq!(clip.width(), None);
+        assert_eq!(clip.height(), None);
+    }
+
+    #[test]
+    fn deserializes_optional_clip_layout() {
+        let video = from_yaml(
+            r#"
+tracks:
+  - name: overlay
+    clips:
+      - { id: title, start: 0, duration: 1, file: title.mkv, x: 12, y: 34, width: 320, height: 180 }
+"#,
+        );
+        let clip = &video.tracks()[0].clips()[0];
+
+        assert_eq!(clip.x(), 12);
+        assert_eq!(clip.y(), 34);
+        assert_eq!(clip.width(), Some(320));
+        assert_eq!(clip.height(), Some(180));
+        assert!(video.validate().is_ok());
     }
 
     fn from_yaml(yaml: &str) -> VideoConfig {
@@ -454,5 +660,189 @@ tracks:
 
         let errors = video.validate().unwrap_err();
         assert!(errors.iter().any(|error| error.contains("clip end")));
+    }
+
+    #[test]
+    fn rejects_zero_clip_layout_dimensions() {
+        let video = from_yaml(
+            r#"
+tracks:
+  - name: overlay
+    clips:
+      - { id: title, start: 0, duration: 1, file: title.mkv, x: 4294967295, y: 4294967295, width: 0, height: 0 }
+"#,
+        );
+
+        let errors = video.validate().unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("x is too large")));
+        assert!(errors.iter().any(|error| error.contains("y is too large")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("width must be positive")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("height must be positive")));
+    }
+
+    #[test]
+    fn enforces_clip_layout_dimension_and_area_limits() {
+        let at_limit = from_yaml(
+            r#"
+tracks:
+  - name: overlay
+    clips:
+      - { id: title, start: 0, duration: 1, file: title.mkv, width: 4096, height: 2160 }
+"#,
+        );
+        assert!(at_limit.validate().is_ok());
+
+        for (width, height, expected) in [
+            (4097, 1, "width must not exceed 4096"),
+            (1, 4097, "height must not exceed 4096"),
+            (4096, 2161, "pixel count must not exceed 8847360"),
+        ] {
+            let video = from_yaml(&format!(
+                r#"
+tracks:
+  - name: overlay
+    clips:
+      - {{ id: title, start: 0, duration: 1, file: title.mkv, width: {width}, height: {height} }}
+"#,
+            ));
+            let errors = video.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} for {width}x{height}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_supported_frame_rate_edges() {
+        for frame_rate in [0.001, 240.0] {
+            let video = from_yaml(&format!(
+                r##"canvas: {{ width: 2, height: 2, frame_rate: {frame_rate}, background: "#000000" }}"##
+            ));
+
+            assert!(
+                video.validate().is_ok(),
+                "supported frame rate {frame_rate} was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_frame_rates_outside_supported_range() {
+        for frame_rate in [0.000_999, 240.001] {
+            let video = from_yaml(&format!(
+                r##"canvas: {{ width: 2, height: 2, frame_rate: {frame_rate}, background: "#000000" }}"##
+            ));
+
+            let errors = video.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| error.contains("0.001..=240")),
+                "out-of-range frame rate {frame_rate} produced {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_documented_video_resource_boundaries() {
+        let tracks = (0..32)
+            .map(|track| {
+                let clips = (0..16)
+                    .map(|clip| format!("{{ id: clip-{track}-{clip}, start: {clip}, duration: 1, file: shared.mkv }}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{{ name: track-{track}, clips: [{clips}] }}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let video = from_yaml(&format!(
+            r##"canvas: {{ width: 4096, height: 2160, frame_rate: 50, background: "#000000" }}
+tracks: [{tracks}]"##
+        ));
+
+        assert!(video.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_canvas_track_and_clip_resource_overages() {
+        for (yaml, expected) in [
+            (
+                r##"canvas: { width: 4097, height: 1, background: "#000000" }"##,
+                "width must not exceed 4096",
+            ),
+            (
+                r##"canvas: { width: 1, height: 4097, background: "#000000" }"##,
+                "height must not exceed 4096",
+            ),
+            (
+                r##"canvas: { width: 4096, height: 4096, background: "#000000" }"##,
+                "pixel count must not exceed 8847360",
+            ),
+        ] {
+            let errors = from_yaml(yaml).validate().unwrap_err();
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{errors:?}"
+            );
+        }
+
+        let tracks = (0..33)
+            .map(|index| format!("{{ name: t{index}, clips: [{{ id: c{index}, start: 0, duration: 1, file: f }}] }}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let errors = from_yaml(&format!("tracks: [{tracks}]"))
+            .validate()
+            .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("tracks must not exceed 32")));
+
+        let clips = (0..513)
+            .map(|index| format!("{{ id: c{index}, start: {index}, duration: 1, file: f }}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let errors = from_yaml(&format!("tracks: [{{ name: t, clips: [{clips}] }}]"))
+            .validate()
+            .unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("clips must not exceed 512")));
+    }
+
+    #[test]
+    fn rejects_non_finite_or_out_of_range_opacity_and_fades() {
+        let mut video =
+            from_yaml("tracks: [{ name: t, clips: [{ id: c, start: 0, duration: 1, file: f }] }]");
+        let clip = &mut video.tracks[0].clips[0];
+        clip.opacity = f64::NAN;
+        clip.fade_in = -1.0;
+        clip.fade_out = f64::INFINITY;
+
+        let errors = video.validate().unwrap_err();
+        for expected in ["opacity", "fade_in", "fade_out"] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} in {errors:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "video")]
+    #[test]
+    fn replacing_clip_files_requires_an_exact_count() {
+        let mut video = from_yaml(
+            "tracks: [{ name: t, clips: [{ id: a, start: 0, duration: 1, file: a }, { id: b, start: 1, duration: 1, file: b }] }]",
+        );
+
+        let error = video
+            .replace_clip_files(vec!["only-one".to_string()])
+            .unwrap_err();
+
+        assert!(error.contains("expected 2 clip files, got 1"), "{error}");
+        assert_eq!(video.tracks()[0].clips()[0].file(), "a");
+        assert_eq!(video.tracks()[0].clips()[1].file(), "b");
     }
 }

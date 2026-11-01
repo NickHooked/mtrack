@@ -55,6 +55,7 @@ export default defineConfig({
       },
       "/api": {
         target: proxyTarget,
+        ws: true,
       },
       "/player.v1.PlayerService": {
         target: proxyTarget,

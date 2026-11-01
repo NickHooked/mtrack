@@ -219,6 +219,64 @@ jobs:
           path: debs/*.deb
           retention-days: 1
 
+  # Video builds are separate Linux assets because they link GStreamer and
+  # must not change the portable/default mtrack archives or Debian packages.
+  build-video-assets:
+    name: Build video asset (${{ matrix.target }})
+    needs: release
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.release.result == 'success') }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install system and GStreamer dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+      - name: Install protoc
+        run: ./scripts/install-protoc.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "release-video-${{ matrix.target }}"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Build frontend
+        run: make build-ui
+      - name: Build video binary
+        run: cargo build --release --locked --features video --target ${{ matrix.target }}
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Package video archive and Debian package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          STAGE="mtrack-video-${VERSION}-${{ matrix.target }}"
+          mkdir "$STAGE" debs
+          cp "target/${{ matrix.target }}/release/mtrack" "$STAGE/"
+          cp README.md LICENSE CHANGELOG.md "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          cargo deb --variant video --no-build --no-strip \
+            --target "${{ matrix.target }}" --output debs/
+      - name: Upload video assets to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${RELEASE_TAG}" mtrack-video-*.tar.gz mtrack-video-*.tar.gz.sha256 debs/*.deb --clobber
+
   # Regenerates the apt archive and syncs it to R2.
   #
   # Skipped entirely until the repository variable APT_R2_BUCKET is set, so the

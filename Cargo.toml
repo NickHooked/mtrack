@@ -13,6 +13,7 @@ repository = "https://github.com/mdwn/mtrack"
 readme = "README.md"
 keywords = ["audio"]
 categories = ["multimedia", "multimedia::audio"]
+
 # NOTE: include globs match the FILESYSTEM, not git — untracked and even
 # gitignored files are packaged if they match. Keep dev-only trees under
 # src/webui/svelte explicitly excluded so a `cargo publish` from a working
@@ -67,6 +68,21 @@ assets = [
     ["CHANGELOG.md", "usr/share/doc/mtrack/CHANGELOG.md", "644"],
 ]
 
+# Opt-in package for binaries built with `--features video`. cargo-deb appends
+# the variant name, producing `mtrack-video`; it owns the same executable and
+# therefore explicitly replaces/conflicts with the non-video package.
+[package.metadata.deb.variants.video]
+features = ["video"]
+depends = "libasound2t64 | libasound2, libudev1, libgstreamer1.0-0, libgstreamer-plugins-base1.0-0, gstreamer1.0-plugins-base"
+recommends = "ola, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-libav"
+conflicts = "mtrack"
+replaces = "mtrack"
+provides = "mtrack"
+
+[features]
+default = []
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video", "dep:image"]
+
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
 pkg-fmt = "tgz"
@@ -120,6 +136,10 @@ serde_json = "1.0"
 sha2 = "0.10"
 ratatui = "0.30"
 crossterm = "0.29"
+gstreamer = { version = "0.24", optional = true }
+gstreamer-app = { version = "0.24", optional = true }
+gstreamer-video = { version = "0.24", optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 
 rmcp = { version = "1.7", default-features = false, features = [
     "server",

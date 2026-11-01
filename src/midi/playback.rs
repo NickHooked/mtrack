@@ -13,7 +13,7 @@
 //
 use std::time::Duration;
 
-use midly::{Format, MetaMessage, MidiMessage, TrackEvent, TrackEventKind};
+use midly::{Format, Fps, MetaMessage, MidiMessage, Timing, TrackEvent, TrackEventKind};
 
 /// A single MIDI event with its absolute timestamp.
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub(crate) struct TimedMidiEvent {
 /// that goes directly from midly's TrackEvents to absolute-timestamped events.
 pub(crate) struct PrecomputedMidi {
     events: Vec<TimedMidiEvent>,
+    duration: Duration,
 }
 
 /// A tempo change at a specific tick position.
@@ -49,28 +50,53 @@ impl PrecomputedMidi {
     /// Single-pass algorithm: for each track, accumulates tick positions and
     /// converts to absolute time using tempo changes. For Format 1 (parallel),
     /// the conductor track (track 0) provides the tempo map for all tracks.
+    #[cfg(test)]
     pub fn from_tracks(
         tracks: &[Vec<TrackEvent<'_>>],
         ticks_per_beat: u16,
         format: Format,
     ) -> Self {
-        let tpb = ticks_per_beat as f64;
-        // Default tempo: 120 BPM = 500_000 microseconds per beat
-        let default_micros_per_tick = 500_000.0 / tpb;
+        Self::from_timing(tracks, Timing::Metrical(ticks_per_beat.into()), format)
+    }
+
+    /// Builds a pre-computed timeline for metrical or SMPTE/timecode timing.
+    pub fn from_timing(tracks: &[Vec<TrackEvent<'_>>], timing: Timing, format: Format) -> Self {
+        let (tpb, default_micros_per_tick, uses_tempo) = match timing {
+            Timing::Metrical(ticks_per_beat) => {
+                let tpb = f64::from(ticks_per_beat.as_int());
+                (tpb, 500_000.0 / tpb, true)
+            }
+            Timing::Timecode(fps, subframe) => {
+                let (micros_per_frame, frames) = match fps {
+                    Fps::Fps24 => (1_000_000.0, 24.0),
+                    Fps::Fps25 => (1_000_000.0, 25.0),
+                    Fps::Fps29 => (1_001_000.0, 30.0),
+                    Fps::Fps30 => (1_000_000.0, 30.0),
+                };
+                (1.0, micros_per_frame / frames / f64::from(subframe), false)
+            }
+        };
 
         match format {
             Format::SingleTrack => {
-                let events = if let Some(track) = tracks.first() {
-                    Self::process_track(track, default_micros_per_tick, tpb, &[]).events
+                let result = if let Some(track) = tracks.first() {
+                    Self::process_track(track, default_micros_per_tick, tpb, &[], uses_tempo)
                 } else {
-                    Vec::new()
+                    TrackResult {
+                        events: Vec::new(),
+                        total_duration: Duration::ZERO,
+                    }
                 };
-                PrecomputedMidi { events }
+                PrecomputedMidi {
+                    events: result.events,
+                    duration: result.total_duration,
+                }
             }
             Format::Parallel => {
                 // Extract tempo map from conductor track (track 0)
                 let tempo_map = tracks
                     .first()
+                    .filter(|_| uses_tempo)
                     .map(|track| Self::extract_tempo_map(track, tpb))
                     .unwrap_or_default();
 
@@ -78,13 +104,35 @@ impl PrecomputedMidi {
                 // not emit MIDI events. Non-conformant files with MIDI events on
                 // track 0 would otherwise get double-tempo-mapped.
                 let mut all_events = Vec::new();
+                let mut duration = Duration::ZERO;
                 for track in tracks.iter().skip(1) {
-                    let mut track_events =
-                        Self::process_track(track, default_micros_per_tick, tpb, &tempo_map).events;
-                    all_events.append(&mut track_events);
+                    let mut result = Self::process_track(
+                        track,
+                        default_micros_per_tick,
+                        tpb,
+                        &tempo_map,
+                        uses_tempo,
+                    );
+                    duration = duration.max(result.total_duration);
+                    all_events.append(&mut result.events);
+                }
+                if let Some(conductor) = tracks.first() {
+                    duration = duration.max(
+                        Self::process_track(
+                            conductor,
+                            default_micros_per_tick,
+                            tpb,
+                            &[],
+                            uses_tempo,
+                        )
+                        .total_duration,
+                    );
                 }
                 all_events.sort_by(|a, b| a.time.cmp(&b.time));
-                PrecomputedMidi { events: all_events }
+                PrecomputedMidi {
+                    events: all_events,
+                    duration,
+                }
             }
             Format::Sequential => {
                 // Each track is processed independently with inline tempo handling only.
@@ -93,7 +141,8 @@ impl PrecomputedMidi {
                 let mut all_events = Vec::new();
                 let mut cumulative_offset = Duration::ZERO;
                 for track in tracks {
-                    let result = Self::process_track(track, default_micros_per_tick, tpb, &[]);
+                    let result =
+                        Self::process_track(track, default_micros_per_tick, tpb, &[], uses_tempo);
                     for event in result.events {
                         all_events.push(TimedMidiEvent {
                             time: event.time + cumulative_offset,
@@ -104,7 +153,10 @@ impl PrecomputedMidi {
                     // Use total track duration (including trailing silence) as offset
                     cumulative_offset += result.total_duration;
                 }
-                PrecomputedMidi { events: all_events }
+                PrecomputedMidi {
+                    events: all_events,
+                    duration: cumulative_offset,
+                }
             }
         }
     }
@@ -121,8 +173,22 @@ impl PrecomputedMidi {
                     micros_per_tick: tempo.as_int() as f64 / tpb,
                 });
             }
+            if matches!(event.kind, TrackEventKind::Meta(MetaMessage::EndOfTrack)) {
+                break;
+            }
         }
         tempo_map
+    }
+
+    fn ticks_until_end_of_track(track: &[TrackEvent<'_>]) -> u64 {
+        let mut ticks = 0_u64;
+        for event in track {
+            ticks += u64::from(event.delta.as_int());
+            if matches!(event.kind, TrackEventKind::Meta(MetaMessage::EndOfTrack)) {
+                break;
+            }
+        }
+        ticks
     }
 
     /// Processes a single track into timed events, using an optional external tempo map.
@@ -132,6 +198,7 @@ impl PrecomputedMidi {
         default_micros_per_tick: f64,
         tpb: f64,
         external_tempo_map: &[TempoEntry],
+        uses_tempo: bool,
     ) -> TrackResult {
         let mut events = Vec::new();
         let mut tick_position: u64 = 0;
@@ -176,8 +243,10 @@ impl PrecomputedMidi {
                 elapsed_micros += ticks_since_last as f64 * micros_per_tick;
 
                 // Update tempo for subsequent deltas
-                if let TrackEventKind::Meta(MetaMessage::Tempo(tempo)) = event.kind {
-                    micros_per_tick = tempo.as_int() as f64 / tpb;
+                if uses_tempo {
+                    if let TrackEventKind::Meta(MetaMessage::Tempo(tempo)) = event.kind {
+                        micros_per_tick = tempo.as_int() as f64 / tpb;
+                    }
                 }
             }
 
@@ -190,6 +259,9 @@ impl PrecomputedMidi {
                     channel: channel.as_int(),
                     message,
                 });
+            }
+            if matches!(event.kind, TrackEventKind::Meta(MetaMessage::EndOfTrack)) {
+                break;
             }
         }
 
@@ -212,7 +284,7 @@ impl PrecomputedMidi {
             Format::SingleTrack => {
                 let (tempo_map, total_ticks) = if let Some(track) = tracks.first() {
                     let map = Self::extract_tempo_map(track, tpb);
-                    let total = track.iter().map(|e| e.delta.as_int() as u64).sum::<u64>();
+                    let total = Self::ticks_until_end_of_track(track);
                     (map, total)
                 } else {
                     (Vec::new(), 0)
@@ -227,7 +299,7 @@ impl PrecomputedMidi {
                 // Total ticks is the max across all tracks
                 let total_ticks = tracks
                     .iter()
-                    .map(|track| track.iter().map(|e| e.delta.as_int() as u64).sum::<u64>())
+                    .map(|track| Self::ticks_until_end_of_track(track))
                     .max()
                     .unwrap_or(0);
                 (tempo_map, ticks_per_beat, total_ticks)
@@ -244,7 +316,7 @@ impl PrecomputedMidi {
                             micros_per_tick: entry.micros_per_tick,
                         });
                     }
-                    total_ticks += track.iter().map(|e| e.delta.as_int() as u64).sum::<u64>();
+                    total_ticks += Self::ticks_until_end_of_track(track);
                 }
                 (combined_map, ticks_per_beat, total_ticks)
             }
@@ -253,7 +325,8 @@ impl PrecomputedMidi {
 
     /// Creates a PrecomputedMidi by taking ownership of a Vec of events.
     pub fn from_events(events: Vec<TimedMidiEvent>) -> Self {
-        PrecomputedMidi { events }
+        let duration = events.last().map_or(Duration::ZERO, |event| event.time);
+        PrecomputedMidi { events, duration }
     }
 
     /// Consumes self and returns the underlying event Vec.
@@ -272,6 +345,11 @@ impl PrecomputedMidi {
         &self.events
     }
 
+    /// Full MIDI timeline duration, including trailing time before end-of-track.
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
     /// Returns true if there are no events.
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
@@ -287,7 +365,7 @@ impl PrecomputedMidi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use midly::{num::u7, MetaMessage, MidiMessage, TrackEvent, TrackEventKind};
+    use midly::{num::u7, Fps, MetaMessage, MidiMessage, Timing, TrackEvent, TrackEventKind};
 
     /// Helper: build a TrackEvent with a delta and MIDI note-on.
     fn note_on(delta: u32, channel: u8, key: u8, vel: u8) -> TrackEvent<'static> {
@@ -657,5 +735,48 @@ mod tests {
         assert!(tempo_map.is_empty());
         assert_eq!(tpb, 480);
         assert_eq!(total_ticks, 0);
+    }
+
+    #[test]
+    fn first_end_of_track_stops_event_and_duration_accumulation() {
+        let track = vec![
+            note_on(0, 0, 60, 100),
+            end_of_track(480),
+            note_on(9_600, 0, 72, 100),
+        ];
+
+        let midi = PrecomputedMidi::from_timing(
+            &[track],
+            Timing::Metrical(480.into()),
+            Format::SingleTrack,
+        );
+
+        assert_eq!(midi.len(), 1);
+        assert_eq!(midi.duration(), Duration::from_millis(500));
+
+        let (_, _, ticks) = PrecomputedMidi::build_tempo_info(
+            &[vec![end_of_track(480), note_on(9_600, 0, 72, 100)]],
+            480,
+            Format::SingleTrack,
+        );
+        assert_eq!(ticks, 480);
+    }
+
+    #[test]
+    fn timecode_timing_uses_fps_and_subframes_and_ignores_tempo() {
+        for (fps, ticks, expected) in [
+            (Fps::Fps24, 2_400, Duration::from_secs(1)),
+            (Fps::Fps25, 2_500, Duration::from_secs(1)),
+            (Fps::Fps29, 3_000, Duration::from_millis(1_001)),
+            (Fps::Fps30, 3_000, Duration::from_secs(1)),
+        ] {
+            let track = vec![tempo_event(0, 1), end_of_track(ticks)];
+            let midi = PrecomputedMidi::from_timing(
+                &[track],
+                Timing::Timecode(fps, 100),
+                Format::SingleTrack,
+            );
+            assert_eq!(midi.duration(), expected, "{fps:?}");
+        }
     }
 }

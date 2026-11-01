@@ -40,4 +40,5 @@ pub mod trigger;
 pub mod tui;
 pub mod util;
 pub mod verify;
+pub mod video;
 pub mod webui;

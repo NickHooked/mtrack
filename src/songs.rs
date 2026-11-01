@@ -137,6 +137,8 @@ pub struct Song {
     midi_event: Option<LiveEvent<'static>>,
     /// The MIDI playback configuration.
     midi_playback: Option<MidiPlayback>,
+    /// End of the MIDI playback timeline.
+    midi_end: Duration,
     /// The light show configurations
     light_shows: Vec<LightShow>,
     /// The DSL lighting shows (resolved to absolute paths)
@@ -173,8 +175,10 @@ pub struct Song {
     sections: Vec<config::Section>,
     /// Per-song notification audio overrides.
     notification_audio: Option<config::SongNotificationConfig>,
-    /// The optional video timeline, retained for browser-side playback.
+    /// The optional video timeline, retained for browser-side editing.
     video: Option<config::VideoConfig>,
+    /// Validated backend-independent timeline with canonical media paths.
+    video_timeline: Option<crate::video::timeline::RuntimeVideoTimeline>,
     /// Last configured video clip end on the song timeline.
     video_end: Duration,
 }
@@ -187,6 +191,20 @@ impl Song {
         let midi_playback = match config.midi_playback() {
             Some(midi_playback) => Some(MidiPlayback::new(start_path, midi_playback)?),
             None => None,
+        };
+        let midi_end = match midi_playback.as_ref() {
+            Some(playback) => playback
+                .midi_sheet()
+                .map_err(|error| {
+                    format!(
+                        "song {:?}: failed to load MIDI file {}: {error}",
+                        config.name(),
+                        playback.file_path().display()
+                    )
+                })?
+                .precomputed
+                .duration(),
+            None => Duration::ZERO,
         };
         let light_shows = match config.light_shows() {
             Some(light_shows) => light_shows
@@ -266,74 +284,20 @@ impl Song {
         };
 
         let video = config.video().cloned();
-        let video_end = match &video {
-            Some(video) => {
-                video.validate().map_err(|errors| {
-                    format!(
-                        "song {:?}: invalid video timeline: {}",
-                        config.name(),
-                        errors.join("; ")
-                    )
-                })?;
-                let video_root = start_path.canonicalize().map_err(|error| {
-                    format!(
-                        "song {:?}: cannot resolve song directory {}: {}",
-                        config.name(),
-                        start_path.display(),
-                        error
-                    )
-                })?;
-                let mut video_end = Duration::ZERO;
-                for track in video.tracks() {
-                    for clip in track.clips() {
-                        let file = start_path.join(clip.file());
-                        let canonical_file = file.canonicalize().map_err(|error| {
-                            format!(
-                                "song {:?} video track {:?} clip {:?}: file {} does not exist or cannot be resolved: {}",
-                                config.name(),
-                                track.name(),
-                                clip.id(),
-                                file.display(),
-                                error
-                            )
-                        })?;
-                        if !canonical_file.starts_with(&video_root) {
-                            return Err(format!(
-                                "song {:?} video track {:?} clip {:?}: file {} resolves outside song directory {}",
-                                config.name(),
-                                track.name(),
-                                clip.id(),
-                                file.display(),
-                                video_root.display()
-                            )
-                            .into());
-                        }
-                        if !canonical_file.is_file() {
-                            return Err(format!(
-                                "song {:?} video track {:?} clip {:?}: file {} is not a regular file",
-                                config.name(),
-                                track.name(),
-                                clip.id(),
-                                canonical_file.display()
-                            )
-                            .into());
-                        }
-                        let clip_end = Duration::try_from_secs_f64(clip.end()).map_err(|error| {
-                            format!(
-                                "song {:?} video track {:?} clip {:?}: video end cannot be represented: {}",
-                                config.name(),
-                                track.name(),
-                                clip.id(),
-                                error
-                            )
-                        })?;
-                        video_end = video_end.max(clip_end);
-                    }
-                }
-                video_end
-            }
-            None => Duration::ZERO,
-        };
+        let video_timeline = video
+            .as_ref()
+            .map(|video| {
+                crate::video::timeline::RuntimeVideoTimeline::resolve(
+                    config.name(),
+                    start_path,
+                    video,
+                )
+            })
+            .transpose()?;
+        let video_end = video_timeline.as_ref().map_or(
+            Duration::ZERO,
+            crate::video::timeline::RuntimeVideoTimeline::end,
+        );
 
         let lighting_end = lighting_end(&dsl_lighting_shows);
 
@@ -349,6 +313,7 @@ impl Song {
             config_path: None,
             midi_event: config.midi_event()?,
             midi_playback,
+            midi_end,
             light_shows,
             lighting_end,
             dsl_lighting_shows,
@@ -367,6 +332,7 @@ impl Song {
             sections: config.sections().to_vec(),
             notification_audio: config.notification_audio().cloned(),
             video,
+            video_timeline,
             video_end,
         })
     }
@@ -592,11 +558,26 @@ impl Song {
             });
         }
 
+        let midi_end = match midi_playback.as_ref() {
+            Some(playback) => playback
+                .midi_sheet()
+                .map_err(|error| {
+                    format!(
+                        "song {:?}: failed to load MIDI file {}: {error}",
+                        name,
+                        playback.file_path().display()
+                    )
+                })?
+                .precomputed
+                .duration(),
+            None => Duration::ZERO,
+        };
         let song = Self {
             name,
             base_path: song_directory.clone(),
             config_path: Some(song_directory.join("song.yaml")),
             midi_playback,
+            midi_end,
             light_shows,
             lighting_end: lighting_end(&dsl_lighting_shows),
             dsl_lighting_shows,
@@ -697,14 +678,11 @@ impl Song {
     }
 
     /// How long the song plays across all configured timeline media.
-    /// Lighting determines the end only when there is no audio; video may
-    /// extend either kind of song.
     pub fn length(&self) -> Duration {
-        self.video_end.max(if self.duration.is_zero() {
-            self.lighting_end
-        } else {
-            self.duration
-        })
+        self.duration
+            .max(self.midi_end)
+            .max(self.lighting_end)
+            .max(self.video_end)
     }
 
     /// Gets the number of channels.
@@ -819,6 +797,11 @@ impl Song {
     /// Gets the song's video timeline configuration, if configured.
     pub fn video(&self) -> Option<&config::VideoConfig> {
         self.video.as_ref()
+    }
+
+    /// Gets the validated, absolute video timeline used by runtime playback.
+    pub fn video_timeline(&self) -> Option<&crate::video::timeline::RuntimeVideoTimeline> {
+        self.video_timeline.as_ref()
     }
 
     /// Resolves a named section to absolute time bounds using the beat grid.
@@ -1152,6 +1135,7 @@ impl Default for Song {
             config_path: None,
             midi_event: Default::default(),
             midi_playback: Default::default(),
+            midi_end: Duration::ZERO,
             light_shows: Vec::new(),
             dsl_lighting_shows: Vec::new(),
             lighting_end: Duration::ZERO,
@@ -1170,6 +1154,7 @@ impl Default for Song {
             sections: Vec::new(),
             notification_audio: None,
             video: None,
+            video_timeline: None,
             video_end: Duration::ZERO,
         }
     }
@@ -1262,33 +1247,37 @@ fn parse_midi(midi_file: &PathBuf) -> Result<MidiSheet, Box<dyn Error>> {
         .map_err(|e| format!("Failed to read MIDI file {}: {}", midi_file.display(), e))?;
     let smf = Smf::parse(&buf)
         .map_err(|e| format!("Failed to parse MIDI file {}: {}", midi_file.display(), e))?;
-    let ticks_per_beat = match smf.header.timing {
-        midly::Timing::Metrical(tpb) => tpb.as_int(),
-        _ => return Err("timecode-based MIDI timing not supported".into()),
-    };
-    let (tempo_map, tpb, total_ticks) = crate::midi::playback::PrecomputedMidi::build_tempo_info(
-        &smf.tracks,
-        ticks_per_beat,
-        smf.header.format,
-    );
-    let precomputed = crate::midi::playback::PrecomputedMidi::from_tracks(
-        &smf.tracks,
-        ticks_per_beat,
-        smf.header.format,
-    );
-    // Only generate beat clock when the MIDI file contains explicit tempo events.
-    // Files without tempo maps have no tempo opinion, so mtrack stays out of the way
-    // and lets musicians control their own tempo.
-    let beat_clock = if tempo_map.is_empty() {
-        None
-    } else {
-        Some(
-            crate::midi::beat_clock::PrecomputedBeatClock::from_tempo_info(
-                &tempo_map,
-                tpb,
-                total_ticks,
-            ),
+    if matches!(smf.header.timing, midly::Timing::Timecode(_, 0)) {
+        return Err(format!(
+            "Invalid SMPTE timing in MIDI file {}: subframes per frame must be positive",
+            midi_file.display()
         )
+        .into());
+    }
+    let precomputed = crate::midi::playback::PrecomputedMidi::from_timing(
+        &smf.tracks,
+        smf.header.timing,
+        smf.header.format,
+    );
+    // Only generate beat clock when a metrical MIDI file contains explicit
+    // tempo events. SMPTE timing is absolute and tempo metadata is irrelevant.
+    let beat_clock = match smf.header.timing {
+        midly::Timing::Metrical(ticks_per_beat) => {
+            let (tempo_map, tpb, total_ticks) =
+                crate::midi::playback::PrecomputedMidi::build_tempo_info(
+                    &smf.tracks,
+                    ticks_per_beat.as_int(),
+                    smf.header.format,
+                );
+            (!tempo_map.is_empty()).then(|| {
+                crate::midi::beat_clock::PrecomputedBeatClock::from_tempo_info(
+                    &tempo_map,
+                    tpb,
+                    total_ticks,
+                )
+            })
+        }
+        midly::Timing::Timecode(_, _) => None,
     };
     Ok(MidiSheet {
         precomputed,
@@ -1818,6 +1807,119 @@ mod test {
         testutil::write_wav,
     };
 
+    const VALID_EMPTY_MIDI: &[u8] = &[
+        0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60, 0x4d, 0x54, 0x72, 0x6b, 0, 0, 0,
+        4, 0, 0xff, 0x2f, 0,
+    ];
+
+    #[test]
+    fn midi_only_song_uses_end_of_track_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let midi = [
+            0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60, 0x4d, 0x54, 0x72, 0x6b, 0, 0,
+            0, 12, 0, 0x90, 0x3c, 0x64, 0x60, 0x80, 0x3c, 0, 0x60, 0xff, 0x2f, 0,
+        ];
+        fs::write(dir.path().join("timeline.mid"), midi).unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            "name: MIDI Only\ntracks: []\nmidi_file: timeline.mid\n",
+        )
+        .unwrap();
+
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+        let song = super::Song::new(dir.path(), &config).unwrap();
+
+        assert_eq!(song.duration(), Duration::ZERO);
+        assert_eq!(song.length(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn invalid_midi_fails_song_load_with_song_and_file_context() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("broken.mid"), b"not midi").unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            "name: Broken MIDI\ntracks: []\nmidi_file: broken.mid\n",
+        )
+        .unwrap();
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+
+        let error = super::Song::new(dir.path(), &config)
+            .err()
+            .expect("invalid MIDI must fail song load")
+            .to_string();
+
+        assert!(error.contains("Broken MIDI"), "{error}");
+        assert!(error.contains("broken.mid"), "{error}");
+        assert!(error.contains("parse MIDI"), "{error}");
+    }
+
+    #[test]
+    fn initialized_midi_only_song_keeps_duration_after_config_reload() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("initialized-midi");
+        fs::create_dir(&dir).unwrap();
+        let midi = [
+            0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0x60, 0x4d, 0x54, 0x72, 0x6b, 0, 0,
+            0, 12, 0, 0x90, 0x3c, 0x64, 0x60, 0x80, 0x3c, 0, 0x60, 0xff, 0x2f, 0,
+        ];
+        fs::write(dir.join("timeline.mid"), midi).unwrap();
+
+        let initialized = super::Song::initialize(&dir).unwrap();
+        assert_eq!(initialized.length(), Duration::from_secs(1));
+
+        let reloaded = super::Song::new(&dir, &initialized.get_config()).unwrap();
+        assert_eq!(reloaded.length(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn smpte_timed_midi_song_uses_absolute_timecode_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let midi = [
+            0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0xe7, 100, 0x4d, 0x54, 0x72, 0x6b, 0,
+            0, 0, 5, 0x93, 0x44, 0xff, 0x2f, 0,
+        ];
+        fs::write(dir.path().join("timecode.mid"), midi).unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            "name: Timecode\ntracks: []\nmidi_file: timecode.mid\n",
+        )
+        .unwrap();
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+
+        let song = super::Song::new(dir.path(), &config).unwrap();
+
+        assert_eq!(song.length(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn zero_subframe_smpte_timing_fails_song_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let midi = [
+            0x4d, 0x54, 0x68, 0x64, 0, 0, 0, 6, 0, 0, 0, 1, 0xe7, 0, 0x4d, 0x54, 0x72, 0x6b, 0, 0,
+            0, 4, 0, 0xff, 0x2f, 0,
+        ];
+        fs::write(dir.path().join("invalid-timecode.mid"), midi).unwrap();
+        let config_path = dir.path().join("song.yaml");
+        fs::write(
+            &config_path,
+            "name: Invalid Timecode\ntracks: []\nmidi_file: invalid-timecode.mid\n",
+        )
+        .unwrap();
+        let config = crate::config::Song::deserialize(&config_path).unwrap();
+
+        let error = super::Song::new(dir.path(), &config)
+            .err()
+            .expect("zero SMPTE subframes must fail")
+            .to_string();
+
+        assert!(error.contains("Invalid Timecode"), "{error}");
+        assert!(error.contains("subframe"), "{error}");
+    }
+
     #[test]
     fn video_only_song_uses_configured_clip_end_without_decoding_video() {
         let dir = tempfile::tempdir().unwrap();
@@ -1855,6 +1957,12 @@ video:
         let video = song.video().unwrap();
         assert_eq!(video.tracks()[0].name(), "screen");
         assert_eq!(video.tracks()[0].clips()[0].file(), "visual.mp4");
+        let runtime = song.video_timeline().unwrap();
+        assert_eq!(runtime.end(), Duration::from_secs_f64(9.5));
+        assert_eq!(
+            runtime.clips()[0].file(),
+            dir.path().canonicalize().unwrap().join("visual.mp4")
+        );
     }
 
     #[test]
@@ -2046,7 +2154,7 @@ video:
 
     fn create_midi_and_dmx_song(path: &Path) -> Result<(), Box<dyn Error>> {
         let song_path = create_song_dir(path, "5 Song with MIDI and DMX")?;
-        fs::write(song_path.join("song.mid"), "")?;
+        fs::write(song_path.join("song.mid"), VALID_EMPTY_MIDI)?;
         fs::write(song_path.join("dmx_lightshow.mid"), "")?;
         Ok(())
     }
@@ -4296,7 +4404,7 @@ pilot:
     }
 
     #[test]
-    fn lighting_does_not_extend_a_song_with_audio() {
+    fn mixed_song_length_is_maximum_of_audio_and_lighting() {
         let song = super::Song {
             duration: Duration::from_secs(10),
             lighting_end: Duration::from_secs(20),
@@ -4304,20 +4412,21 @@ pilot:
         };
 
         assert_eq!(song.duration(), Duration::from_secs(10));
-        assert_eq!(song.length(), Duration::from_secs(10));
+        assert_eq!(song.length(), Duration::from_secs(20));
     }
 
     #[test]
-    fn video_extends_a_song_with_shorter_audio() {
+    fn mixed_song_length_uses_longest_of_audio_midi_lighting_and_video() {
         let song = super::Song {
             duration: Duration::from_secs(10),
+            midi_end: Duration::from_secs(40),
             lighting_end: Duration::from_secs(30),
             video_end: Duration::from_secs(20),
             ..Default::default()
         };
 
         assert_eq!(song.duration(), Duration::from_secs(10));
-        assert_eq!(song.length(), Duration::from_secs(20));
+        assert_eq!(song.length(), Duration::from_secs(40));
     }
 
     #[test]

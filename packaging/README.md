@@ -15,6 +15,43 @@ The Debian package and the apt archive that serves it.
 Package metadata (dependencies, description, assets) lives in
 `[package.metadata.deb]` in `Cargo.toml`.
 
+## Default and video-enabled builds
+
+Cargo's `default` feature set is intentionally empty. Existing `cargo build`,
+release tarballs, CI packages, and `make deb` therefore remain audio/MIDI/DMX
+builds and do not link or initialize GStreamer.
+
+On Debian or Ubuntu, the reproducible opt-in path is:
+
+```
+$ ./setup.sh --video
+$ make build-video
+$ make deb-video
+```
+
+This builds `target/release/mtrack` with `--features video` and packages those
+exact bytes. `deb-video` uses the `video` cargo-deb variant and the existing
+maintainer scripts, producing `mtrack-video`; it conflicts with and replaces
+the non-video `mtrack` package because both own `/usr/bin/mtrack`. Only this
+variant carries the GStreamer shared-library dependencies and the plugin sets
+needed by common show media.
+The base plugin set is a hard dependency because the compositor, conversion,
+URI decode, app source/sink, and default program sink factories use it; the
+good/bad/libav codec and V4L2 providers remain recommendations.
+`gstreamer1.0-plugins-good` supplies Linux `v4l2src`; `gstreamer1.0-tools`
+provides operator diagnostics such as `gst-inspect-1.0` but is only a build-host
+setup dependency.
+
+At runtime, GStreamer is initialized only when a loaded song config contains
+one or more video clips. Startup logs the detected version/target, or exits
+with the missing functional element groups and the Debian/Ubuntu install
+command. JPEG preview encoding is provided by Rust's `image` crate, so
+`jpegenc` is not a required GStreamer element.
+
+Tagged releases publish separate `mtrack-video-<version>-<linux-target>.tar.gz`
+archives and `mtrack-video` Debian packages for amd64 and arm64. The ordinary
+`mtrack` archives and packages remain audio-only.
+
 ### The unit is generated, not shipped
 
 `postinst` runs `mtrack systemd "$MTRACK_PATH"` against the binary it just

@@ -632,7 +632,149 @@ app.post("/test/send-ws", async (req, res) => {
 // --- HTTP + WebSocket server ---
 
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
+const previewWss = new WebSocketServer({ noServer: true });
+const previewBusySongs = new Set<string>();
+const previewConnectionCounts = new Map<string, number>();
+
+app.post("/test/video-preview/:song/busy", (req, res) => {
+  const song = req.params.song;
+  if (req.body?.busy === false) previewBusySongs.delete(song);
+  else previewBusySongs.add(song);
+  res.json({ busy: previewBusySongs.has(song) });
+});
+
+app.get("/test/video-preview/:song/stats", (req, res) => {
+  res.json({ connections: previewConnectionCounts.get(req.params.song) ?? 0 });
+});
+
+const PREVIEW_JPEG = Buffer.from(
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAEf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==",
+  "base64",
+);
+
+function previewFrame(epoch: bigint, positionMs: bigint): Buffer {
+  const message = Buffer.alloc(24 + PREVIEW_JPEG.length);
+  message.write("MTRK", 0, "ascii");
+  message[4] = 1;
+  message.writeBigUInt64BE(epoch, 8);
+  message.writeBigUInt64BE(positionMs, 16);
+  PREVIEW_JPEG.copy(message, 24);
+  return message;
+}
+
+previewWss.on("connection", (ws, request) => {
+  const pathname = new URL(request.url ?? "", "http://localhost").pathname;
+  const encodedSong = pathname.match(
+    /^\/api\/songs\/([^/]+)\/video-preview\/ws$/,
+  )?.[1];
+  const song = encodedSong ? decodeURIComponent(encodedSong) : "";
+  previewConnectionCounts.set(
+    song,
+    (previewConnectionCounts.get(song) ?? 0) + 1,
+  );
+  if (previewBusySongs.has(song)) {
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        request_id: "session",
+        epoch: 0,
+        state: "busy",
+        position_ms: 0,
+        error: "another video preview session is already active",
+      }),
+      () => ws.close(),
+    );
+    return;
+  }
+  let epoch = 0n;
+  let positionMs = 0n;
+  let state = "stopped";
+  const reply = (requestId: unknown) => {
+    ws.send(
+      JSON.stringify({
+        type: "state",
+        request_id: requestId,
+        epoch: Number(epoch),
+        state,
+        position_ms: Number(positionMs),
+      }),
+    );
+  };
+  ws.on("message", (data, isBinary) => {
+    if (isBinary) return;
+    let command: Record<string, unknown>;
+    try {
+      command = JSON.parse(data.toString()) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const requestId = command.request_id;
+    switch (command.type) {
+      case "start": {
+        const config = command.config as
+          | { canvas?: { background?: string } }
+          | undefined;
+        if (
+          config?.canvas?.background === "#ff0000" ||
+          config?.canvas?.background === "#0000ff"
+        ) {
+          const disabled = config.canvas.background === "#0000ff";
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              request_id: "session",
+              epoch: 0,
+              state: disabled ? "disabled" : "busy",
+              position_ms: 0,
+              error: disabled
+                ? "video preview is disabled in this build"
+                : "another video preview session is already active",
+            }),
+            () => ws.close(),
+          );
+          break;
+        }
+        const raceReload =
+          config?.canvas?.background === "#00ff00" && epoch > 0n;
+        if (raceReload) ws.send(previewFrame(epoch, positionMs));
+        epoch += 1n;
+        positionMs = BigInt(Number(command.position_ms) || 0);
+        state = command.autoplay === true ? "playing" : "paused";
+        if (raceReload) {
+          reply(requestId);
+          setTimeout(() => ws.send(previewFrame(epoch, positionMs)), 300);
+        } else {
+          ws.send(previewFrame(epoch, positionMs));
+          reply(requestId);
+        }
+        break;
+      }
+      case "play":
+        state = "playing";
+        reply(requestId);
+        positionMs += 40n;
+        ws.send(previewFrame(epoch, positionMs));
+        break;
+      case "pause":
+        state = "paused";
+        reply(requestId);
+        break;
+      case "seek":
+        epoch += 1n;
+        positionMs = BigInt(Number(command.position_ms) || 0);
+        ws.send(previewFrame(epoch, positionMs));
+        reply(requestId);
+        break;
+      case "stop":
+        epoch += 1n;
+        positionMs = 0n;
+        state = "stopped";
+        reply(requestId);
+        break;
+    }
+  });
+});
 
 // The opening burst every connection gets, in the same order as the real
 // server. Resolves once the last message is out: a test's own state push has
@@ -672,6 +814,23 @@ wss.on("connection", (ws, req) => {
       if (wsConnections.get(wsId)?.ws === ws) wsConnections.delete(wsId);
     });
   }
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url ?? "", "http://localhost").pathname;
+  const target =
+    pathname === "/ws"
+      ? wss
+      : /^\/api\/songs\/[^/]+\/video-preview\/ws$/.test(pathname)
+        ? previewWss
+        : null;
+  if (!target) {
+    socket.destroy();
+    return;
+  }
+  target.handleUpgrade(request, socket, head, (ws) => {
+    target.emit("connection", ws, request);
+  });
 });
 
 const PORT = 3111;

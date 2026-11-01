@@ -50,6 +50,10 @@ export interface StatusData {
     trigger: SubsystemStatus;
   };
   controllers: ControllerStatus[];
+  capabilities: {
+    video_preview: boolean;
+  };
+  locked?: boolean;
 }
 
 /** Worst-case across all required subsystems. */

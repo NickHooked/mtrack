@@ -43,6 +43,7 @@
   } from "../../lib/video/timeline-state";
   import type { VideoConfig } from "../../lib/video/types";
   import { playbackStore } from "../../lib/ws/stores";
+  import { statusStore } from "../../lib/ws/status";
   import FileBrowser from "./FileBrowser.svelte";
   import FileUpload from "./FileUpload.svelte";
   import FilePicker from "./FilePicker.svelte";
@@ -178,6 +179,7 @@
   // Lifted up so video edits survive tab switches and use the unified save.
   let videoConfig = $state<VideoConfig | null>(null);
   let videoValidationError = $state<string | null>(null);
+  let videoSelectedClipId = $state<string | null>(null);
 
   // Light shows with their own tempo maps — offered as import sources in
   // the timeline's base tempo marker dialog.
@@ -1241,8 +1243,11 @@
       {:else if activeTab === "video"}
         <VideoTimelineEditor
           video={videoConfig}
+          {songName}
           songDurationSeconds={(song?.duration_ms ?? 0) / 1000}
           files={songFiles}
+          previewAvailable={$statusStore?.capabilities.video_preview ?? null}
+          bind:selectedClipId={videoSelectedClipId}
           onchange={onVideoChange}
           onvaliditychange={onVideoValidityChange}
         />
