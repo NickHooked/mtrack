@@ -1,0 +1,1692 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+use super::super::effects::*;
+use super::super::tempo::TempoMap;
+
+/// Build fixture states by applying a callback to each target fixture's profile.
+///
+/// This extracts the common pattern of iterating target fixtures, looking up each
+/// fixture in the registry, getting its profile, and collecting channel commands
+/// into fixture states.
+fn build_fixture_states(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    mut apply_fn: impl FnMut(&FixtureProfile) -> HashMap<String, ChannelState>,
+) -> HashMap<String, FixtureState> {
+    let mut fixture_states = HashMap::new();
+    for fixture_name in &effect.target_fixtures {
+        if let Some(fixture) = fixture_registry.get(fixture_name) {
+            let profile = FixtureProfile::for_fixture(fixture);
+            let channel_commands = apply_fn(profile);
+            fixture_states.insert(
+                fixture_name.clone(),
+                FixtureState::from_channels(channel_commands),
+            );
+        }
+    }
+    fixture_states
+}
+
+/// Like `build_fixture_states`, but gives the callback access to the FixtureInfo too.
+fn build_fixture_states_with_info(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    mut apply_fn: impl FnMut(&FixtureInfo, &FixtureProfile) -> FixtureState,
+) -> HashMap<String, FixtureState> {
+    let mut fixture_states = HashMap::new();
+    for fixture_name in &effect.target_fixtures {
+        if let Some(fixture) = fixture_registry.get(fixture_name) {
+            let profile = FixtureProfile::for_fixture(fixture);
+            let fixture_state = apply_fn(fixture, profile);
+            fixture_states.insert(fixture_name.clone(), fixture_state);
+        }
+    }
+    fixture_states
+}
+
+/// Calculate cycle progress (0.0 to 1.0) for a given elapsed time and cycle period
+#[inline]
+fn cycle_progress(elapsed: Duration, cycle_period: f64) -> f64 {
+    (elapsed.as_secs_f64() % cycle_period) / cycle_period
+}
+
+/// Calculate phase for periodic effects (0.0 to 2π)
+#[inline]
+fn phase(elapsed: Duration, frequency: f64) -> f64 {
+    elapsed.as_secs_f64() * frequency * 2.0 * std::f64::consts::PI
+}
+
+/// Calculate color indices and interpolation progress for color cycle effects
+fn calculate_color_indices(
+    cycle_progress: f64,
+    color_count: usize,
+    direction: &CycleDirection,
+) -> (usize, usize, f64) {
+    match direction {
+        CycleDirection::Forward => {
+            let color_index_f = cycle_progress * color_count as f64;
+            let color_index = color_index_f.floor() as usize;
+            let next_index = (color_index + 1) % color_count;
+            let segment_progress = color_index_f - color_index as f64;
+            (color_index, next_index, segment_progress)
+        }
+        CycleDirection::Backward => {
+            let reversed_progress = 1.0 - cycle_progress;
+            let color_index_f = reversed_progress * color_count as f64;
+            let color_index = color_index_f.floor() as usize;
+
+            // Handle boundary case: when reversed_progress = 1.0 (cycle start),
+            // color_index_f = color_count, which is out of bounds.
+            if color_index >= color_count {
+                (color_count - 1, color_count - 1, 0.0)
+            } else {
+                let next_index = if color_index == 0 {
+                    color_count - 1
+                } else {
+                    color_index - 1
+                };
+                let segment_progress = color_index_f - color_index as f64;
+                (color_index, next_index, segment_progress)
+            }
+        }
+        CycleDirection::PingPong => {
+            // PingPong: go forward then backward through colors
+            // ping_pong_progress goes 0 → 1 → 0 over one cycle
+            let ping_pong_progress = if cycle_progress < 0.5 {
+                cycle_progress * 2.0
+            } else {
+                2.0 - cycle_progress * 2.0
+            };
+
+            // Map ping_pong_progress (0 to 1) to color indices (0 to len-1)
+            let max_index = (color_count - 1) as f64;
+            let color_progress = ping_pong_progress * max_index;
+
+            // Calculate current and next color indices for interpolation
+            let color_index = color_progress.floor() as usize;
+            let seg_progress = color_progress - color_index as f64;
+
+            // Handle edge case when at exactly the last color
+            if color_index >= color_count - 1 {
+                (color_count - 1, color_count - 1, 0.0)
+            } else {
+                (color_index, color_index + 1, seg_progress)
+            }
+        }
+    }
+}
+
+/// Process a single effect and return fixture states
+pub(crate) fn process_effect(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    focus_points: &HashMap<String, [f64; 3]>,
+    effect: &EffectInstance,
+    elapsed: Duration,
+    engine_elapsed: Duration,
+    tempo_map: Option<&TempoMap>,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    if !effect.enabled {
+        return Ok(None);
+    }
+
+    // Calculate absolute time for tempo-aware effects
+    let absolute_time = engine_elapsed;
+
+    match &effect.effect_type {
+        EffectType::Move {
+            to,
+            from,
+            easing,
+            duration,
+        } => Ok(Some(apply_move(
+            fixture_registry,
+            focus_points,
+            effect,
+            to,
+            from.as_ref(),
+            *easing,
+            *duration,
+            elapsed,
+        ))),
+        EffectType::Static { parameters, .. } => {
+            apply_static_effect(fixture_registry, effect, parameters, elapsed)
+        }
+        EffectType::ColorCycle {
+            colors,
+            speed,
+            direction,
+            transition,
+            ..
+        } => {
+            let current_speed =
+                speed.to_rate_with_offset(tempo_map, absolute_time, effect.tempo_offset_secs);
+            apply_color_cycle(
+                fixture_registry,
+                effect,
+                colors,
+                current_speed,
+                direction,
+                *transition,
+                elapsed,
+            )
+        }
+        EffectType::Strobe { frequency, .. } => {
+            let current_frequency =
+                frequency.to_rate_with_offset(tempo_map, absolute_time, effect.tempo_offset_secs);
+            apply_strobe(fixture_registry, effect, current_frequency, elapsed)
+        }
+        EffectType::Dimmer {
+            start_level,
+            end_level,
+            duration,
+            curve,
+        } => apply_dimmer(
+            fixture_registry,
+            effect,
+            *start_level,
+            *end_level,
+            curve,
+            elapsed,
+            *duration,
+        ),
+        EffectType::Chase {
+            pattern,
+            speed,
+            direction,
+            transition,
+            ..
+        } => {
+            let current_speed =
+                speed.to_rate_with_offset(tempo_map, absolute_time, effect.tempo_offset_secs);
+            apply_chase(
+                fixture_registry,
+                effect,
+                pattern,
+                current_speed,
+                direction,
+                *transition,
+                elapsed,
+            )
+        }
+        EffectType::Rainbow {
+            speed,
+            saturation,
+            brightness,
+            ..
+        } => {
+            let current_speed =
+                speed.to_rate_with_offset(tempo_map, absolute_time, effect.tempo_offset_secs);
+            apply_rainbow(
+                fixture_registry,
+                effect,
+                current_speed,
+                *saturation,
+                *brightness,
+                elapsed,
+            )
+        }
+        EffectType::Pulse {
+            base_level,
+            pulse_amplitude,
+            frequency,
+            ..
+        } => {
+            let current_frequency =
+                frequency.to_rate_with_offset(tempo_map, absolute_time, effect.tempo_offset_secs);
+            apply_pulse(
+                fixture_registry,
+                effect,
+                *base_level,
+                *pulse_amplitude,
+                current_frequency,
+                elapsed,
+            )
+        }
+    }
+}
+
+/// Apply a static effect and return fixture states
+fn apply_static_effect(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    parameters: &HashMap<String, f64>,
+    elapsed: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    // Calculate crossfade multiplier
+    let crossfade_multiplier = effect.calculate_crossfade_multiplier(elapsed);
+
+    // The level goes through the fixture profile rather than being matched against a
+    // channel name: it is a level to composite with the colour, whatever the
+    // fixture's hardware, not a channel to write.
+    let level = parameters.get("dimmer").copied();
+
+    let fixture_states =
+        build_fixture_states_with_info(fixture_registry, effect, |fixture, profile| {
+            let channels = parameters
+                .iter()
+                .filter(|(param_name, _)| param_name.as_str() != "dimmer")
+                .filter(|(param_name, _)| fixture.takes_channel(param_name))
+                .map(|(param_name, value)| {
+                    // A replace fades by crossfading with what is beneath it;
+                    // the other modes fade their own contribution, which at
+                    // zero leaves the bed untouched.
+                    let state = if effect.blend_mode == BlendMode::Replace {
+                        ChannelState::new(*value, effect.layer, effect.blend_mode)
+                            .with_mix(crossfade_multiplier)
+                    } else {
+                        ChannelState::new(
+                            *value * crossfade_multiplier,
+                            effect.layer,
+                            effect.blend_mode,
+                        )
+                    };
+                    (param_name.clone(), state)
+                });
+            let mut state = FixtureState::from_channels(channels);
+
+            if let Some(level) = level {
+                for (channel_name, channel_state) in profile.apply_brightness(
+                    level * crossfade_multiplier,
+                    effect.layer,
+                    effect.blend_mode,
+                ) {
+                    state.set_channel(channel_name, channel_state);
+                }
+            }
+
+            state
+        });
+
+    Ok(Some(fixture_states))
+}
+
+/// Apply a color cycle effect and return fixture states
+fn apply_color_cycle(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    colors: &[Color],
+    speed: f64,
+    direction: &CycleDirection,
+    transition: CycleTransition,
+    elapsed: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    if colors.is_empty() {
+        return Ok(None);
+    }
+
+    // Calculate crossfade multiplier
+    let crossfade_multiplier = effect.calculate_crossfade_multiplier(elapsed);
+
+    // Guard against zero/negative speed - treat as "stopped" at first color
+    if speed <= 0.0 {
+        let color = colors[0];
+        let fixture_states = build_fixture_states(fixture_registry, effect, |profile| {
+            let mut commands = profile.apply_color(color, effect.layer, effect.blend_mode);
+            for state in commands.values_mut() {
+                state.value *= crossfade_multiplier;
+            }
+            commands
+        });
+        return Ok(Some(fixture_states));
+    }
+
+    let cycle_time = 1.0 / speed;
+    let cycle_progress_val = cycle_progress(elapsed, cycle_time);
+
+    // Calculate color indices and interpolation factor for smooth transitions
+    let (color_index, next_index, segment_progress) =
+        calculate_color_indices(cycle_progress_val, colors.len(), direction);
+
+    // Apply transition based on transition type
+    let color = match transition {
+        CycleTransition::Fade => {
+            // Interpolate between current and next color for smooth transitions
+            let current_color = colors[color_index % colors.len()];
+            let next_color = colors[next_index % colors.len()];
+            current_color.lerp(&next_color, segment_progress)
+        }
+        CycleTransition::Hue => colors[color_index % colors.len()]
+            .lerp_hue(&colors[next_index % colors.len()], segment_progress),
+        CycleTransition::Snap => {
+            // Snap to current color (original behavior)
+            colors[color_index % colors.len()]
+        }
+    };
+    if effect.spread != 0.0 {
+        // Each ordered target a share of the spread further along the
+        // cycle: `spread: 360deg` paints every colour of the cycle across
+        // the group at once.
+        let fixture_states = build_spread_states(fixture_registry, effect, |share| {
+            let progress = (cycle_progress_val + share * effect.spread / 360.0).rem_euclid(1.0);
+            let (i, next, t) = calculate_color_indices(progress, colors.len(), direction);
+            let color = match transition {
+                CycleTransition::Fade => {
+                    colors[i % colors.len()].lerp(&colors[next % colors.len()], t)
+                }
+                CycleTransition::Hue => {
+                    colors[i % colors.len()].lerp_hue(&colors[next % colors.len()], t)
+                }
+                CycleTransition::Snap => colors[i % colors.len()],
+            };
+            (color, crossfade_multiplier)
+        });
+        return Ok(Some(fixture_states));
+    }
+    let fixture_states = build_fixture_states(fixture_registry, effect, |profile| {
+        let mut commands = profile.apply_color(color, effect.layer, effect.blend_mode);
+        for state in commands.values_mut() {
+            state.value *= crossfade_multiplier;
+        }
+        commands
+    });
+
+    Ok(Some(fixture_states))
+}
+
+/// Colour states across the effect's targets in spatial order, each given
+/// its share (0 for the first, `(n−1)/n` for the last) of the spread
+/// (design §17.3). The colour and level come from `color_at(share)`.
+fn build_spread_states(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    color_at: impl Fn(f64) -> (Color, f64),
+) -> HashMap<String, FixtureState> {
+    let ordered = spatial_order(
+        fixture_registry,
+        &effect.target_fixtures,
+        &ChaseDirection::LeftToRight,
+    );
+    let n = ordered.len().max(1) as f64;
+    let mut fixture_states = HashMap::new();
+    for (i, fixture_name) in ordered.iter().enumerate() {
+        if let Some(fixture) = fixture_registry.get(fixture_name) {
+            let (color, level) = color_at(i as f64 / n);
+            let profile = FixtureProfile::for_fixture(fixture);
+            let mut commands = profile.apply_color(color, effect.layer, effect.blend_mode);
+            for state in commands.values_mut() {
+                state.value *= level;
+            }
+            fixture_states.insert(fixture_name.clone(), FixtureState::from_channels(commands));
+        }
+    }
+    fixture_states
+}
+
+/// Apply a strobe effect and return fixture states
+fn apply_strobe(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    frequency: f64,
+    elapsed: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    // Calculate crossfade multiplier
+    let crossfade_multiplier = effect.calculate_crossfade_multiplier(elapsed);
+
+    let fixture_states =
+        build_fixture_states_with_info(fixture_registry, effect, |fixture, profile| {
+            if frequency == 0.0 {
+                // Frequency 0 means strobe is disabled
+                let mut fixture_state = FixtureState::new();
+                if fixture.has_capability(FixtureCapabilities::STROBING) {
+                    // Hardware strobe: just disable the strobe channel
+                    fixture_state.set_channel(
+                        "strobe".to_string(),
+                        ChannelState::new(0.0, effect.layer, effect.blend_mode),
+                    );
+                }
+                // Software strobe: when frequency=0, don't set any channels
+                // This allows parent layers/effects to take over control
+                fixture_state
+            } else {
+                // Calculate strobe parameters based on strategy
+                let (normalized_frequency, strobe_value) =
+                    if profile.strobe_strategy == StrobeStrategy::DedicatedChannel {
+                        // Hardware strobe: the fixture's own rule, which the
+                        // state stream reads the byte back through.
+                        let normalized = fixture.strobe_map().normalized(frequency);
+                        (normalized, None)
+                    } else {
+                        // Software strobe: calculate on/off value
+                        let strobe_period = 1.0 / frequency;
+                        let strobe_phase = cycle_progress(elapsed, strobe_period);
+                        let is_strobe_on = strobe_phase < 0.5; // 50% duty cycle
+                        (frequency, Some(if is_strobe_on { 1.0 } else { 0.0 }))
+                    };
+
+                let channel_commands = profile.apply_strobe(
+                    normalized_frequency,
+                    effect.layer,
+                    effect.blend_mode,
+                    crossfade_multiplier,
+                    strobe_value,
+                );
+                let mut fixture_state = FixtureState::from_channels(channel_commands);
+                // A software strobe's bytes show only its phase; the state
+                // stream reports the rate from here.
+                if strobe_value.is_some() && crossfade_multiplier > 0.0 {
+                    fixture_state.strobe_hz = Some(frequency);
+                }
+                fixture_state
+            }
+        });
+
+    Ok(Some(fixture_states))
+}
+
+/// Apply a dimmer effect and return fixture states
+fn apply_dimmer(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    start_level: f64,
+    end_level: f64,
+    curve: &DimmerCurve,
+    elapsed: Duration,
+    duration: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    // Calculate dimmer value based on elapsed time and duration with curve applied
+    let dimmer_value = if duration.is_zero() {
+        end_level // Instant transition
+    } else {
+        let linear_progress = fade_progress(elapsed, duration);
+
+        // Apply curve to the progress value
+        let curved_progress = match curve {
+            DimmerCurve::Linear => linear_progress,
+            DimmerCurve::Exponential => linear_progress * linear_progress,
+            DimmerCurve::Logarithmic => {
+                if linear_progress <= 0.0 {
+                    0.0
+                } else {
+                    // Map [0,1] to [0,1] using log curve
+                    // log(1 + 9*x) / log(10) gives nice log curve from 0 to 1
+                    (1.0 + 9.0 * linear_progress).log10()
+                }
+            }
+            DimmerCurve::Sine => {
+                // Smooth ease-in-out using sine
+                (1.0 - ((linear_progress * std::f64::consts::PI).cos())) / 2.0
+            }
+            DimmerCurve::Cosine => {
+                // Smooth ease-in using cosine: starts slow, ends fast
+                1.0 - (linear_progress * std::f64::consts::FRAC_PI_2).cos()
+            }
+        };
+
+        crate::lighting::channels::lerp(start_level, end_level, curved_progress)
+    };
+
+    // Apply dimmer to all fixtures
+    let fixture_states = build_fixture_states(fixture_registry, effect, |profile| {
+        profile.apply_brightness(dimmer_value, effect.layer, effect.blend_mode)
+    });
+
+    Ok(Some(fixture_states))
+}
+
+/// The pose a move target means for one fixture. A focus point aims
+/// through the pointing math from the fixture's position and mounting; a
+/// fixture the venue has not placed aims from the origin, level — which is
+/// wrong, and what the `move-without-positions` lint says. An unbound
+/// focus point leaves the fixture where it is (`None`).
+fn target_pose(
+    fixture: &FixtureInfo,
+    focus_points: &HashMap<String, [f64; 3]>,
+    target: &MoveTarget,
+    current: Option<Pose>,
+) -> Option<Pose> {
+    match target {
+        MoveTarget::Focus(name) => {
+            let point = focus_points.get(name)?;
+            let position = fixture.position.unwrap_or([0.0; 3]);
+            let rotation = fixture.rotation.unwrap_or([0.0; 3]);
+            let span = |channel: &str, parameter: PhysicalParameter| {
+                fixture
+                    .channel_defs
+                    .get(channel)
+                    .map(|def| {
+                        let (from, to, _, _) = degree_span(def, parameter);
+                        (from, to)
+                    })
+                    .unwrap_or(parameter.fallback_range())
+            };
+            let pan_range = span("pan", PhysicalParameter::Pan);
+            let (tilt_low, tilt_high) = {
+                let (a, b) = span("tilt", PhysicalParameter::Tilt);
+                (a.min(b), a.max(b))
+            };
+            let reference = current.unwrap_or(Pose {
+                pan: 0.0,
+                tilt: 0.0,
+            });
+            // Two ways to reach any point (design §18.2): the one inside
+            // the tilt range whose pan is nearest the head's current pan
+            // wins, ties to the smaller tilt change. Nothing in range:
+            // the principal solution, clamped by the resolver.
+            let calibration = fixture.calibration();
+            let solutions = calibration.aim_solutions(position, rotation, *point);
+            // On the pan axis — straight down or straight up — every pan
+            // is the same beam: hold the head's pan rather than snap it.
+            // The axis is the joint's, so the test is on the joint tilt,
+            // before the calibration's offset is taken off.
+            // (A lens carried off the pan axis would make pan matter even
+            // there, so the hold is only for a lens on the axis.)
+            let joint_tilt = solutions[0].tilt + calibration.tilt_offset;
+            let on_axis =
+                !(1e-6..=180.0 - 1e-6).contains(&joint_tilt) && calibration.lens_on_pan_axis();
+            if on_axis {
+                return Some(Pose {
+                    pan: reference.pan,
+                    tilt: solutions[0].tilt.round(),
+                });
+            }
+            solutions
+                .iter()
+                .filter(|s| s.tilt >= tilt_low - 1e-9 && s.tilt <= tilt_high + 1e-9)
+                .map(|s| Pose {
+                    pan: nearest_pan(s.pan, reference.pan, pan_range),
+                    tilt: s.tilt,
+                })
+                .min_by(|a, b| {
+                    // Costs quantised to a millidegree so a true tie (a
+                    // level target: ±90° either way) is a tie, and the
+                    // principal solution keeps it.
+                    let cost = |p: &Pose| {
+                        (
+                            ((p.pan - reference.pan).abs() * 1e3).round(),
+                            ((p.tilt - reference.tilt).abs() * 1e3).round(),
+                        )
+                    };
+                    cost(a).partial_cmp(&cost(b)).expect("finite poses")
+                })
+                .or(Some(Pose {
+                    pan: nearest_pan(solutions[0].pan, reference.pan, pan_range),
+                    tilt: solutions[0].tilt,
+                }))
+        }
+        MoveTarget::Angles { pan, tilt } => Some(Pose {
+            pan: pan.or(current.map(|c| c.pan)).unwrap_or(0.0),
+            tilt: tilt.or(current.map(|c| c.tilt)).unwrap_or(0.0),
+        }),
+    }
+}
+
+/// Where a move ends for each of its targets: the poses a completed move
+/// commits to memory, so a move whose last frame fell short of its
+/// duration (or that had no duration at all) still arrives.
+pub(crate) fn move_final_poses(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    focus_points: &HashMap<String, [f64; 3]>,
+    effect: &EffectInstance,
+) -> HashMap<String, Pose> {
+    let EffectType::Move { to, .. } = &effect.effect_type else {
+        return HashMap::new();
+    };
+    effect
+        .target_fixtures
+        .iter()
+        .filter_map(|name| {
+            let fixture = fixture_registry.get(name)?;
+            let remembered = effect.start_poses.get(name).copied();
+            target_pose(fixture, focus_points, to, remembered).map(|pose| (name.clone(), pose))
+        })
+        .collect()
+}
+
+/// Where a move has each of its targets at `elapsed` of its own: the pose
+/// a seek commits for a move cut short part way, as the head was shown at
+/// the cut.
+pub(crate) fn move_poses_at(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    focus_points: &HashMap<String, [f64; 3]>,
+    effect: &EffectInstance,
+    elapsed: Duration,
+) -> HashMap<String, Pose> {
+    let EffectType::Move {
+        to,
+        from,
+        easing,
+        duration,
+    } = &effect.effect_type
+    else {
+        return HashMap::new();
+    };
+    move_poses(
+        fixture_registry,
+        focus_points,
+        effect,
+        to,
+        from.as_ref(),
+        *easing,
+        *duration,
+        elapsed,
+    )
+}
+
+/// Each target's pose part way through a move: from its start pose to its
+/// target pose over the duration, eased, in degrees.
+#[allow(clippy::too_many_arguments)]
+fn move_poses(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    focus_points: &HashMap<String, [f64; 3]>,
+    effect: &EffectInstance,
+    to: &MoveTarget,
+    from: Option<&MoveTarget>,
+    easing: Easing,
+    duration: Duration,
+    elapsed: Duration,
+) -> HashMap<String, Pose> {
+    let travel = easing.apply(fade_progress(elapsed, duration));
+
+    let mut poses = HashMap::new();
+    for name in &effect.target_fixtures {
+        let Some(fixture) = fixture_registry.get(name) else {
+            continue;
+        };
+        let remembered = effect.start_poses.get(name).copied();
+        let Some(target) = target_pose(fixture, focus_points, to, remembered) else {
+            continue;
+        };
+        // Where the travel starts: the explicit `from`, else the pose the
+        // engine remembered when the effect began, else the target itself
+        // (a snap — the show's first cue has nowhere to sweep from).
+        // A `from` naming a focus point the venue does not bind is a lint
+        // finding, not a snap: it falls back to the remembered pose the
+        // same way an absent `from` does.
+        let start = from
+            .and_then(|from| target_pose(fixture, focus_points, from, remembered))
+            .or(remembered)
+            .unwrap_or(target);
+        poses.insert(name.clone(), lerp(start, target, travel));
+    }
+    poses
+}
+
+/// Apply a move effect: each target travels from its start pose to its
+/// target pose over the duration, eased, in degrees. The result is a
+/// physical intent per fixture; the engine slews and remembers it.
+#[allow(clippy::too_many_arguments)]
+fn apply_move(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    focus_points: &HashMap<String, [f64; 3]>,
+    effect: &EffectInstance,
+    to: &MoveTarget,
+    from: Option<&MoveTarget>,
+    easing: Easing,
+    duration: Duration,
+    elapsed: Duration,
+) -> HashMap<String, FixtureState> {
+    move_poses(
+        fixture_registry,
+        focus_points,
+        effect,
+        to,
+        from,
+        easing,
+        duration,
+        elapsed,
+    )
+    .into_iter()
+    .map(|(name, pose)| {
+        let mut state = FixtureState::new();
+        state.physical.set(
+            PhysicalParameter::Pan,
+            Intent {
+                degrees: pose.pan,
+                layer: effect.layer,
+            },
+        );
+        state.physical.set(
+            PhysicalParameter::Tilt,
+            Intent {
+                degrees: pose.tilt,
+                layer: effect.layer,
+            },
+        );
+        (name, state)
+    })
+    .collect()
+}
+
+/// Apply a chase effect and return fixture states
+fn apply_chase(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    pattern: &ChasePattern,
+    speed: f64,
+    direction: &ChaseDirection,
+    transition: CycleTransition,
+    elapsed: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    // Calculate crossfade multiplier
+    let crossfade_multiplier = effect.calculate_crossfade_multiplier(elapsed);
+
+    // Guard against zero/negative speed - treat as "stopped" with first fixture active
+    if speed <= 0.0 {
+        let mut fixture_states = HashMap::new();
+        for (i, fixture_name) in effect.target_fixtures.iter().enumerate() {
+            if let Some(fixture) = fixture_registry.get(fixture_name) {
+                let chase_value = if i == 0 { crossfade_multiplier } else { 0.0 };
+                let profile = FixtureProfile::for_fixture(fixture);
+                let channel_commands =
+                    profile.apply_chase(chase_value, effect.layer, effect.blend_mode);
+                fixture_states.insert(
+                    fixture_name.clone(),
+                    FixtureState::from_channels(channel_commands),
+                );
+            }
+        }
+        return Ok(Some(fixture_states));
+    }
+
+    let chase_period = if speed > 0.0 {
+        1.0 / speed
+    } else {
+        f64::INFINITY
+    };
+
+    let mut fixture_states = HashMap::new();
+    let fixture_count = effect.target_fixtures.len();
+
+    // Guard against empty fixture list - nothing to chase
+    if fixture_count == 0 {
+        return Ok(Some(fixture_states));
+    }
+
+    // Where the venue places every target, the direction means what it
+    // says on the stage plot; otherwise it is group-list order, as before.
+    let targets = spatial_order(fixture_registry, &effect.target_fixtures, direction);
+
+    // Calculate fixture order based on pattern and direction
+    let mut fixture_order =
+        calculate_fixture_order(fixture_count, pattern, direction, effect.cue_time);
+
+    // Calculate the pattern cycle length
+    let pattern_length = fixture_order.len();
+
+    // Use consistent timing for all patterns
+    // Each position in the pattern should last the same time as a linear chase position
+    let position_duration = chase_period / fixture_count as f64;
+    let pattern_cycle_period = position_duration * pattern_length as f64;
+
+    // The fixture lit just before this lap began: the order's own last entry
+    // for a pattern that repeats, the previous lap's last for a random one.
+    let mut previous_lap_last = fixture_order.last().copied();
+    if matches!(pattern, ChasePattern::Random) {
+        // A fresh shuffle every lap (#532): one order reused on every lap made
+        // a "random" chase a fixed loop. Seeded by the cue time and the lap, so
+        // the same moment always renders the same order.
+        let lap = (elapsed.as_secs_f64() / pattern_cycle_period)
+            .floor()
+            .max(0.0) as u64;
+        fixture_order = random_lap_order(fixture_count, effect.cue_time, lap);
+        if lap > 0 {
+            let previous = random_lap_order(fixture_count, effect.cue_time, lap - 1);
+            previous_lap_last = previous.last().copied();
+            // No double tap at the seam: a lap does not start on the fixture
+            // the previous one ended on. Swapping the first two never moves a
+            // lap's last entry (with three or more), so each lap only needs its
+            // predecessor's shuffle, not a chain back to the first.
+            if fixture_count >= 3 && fixture_order.first().copied() == previous_lap_last {
+                fixture_order.swap(0, 1);
+            }
+        }
+    }
+
+    let pattern_progress = cycle_progress(elapsed, pattern_cycle_period);
+    let current_pattern_index_f = pattern_progress * pattern_length as f64;
+    let current_pattern_index = current_pattern_index_f.floor() as usize;
+    let position_progress = current_pattern_index_f - current_pattern_index as f64;
+
+    for (i, fixture_name) in targets.iter().enumerate() {
+        if let Some(fixture) = fixture_registry.get(fixture_name) {
+            let chase_value = match transition {
+                CycleTransition::Snap => {
+                    // Binary on/off: fixture is either fully on or fully off
+                    let is_fixture_active = if current_pattern_index < pattern_length {
+                        fixture_order[current_pattern_index] == i
+                    } else {
+                        false
+                    };
+                    if is_fixture_active {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                // A chase has no colours to turn through; the parser
+                // accepts `hue` on cycles only.
+                CycleTransition::Fade | CycleTransition::Hue => {
+                    // Fade in/out: calculate smooth transitions
+                    // Each fixture fades in over the first 50% of its position, stays at 1.0 for the middle,
+                    // and fades out over the last 50% of its position
+                    let fade_ratio = 0.5; // 50% of position_duration for fade in, 50% for fade out
+
+                    // Check if this fixture is the current active fixture
+                    let is_current = if current_pattern_index < pattern_length {
+                        fixture_order[current_pattern_index] == i
+                    } else {
+                        false
+                    };
+
+                    // Check if this fixture is the previous fixture (fading out)
+                    let previous = if current_pattern_index > 0 {
+                        fixture_order.get(current_pattern_index - 1).copied()
+                    } else {
+                        previous_lap_last
+                    };
+                    let is_previous = previous == Some(i);
+
+                    if is_current {
+                        // Current fixture: fade in if at start of position, otherwise full on
+                        if position_progress < fade_ratio {
+                            // Fading in: 0.0 to 1.0 over first 50% of position
+                            position_progress / fade_ratio
+                        } else {
+                            // Fully on for the rest of the position
+                            1.0
+                        }
+                    } else if is_previous {
+                        // Previous fixture: fade out if at start of next position
+                        if position_progress < fade_ratio {
+                            // Fading out: 1.0 to 0.0 over first 50% of next position
+                            1.0 - (position_progress / fade_ratio)
+                        } else {
+                            // Fully off
+                            0.0
+                        }
+                    } else {
+                        // Not active
+                        0.0
+                    }
+                }
+            } * crossfade_multiplier;
+
+            // Use fixture profile to determine how to apply chase control
+            let profile = FixtureProfile::for_fixture(fixture);
+            let channel_commands =
+                profile.apply_chase(chase_value, effect.layer, effect.blend_mode);
+            fixture_states.insert(
+                fixture_name.clone(),
+                FixtureState::from_channels(channel_commands),
+            );
+        }
+    }
+
+    Ok(Some(fixture_states))
+}
+
+/// The chase's targets in the order the stage plot gives them, when the
+/// venue places every one of them; group-list order otherwise.
+///
+/// Directions read from the audience: `left_to_right` runs from stage-right
+/// (−x) to stage-left (+x), `top_to_bottom` from upstage (+y) to downstage,
+/// and `clockwise` goes around the targets' centroid as seen from above,
+/// starting at the upstage-most fixture. The reverse directions are the
+/// same orders reversed by `calculate_fixture_order`, so only the forward
+/// sort is decided here. Without positions the venue's own list order
+/// stands, and a mixed group (some placed, some not) keeps list order too
+/// rather than guessing where the unplaced ones are.
+fn spatial_order(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    targets: &[String],
+    direction: &ChaseDirection,
+) -> Vec<String> {
+    let mut placed: Vec<(String, [f64; 3])> = Vec::with_capacity(targets.len());
+    for name in targets {
+        match fixture_registry.get(name) {
+            Some(fixture) => match fixture.position {
+                Some(position) => placed.push((name.clone(), position)),
+                None => return targets.to_vec(),
+            },
+            None => {
+                // A stale or misspelled group member: visible here rather
+                // than as "the chase does not look spatial".
+                tracing::debug!(
+                    fixture = %name,
+                    "chase target is not a registered fixture; using list order"
+                );
+                return targets.to_vec();
+            }
+        }
+    }
+    if placed.len() < 2 {
+        return targets.to_vec();
+    }
+    type Placed = (String, [f64; 3]);
+    let key: Box<dyn Fn(&Placed) -> f64> = match direction {
+        ChaseDirection::LeftToRight | ChaseDirection::RightToLeft => Box::new(|(_, p)| p[0]),
+        ChaseDirection::TopToBottom | ChaseDirection::BottomToTop => Box::new(|(_, p)| -p[1]),
+        ChaseDirection::Clockwise | ChaseDirection::CounterClockwise => {
+            let n = placed.len() as f64;
+            let cx = placed.iter().map(|(_, p)| p[0]).sum::<f64>() / n;
+            let cy = placed.iter().map(|(_, p)| p[1]).sum::<f64>() / n;
+            // Angle measured clockwise from upstage, as seen from above.
+            Box::new(move |(_, p)| {
+                let angle = (p[0] - cx).atan2(p[1] - cy);
+                if angle < 0.0 {
+                    angle + std::f64::consts::TAU
+                } else {
+                    angle
+                }
+            })
+        }
+    };
+    // Stable, so fixtures sharing a coordinate keep their list order.
+    placed.sort_by(|a, b| {
+        key(a)
+            .partial_cmp(&key(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    placed.into_iter().map(|(name, _)| name).collect()
+}
+
+/// A random chase's fixture order for one lap: a shuffle seeded by the cue
+/// time (the song time the effect was meant to start), the fixture count and
+/// the lap number. Deterministic, so seeking to a moment renders the order
+/// that moment always had; a different shuffle on every lap (#532).
+fn random_lap_order(fixture_count: usize, cue_time: Option<Duration>, lap: u64) -> Vec<usize> {
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    match cue_time {
+        Some(cue) => cue.as_nanos().hash(&mut hasher),
+        // Fallback if cue_time not set (shouldn't happen in normal operation)
+        None => 13u64.hash(&mut hasher),
+    }
+    fixture_count.hash(&mut hasher);
+    lap.hash(&mut hasher);
+    let mut rng = StdRng::seed_from_u64(hasher.finish());
+
+    // Fisher-Yates shuffle with proper random number generator
+    let mut order: Vec<usize> = (0..fixture_count).collect();
+    for i in (1..fixture_count).rev() {
+        let j = rng.random_range(0..=i);
+        order.swap(i, j);
+    }
+    order
+}
+
+/// Calculate fixture order for chase effects based on pattern and direction
+fn calculate_fixture_order(
+    fixture_count: usize,
+    pattern: &ChasePattern,
+    direction: &ChaseDirection,
+    cue_time: Option<Duration>,
+) -> Vec<usize> {
+    match pattern {
+        // The first lap's order; `apply_chase` reshuffles every lap.
+        ChasePattern::Random => random_lap_order(fixture_count, cue_time, 0),
+        ChasePattern::Linear => {
+            // Linear pattern - fixtures in order
+            let mut order: Vec<usize> = (0..fixture_count).collect();
+            // Direction determines if we reverse the order
+            match direction {
+                ChaseDirection::LeftToRight
+                | ChaseDirection::TopToBottom
+                | ChaseDirection::Clockwise => {
+                    // Forward direction - keep original order
+                    order
+                }
+                ChaseDirection::RightToLeft
+                | ChaseDirection::BottomToTop
+                | ChaseDirection::CounterClockwise => {
+                    // Reverse direction - reverse the order
+                    order.reverse();
+                    order
+                }
+            }
+        }
+        ChasePattern::Snake => {
+            // Snake pattern - forward then reverse
+            // Create a snake pattern: 0, 1, 2, 3, 2, 1, 0, 1, 2, 3, ...
+            let mut snake_order = Vec::new();
+
+            // Forward pass: 0, 1, 2, 3
+            for i in 0..fixture_count {
+                snake_order.push(i);
+            }
+
+            // Reverse pass: 2, 1 (skip the last element to avoid duplication)
+            for i in (1..fixture_count - 1).rev() {
+                snake_order.push(i);
+            }
+
+            // Apply direction
+            match direction {
+                ChaseDirection::LeftToRight
+                | ChaseDirection::TopToBottom
+                | ChaseDirection::Clockwise => {
+                    // Forward direction - use snake order as is
+                    snake_order
+                }
+                ChaseDirection::RightToLeft
+                | ChaseDirection::BottomToTop
+                | ChaseDirection::CounterClockwise => {
+                    // Reverse direction - reverse the snake order
+                    snake_order.reverse();
+                    snake_order
+                }
+            }
+        }
+    }
+}
+
+/// Apply a rainbow effect and return fixture states
+fn apply_rainbow(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    speed: f64,
+    saturation: f64,
+    brightness: f64,
+    elapsed: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    // Calculate crossfade multiplier
+    let crossfade_multiplier = effect.calculate_crossfade_multiplier(elapsed);
+
+    // Calculate hue: cycles through 360 degrees based on speed
+    let hue = (elapsed.as_secs_f64() * speed * 360.0) % 360.0;
+    let color = Color::from_hsv(hue, saturation, brightness);
+
+    if effect.spread != 0.0 {
+        let fixture_states = build_spread_states(fixture_registry, effect, |share| {
+            let hue = (hue + share * effect.spread).rem_euclid(360.0);
+            (
+                Color::from_hsv(hue, saturation, brightness),
+                crossfade_multiplier,
+            )
+        });
+        return Ok(Some(fixture_states));
+    }
+
+    let fixture_states = build_fixture_states(fixture_registry, effect, |profile| {
+        let mut commands = profile.apply_color(color, effect.layer, effect.blend_mode);
+        for state in commands.values_mut() {
+            state.value *= crossfade_multiplier;
+        }
+        commands
+    });
+
+    Ok(Some(fixture_states))
+}
+
+/// Apply a pulse effect and return fixture states
+fn apply_pulse(
+    fixture_registry: &HashMap<String, FixtureInfo>,
+    effect: &EffectInstance,
+    base_level: f64,
+    pulse_amplitude: f64,
+    frequency: f64,
+    elapsed: Duration,
+) -> Result<Option<HashMap<String, FixtureState>>, EffectError> {
+    // Calculate crossfade multiplier
+    let crossfade_multiplier = effect.calculate_crossfade_multiplier(elapsed);
+
+    let pulse_phase = phase(elapsed, frequency);
+    // Convert sine wave (-1 to 1) to 0-1 range, then scale by amplitude
+    let pulse_value =
+        (base_level + pulse_amplitude * (pulse_phase.sin() * 0.5 + 0.5)) * crossfade_multiplier;
+
+    // Apply pulse to all fixtures
+    let fixture_states = build_fixture_states(fixture_registry, effect, |profile| {
+        profile.apply_pulse(pulse_value, effect.layer, effect.blend_mode)
+    });
+
+    Ok(Some(fixture_states))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── cycle_progress ───────────────────────────────────────────
+
+    #[test]
+    fn cycle_progress_at_zero() {
+        assert!((cycle_progress(Duration::ZERO, 1.0) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cycle_progress_halfway() {
+        let p = cycle_progress(Duration::from_secs_f64(0.5), 1.0);
+        assert!((p - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cycle_progress_wraps() {
+        let p = cycle_progress(Duration::from_secs_f64(1.5), 1.0);
+        assert!((p - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cycle_progress_quarter() {
+        let p = cycle_progress(Duration::from_secs_f64(0.25), 1.0);
+        assert!((p - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cycle_progress_fast_period() {
+        let p = cycle_progress(Duration::from_secs_f64(0.1), 0.2);
+        assert!((p - 0.5).abs() < 1e-10);
+    }
+
+    // ── phase ────────────────────────────────────────────────────
+
+    #[test]
+    fn phase_at_zero() {
+        assert!((phase(Duration::ZERO, 1.0) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn phase_one_cycle() {
+        let p = phase(Duration::from_secs(1), 1.0);
+        assert!((p - 2.0 * std::f64::consts::PI).abs() < 1e-10);
+    }
+
+    #[test]
+    fn phase_half_cycle() {
+        let p = phase(Duration::from_secs_f64(0.5), 1.0);
+        assert!((p - std::f64::consts::PI).abs() < 1e-10);
+    }
+
+    #[test]
+    fn phase_2hz() {
+        let p = phase(Duration::from_secs(1), 2.0);
+        assert!((p - 4.0 * std::f64::consts::PI).abs() < 1e-10);
+    }
+
+    // ── calculate_color_indices ──────────────────────────────────
+
+    #[test]
+    fn color_indices_forward_start() {
+        let (idx, next, progress) = calculate_color_indices(0.0, 3, &CycleDirection::Forward);
+        assert_eq!(idx, 0);
+        assert_eq!(next, 1);
+        assert!(progress < 0.01);
+    }
+
+    #[test]
+    fn color_indices_forward_mid() {
+        // At 50% through a 3-color cycle, we're at color index 1.5
+        let (idx, next, progress) = calculate_color_indices(0.5, 3, &CycleDirection::Forward);
+        assert_eq!(idx, 1);
+        assert_eq!(next, 2);
+        assert!((progress - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn color_indices_forward_wraps() {
+        // Near the end, next should wrap to 0
+        let (idx, next, _) = calculate_color_indices(0.9, 3, &CycleDirection::Forward);
+        assert_eq!(idx, 2);
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn color_indices_backward_start() {
+        // At progress 0.0, backward means reversed_progress = 1.0
+        let (idx, next, progress) = calculate_color_indices(0.0, 3, &CycleDirection::Backward);
+        // At boundary: color_index = color_count, returns (count-1, count-1, 0.0)
+        assert_eq!(idx, 2);
+        assert_eq!(next, 2);
+        assert!(progress.abs() < 0.01);
+    }
+
+    #[test]
+    fn color_indices_backward_mid() {
+        let (idx, _, _) = calculate_color_indices(0.5, 3, &CycleDirection::Backward);
+        // reversed_progress = 0.5, 0.5 * 3 = 1.5, floor = 1
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn color_indices_pingpong_start() {
+        let (idx, next, _) = calculate_color_indices(0.0, 4, &CycleDirection::PingPong);
+        assert_eq!(idx, 0);
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn color_indices_pingpong_midpoint() {
+        // At 0.5, ping_pong_progress = 1.0, should be at last color
+        let (idx, next, _) = calculate_color_indices(0.5, 4, &CycleDirection::PingPong);
+        assert_eq!(idx, 3);
+        assert_eq!(next, 3); // edge case at last color
+    }
+
+    #[test]
+    fn color_indices_pingpong_quarter() {
+        // At 0.25, ping_pong_progress = 0.5, 0.5 * 3 = 1.5
+        let (idx, next, progress) = calculate_color_indices(0.25, 4, &CycleDirection::PingPong);
+        assert_eq!(idx, 1);
+        assert_eq!(next, 2);
+        assert!((progress - 0.5).abs() < 0.01);
+    }
+
+    // ── calculate_fixture_order ──────────────────────────────────
+
+    #[test]
+    fn fixture_order_linear_forward() {
+        let order =
+            calculate_fixture_order(4, &ChasePattern::Linear, &ChaseDirection::LeftToRight, None);
+        assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn fixture_order_linear_reverse() {
+        let order =
+            calculate_fixture_order(4, &ChasePattern::Linear, &ChaseDirection::RightToLeft, None);
+        assert_eq!(order, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn fixture_order_snake_forward() {
+        let order =
+            calculate_fixture_order(4, &ChasePattern::Snake, &ChaseDirection::LeftToRight, None);
+        // 0, 1, 2, 3, 2, 1
+        assert_eq!(order, vec![0, 1, 2, 3, 2, 1]);
+    }
+
+    #[test]
+    fn fixture_order_snake_reverse() {
+        let order =
+            calculate_fixture_order(4, &ChasePattern::Snake, &ChaseDirection::RightToLeft, None);
+        // Reversed: 1, 2, 3, 2, 1, 0
+        assert_eq!(order, vec![1, 2, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn fixture_order_random_deterministic() {
+        let cue_time = Some(Duration::from_secs(10));
+        let order1 = calculate_fixture_order(
+            5,
+            &ChasePattern::Random,
+            &ChaseDirection::LeftToRight,
+            cue_time,
+        );
+        let order2 = calculate_fixture_order(
+            5,
+            &ChasePattern::Random,
+            &ChaseDirection::LeftToRight,
+            cue_time,
+        );
+        // Same cue_time → same order
+        assert_eq!(order1, order2);
+        // Should be a permutation of 0..5
+        let mut sorted = order1.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn fixture_order_random_different_seeds() {
+        let order1 = calculate_fixture_order(
+            8,
+            &ChasePattern::Random,
+            &ChaseDirection::LeftToRight,
+            Some(Duration::from_secs(1)),
+        );
+        let order2 = calculate_fixture_order(
+            8,
+            &ChasePattern::Random,
+            &ChaseDirection::LeftToRight,
+            Some(Duration::from_secs(999)),
+        );
+        // Different seeds should (very likely) produce different orders
+        // Not guaranteed, but with 8 elements the chance of collision is ~1/40320
+        assert_ne!(order1, order2);
+    }
+
+    #[test]
+    fn fixture_order_linear_single() {
+        let order =
+            calculate_fixture_order(1, &ChasePattern::Linear, &ChaseDirection::LeftToRight, None);
+        assert_eq!(order, vec![0]);
+    }
+
+    // ── process_effect disabled ──────────────────────────────────
+
+    #[test]
+    fn process_effect_disabled() {
+        let registry = HashMap::new();
+        let mut effect = EffectInstance::new(
+            "test".to_string(),
+            EffectType::Static {
+                parameters: HashMap::new(),
+                duration: Duration::ZERO,
+            },
+            vec![],
+            None,
+            None,
+            None,
+        );
+        effect.enabled = false;
+        let result = process_effect(
+            &registry,
+            &HashMap::new(),
+            &effect,
+            Duration::ZERO,
+            Duration::ZERO,
+            None,
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── build_fixture_states ─────────────────────────────────────
+
+    #[test]
+    fn build_fixture_states_skips_unknown() {
+        let registry = HashMap::new(); // No fixtures registered
+        let effect = EffectInstance::new(
+            "test".to_string(),
+            EffectType::Static {
+                parameters: HashMap::new(),
+                duration: Duration::ZERO,
+            },
+            vec!["unknown_fixture".to_string()],
+            None,
+            None,
+            None,
+        );
+        let states = build_fixture_states(&registry, &effect, |_profile| HashMap::new());
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn build_fixture_states_with_fixture() {
+        let mut channels = HashMap::new();
+        channels.insert("dimmer".to_string(), 1u16);
+        let fixture = FixtureInfo::new(
+            "test_fix".to_string(),
+            1,
+            1,
+            "generic".to_string(),
+            channels,
+            None,
+        );
+        let mut registry = HashMap::new();
+        registry.insert("test_fix".to_string(), fixture);
+
+        let effect = EffectInstance::new(
+            "test".to_string(),
+            EffectType::Static {
+                parameters: HashMap::new(),
+                duration: Duration::ZERO,
+            },
+            vec!["test_fix".to_string()],
+            None,
+            None,
+            None,
+        );
+        let states = build_fixture_states(&registry, &effect, |_profile| {
+            let mut cmds = HashMap::new();
+            cmds.insert(
+                "dimmer".to_string(),
+                ChannelState::new(1.0, EffectLayer::FOREGROUND, BlendMode::Replace),
+            );
+            cmds
+        });
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key("test_fix"));
+    }
+}
+
+#[cfg(test)]
+mod spatial_order_tests {
+    use super::*;
+
+    fn registry(placed: &[(&str, Option<[f64; 3]>)]) -> HashMap<String, FixtureInfo> {
+        placed
+            .iter()
+            .map(|(name, position)| {
+                let mut info = FixtureInfo::new(
+                    name.to_string(),
+                    1,
+                    1,
+                    "T".to_string(),
+                    HashMap::new(),
+                    None,
+                );
+                info.position = *position;
+                (name.to_string(), info)
+            })
+            .collect()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positioned_targets_order_by_the_stage_plot() {
+        // Listed in patch order, hung the other way round.
+        let reg = registry(&[
+            ("a", Some([2.0, 0.0, 3.0])),
+            ("b", Some([-2.0, 0.0, 3.0])),
+            ("c", Some([0.0, 0.0, 3.0])),
+        ]);
+        let targets = names(&["a", "b", "c"]);
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::LeftToRight),
+            names(&["b", "c", "a"]),
+            "audience left is stage-right (−x)"
+        );
+        // The reverse direction is the same sort; the caller reverses.
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::RightToLeft),
+            names(&["b", "c", "a"])
+        );
+    }
+
+    #[test]
+    fn top_to_bottom_runs_upstage_to_downstage() {
+        let reg = registry(&[
+            ("front", Some([0.0, 0.5, 3.0])),
+            ("back", Some([0.0, 4.0, 3.0])),
+            ("mid", Some([0.0, 2.0, 3.0])),
+        ]);
+        let targets = names(&["front", "back", "mid"]);
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::TopToBottom),
+            names(&["back", "mid", "front"])
+        );
+    }
+
+    #[test]
+    fn clockwise_goes_around_the_centroid_from_upstage() {
+        let reg = registry(&[
+            ("us", Some([0.0, 4.0, 3.0])),
+            ("sl", Some([2.0, 2.0, 3.0])),
+            ("ds", Some([0.0, 0.0, 3.0])),
+            ("sr", Some([-2.0, 2.0, 3.0])),
+        ]);
+        let targets = names(&["ds", "sr", "us", "sl"]);
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::Clockwise),
+            names(&["us", "sl", "ds", "sr"]),
+            "seen from above: upstage, stage-left, downstage, stage-right"
+        );
+    }
+
+    #[test]
+    fn a_group_without_positions_keeps_list_order() {
+        let reg = registry(&[("a", None), ("b", None)]);
+        let targets = names(&["b", "a"]);
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::LeftToRight),
+            names(&["b", "a"])
+        );
+        // Mixed: one placed, one not — no guessing.
+        let reg = registry(&[("a", Some([1.0, 0.0, 0.0])), ("b", None)]);
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::LeftToRight),
+            names(&["b", "a"])
+        );
+    }
+
+    #[test]
+    fn fixtures_sharing_a_coordinate_keep_list_order() {
+        let reg = registry(&[
+            ("a", Some([0.0, 0.0, 0.0])),
+            ("b", Some([0.0, 1.0, 0.0])),
+            ("c", Some([0.0, 2.0, 0.0])),
+        ]);
+        let targets = names(&["c", "a", "b"]);
+        assert_eq!(
+            spatial_order(&reg, &targets, &ChaseDirection::LeftToRight),
+            names(&["c", "a", "b"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod random_chase_tests {
+    use super::*;
+
+    const FIXTURES: usize = 8;
+
+    fn rig() -> (HashMap<String, FixtureInfo>, EffectInstance) {
+        let names: Vec<String> = (0..FIXTURES).map(|i| format!("brick{i}")).collect();
+        let registry = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut channels = HashMap::new();
+                channels.insert("dimmer".to_string(), 1);
+                let info = FixtureInfo::new(
+                    name.clone(),
+                    1,
+                    1 + i as u16,
+                    "Dimmer".to_string(),
+                    channels,
+                    None,
+                );
+                (name.clone(), info)
+            })
+            .collect();
+        let mut effect = EffectInstance::new(
+            "random".to_string(),
+            EffectType::Chase {
+                pattern: ChasePattern::Random,
+                speed: TempoAwareSpeed::Fixed(1.0),
+                direction: ChaseDirection::LeftToRight,
+                transition: CycleTransition::Snap,
+                duration: Duration::from_secs(60),
+            },
+            names,
+            None,
+            None,
+            None,
+        );
+        effect.cue_time = Some(Duration::from_secs(42));
+        (registry, effect)
+    }
+
+    /// The fixture lit at `secs` into the chase (one lap a second).
+    fn lit_at(
+        registry: &HashMap<String, FixtureInfo>,
+        effect: &EffectInstance,
+        secs: f64,
+    ) -> usize {
+        let states = apply_chase(
+            registry,
+            effect,
+            &ChasePattern::Random,
+            1.0,
+            &ChaseDirection::LeftToRight,
+            CycleTransition::Snap,
+            Duration::from_secs_f64(secs),
+        )
+        .unwrap()
+        .unwrap();
+        let lit: Vec<usize> = (0..FIXTURES)
+            .filter(|i| {
+                states[&format!("brick{i}")]
+                    .all_states()
+                    .any(|c| c.value > 0.5)
+            })
+            .collect();
+        assert_eq!(lit.len(), 1, "exactly one fixture lit at {secs}: {lit:?}");
+        lit[0]
+    }
+
+    /// Each lap's order, sampled in the middle of every step.
+    fn laps(
+        registry: &HashMap<String, FixtureInfo>,
+        effect: &EffectInstance,
+        count: usize,
+    ) -> Vec<Vec<usize>> {
+        (0..count)
+            .map(|lap| {
+                (0..FIXTURES)
+                    .map(|step| {
+                        lit_at(
+                            registry,
+                            effect,
+                            lap as f64 + (step as f64 + 0.5) / FIXTURES as f64,
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// #532: every lap is a fresh permutation, not the first one repeated.
+    #[test]
+    fn a_random_chase_reshuffles_every_lap() {
+        let (registry, effect) = rig();
+        let laps = laps(&registry, &effect, 6);
+        for lap in &laps {
+            let mut sorted = lap.clone();
+            sorted.sort();
+            assert_eq!(
+                sorted,
+                (0..FIXTURES).collect::<Vec<_>>(),
+                "a lap visits every fixture once: {lap:?}"
+            );
+        }
+        let distinct: std::collections::HashSet<&Vec<usize>> = laps.iter().collect();
+        assert!(distinct.len() > 1, "every lap had the same order: {laps:?}");
+        assert_ne!(laps[0], laps[1], "the second lap repeated the first");
+    }
+
+    /// The same moment always renders the same fixture, so seeking and
+    /// re-renders agree.
+    #[test]
+    fn a_random_chase_is_deterministic() {
+        let (registry, effect) = rig();
+        assert_eq!(laps(&registry, &effect, 4), laps(&registry, &effect, 4));
+    }
+
+    /// No lap starts on the fixture the previous lap ended on.
+    #[test]
+    fn a_random_chase_never_double_taps_at_a_lap_seam() {
+        let (registry, effect) = rig();
+        let laps = laps(&registry, &effect, 40);
+        for pair in laps.windows(2) {
+            assert_ne!(
+                pair[0].last(),
+                pair[1].first(),
+                "a lap began on the fixture the last one ended on: {pair:?}"
+            );
+        }
+    }
+}

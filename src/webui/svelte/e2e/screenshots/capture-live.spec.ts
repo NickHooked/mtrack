@@ -18,13 +18,16 @@
 // Run via `npm run screenshots:live` (assumes mtrack on http://localhost:8080;
 // override with MTRACK_URL=...).
 //
-// Picks songs/playlists dynamically from /api/songs and /api/playlists so
+// Picks songs/playlists dynamically from the player's ListSongs and ListPlaylists so
 // the spec doesn't bake in operator-specific names.
 
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
+import { mapPlaylistList, mapSongList } from "../../src/lib/grpc/library";
+import { configClientAt, playerClientAt } from "../support/player-client";
+import { FileKind } from "../../src/gen/player/v1/player_pb";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -54,21 +57,23 @@ interface PlaylistSummary {
   name: string;
   is_active?: boolean;
   song_count?: number;
+  reserved?: boolean;
 }
 
-async function fetchJson<T>(page: Page, urlPath: string): Promise<T> {
-  const res = await page.request.get(urlPath);
-  if (!res.ok()) {
-    throw new Error(`GET ${urlPath} → ${res.status()}`);
-  }
-  return (await res.json()) as T;
+/** The player's gRPC service, on the server the shots are of. */
+function player() {
+  return playerClientAt(process.env.MTRACK_URL ?? "http://localhost:8080");
+}
+
+/** The editor service of the same server. */
+function config() {
+  return configClientAt(process.env.MTRACK_URL ?? "http://localhost:8080");
 }
 
 async function pickSong(
-  page: Page,
   predicate: (s: SongSummary) => boolean,
 ): Promise<string> {
-  const data = await fetchJson<{ songs: SongSummary[] }>(page, "/api/songs");
+  const data = mapSongList(await player().listSongs({ detailed: true }));
   const match = data.songs.find(predicate) ?? data.songs[0];
   if (!match) {
     throw new Error("no songs available on the live server");
@@ -76,11 +81,13 @@ async function pickSong(
   return match.name;
 }
 
-async function pickPlaylist(page: Page): Promise<string> {
-  const playlists = await fetchJson<PlaylistSummary[]>(page, "/api/playlists");
-  // Prefer the active playlist with the most songs, ignoring "all_songs"
-  // (which renders differently and isn't representative).
-  const candidates = playlists.filter((p) => p.name !== "all_songs");
+async function pickPlaylist(): Promise<string> {
+  const playlists: PlaylistSummary[] = mapPlaylistList(
+    await player().listPlaylists({ detailed: true }),
+  );
+  // Prefer the active playlist with the most songs, ignoring the player's
+  // own (`reserved`), which renders differently and isn't representative.
+  const candidates = playlists.filter((p) => !p.reserved);
   const sorted = [...candidates].sort(
     (a, b) => (b.song_count ?? 0) - (a.song_count ?? 0),
   );
@@ -108,7 +115,6 @@ test("song-detail", async ({ page }) => {
   // A song with both lighting and sections gives the detail page the most
   // to render — beat grid, section markers, lighting summary.
   const song = await pickSong(
-    page,
     (s) => !!s.has_lighting && (s.sections?.length ?? 0) > 0,
   );
   await page.goto(`/#/songs/${encodeURIComponent(song)}`);
@@ -118,7 +124,7 @@ test("song-detail", async ({ page }) => {
 });
 
 test("song-sections", async ({ page }) => {
-  const song = await pickSong(page, (s) => (s.sections?.length ?? 0) > 1);
+  const song = await pickSong((s) => (s.sections?.length ?? 0) > 1);
   await page.goto(`/#/songs/${encodeURIComponent(song)}/sections`);
   await expect(page.locator(".tab.active")).toContainText("Timeline");
   await page.waitForTimeout(400);
@@ -129,7 +135,6 @@ test("timeline-editor", async ({ page }) => {
   // Prefer a song with sections too — those are usually the ones with
   // authored lighting cues, not just an empty .light file.
   const song = await pickSong(
-    page,
     (s) => !!s.has_lighting && (s.sections?.length ?? 0) > 0,
   );
   await page.goto(`/#/songs/${encodeURIComponent(song)}/lighting`);
@@ -142,7 +147,7 @@ test("timeline-editor", async ({ page }) => {
 });
 
 test("playlist-editor", async ({ page }) => {
-  const playlist = await pickPlaylist(page);
+  const playlist = await pickPlaylist();
   await page.goto(`/#/playlists/${encodeURIComponent(playlist)}`);
   await expect(page.locator(".song-columns")).toBeVisible();
   await page.waitForTimeout(300);
@@ -182,12 +187,12 @@ test("bulk-import-result", async ({ page }) => {
   // Override the parent path with MTRACK_IMPORT_PATH if the auto-pick
   // doesn't produce a representative result.
   const importPath =
-    process.env.MTRACK_IMPORT_PATH ?? (await pickImportParent(page));
+    process.env.MTRACK_IMPORT_PATH ?? (await pickImportParent());
 
   // Bulk import is a config change, and a live player starts locked
   // (the server answers 423 while locked). Unlock for the shot, and
   // restore the lock afterwards so the instance is left as found.
-  await page.request.put("/api/lock", { data: { locked: false } });
+  await player().setLock({ locked: false });
   try {
     await page.goto("/#/songs");
     await page.getByRole("button", { name: /import from filesystem/i }).click();
@@ -214,34 +219,20 @@ test("bulk-import-result", async ({ page }) => {
       path: path.join(DOCS_IMAGES, "bulk-import-result.png"),
     });
   } finally {
-    await page.request.put("/api/lock", { data: { locked: true } });
+    await player().setLock({ locked: true });
   }
 });
-
-interface BrowseEntry {
-  name: string;
-  path: string;
-  type: string;
-}
-
-interface BrowseResponse {
-  entries: BrowseEntry[];
-  path: string;
-}
 
 // Find the first directory (under /) whose children are themselves
 // directories — that's typically a parent-of-songs (artist/album/song
 // layout). Falls back to "/" if nothing better is found.
-async function pickImportParent(page: Page): Promise<string> {
-  const root = await fetchJson<BrowseResponse>(page, "/api/browse?path=/");
+async function pickImportParent(): Promise<string> {
+  const root = await config().browseDirectory({ path: "/" });
   for (const entry of root.entries) {
-    if (entry.type !== "directory") continue;
-    const child = await fetchJson<BrowseResponse>(
-      page,
-      `/api/browse?path=${encodeURIComponent(entry.path)}`,
-    );
+    if (entry.kind !== FileKind.DIRECTORY) continue;
+    const child = await config().browseDirectory({ path: entry.path });
     const subdirCount = child.entries.filter(
-      (e) => e.type === "directory",
+      (e) => e.kind === FileKind.DIRECTORY,
     ).length;
     if (subdirCount >= 3) {
       return entry.path;

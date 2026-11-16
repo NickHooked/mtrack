@@ -59,6 +59,69 @@ pub struct PlaybackSync {
     pub loop_control: LoopControl,
 }
 
+/// Plays a song as a mock device does: ready at once, the clock's start
+/// waited for, then `remaining` slept through on a thread, cut short by a
+/// cancel. `stopping` runs as soon as playback is known to be over, before
+/// the thread is joined, so a caller's "playing" flag is down by the time
+/// a stop returns.
+pub(crate) fn mock_play(
+    sync: PlaybackSync,
+    remaining: Duration,
+    stopping: impl FnOnce(),
+) -> Result<(), String> {
+    let PlaybackSync {
+        cancel_handle,
+        ready_tx,
+        clock,
+        ..
+    } = sync;
+    let (sleep_tx, sleep_rx) = std::sync::mpsc::channel::<()>();
+    let finished = Arc::new(AtomicBool::new(false));
+    let join_handle = {
+        let cancel_handle = cancel_handle.clone();
+        let finished = finished.clone();
+        std::thread::spawn(move || {
+            let mut ready_tx = ready_tx;
+            ready_tx.send();
+            clock.wait_for_start_or_cancel(&cancel_handle);
+            if !cancel_handle.is_cancelled() {
+                let _ = sleep_rx.recv_timeout(remaining);
+            }
+            // Expire at the end of playback, or at once on a cancel.
+            finished.store(true, Ordering::Relaxed);
+            cancel_handle.notify();
+        })
+    };
+    cancel_handle.wait(finished);
+    stopping();
+    // Wakes a playback cut short; one that ran to its end has already
+    // dropped the receiver, and is no error.
+    let _ = sleep_tx.send(());
+    join_handle
+        .join()
+        .map_err(|_| "Error while joining thread!".to_string())
+}
+
+/// How the song a loop break moves to fades in under the one fading out.
+#[derive(Clone, Debug)]
+pub struct StartFade {
+    /// The song it is for: another song started instead does not fade in.
+    pub song: String,
+    pub fade: crate::songs::ResolvedFade,
+}
+
+/// A loop break's fade-out in progress (a playlist `fade_out`).
+#[derive(Clone, Debug)]
+pub struct BreakFade {
+    /// When the break came.
+    pub started: std::time::Instant,
+    /// How long the audio fades.
+    pub length: Duration,
+    pub curve: crate::audio::crossfade::CrossfadeCurve,
+    /// Tracks that cut at once instead.
+    pub exclude: Vec<String>,
+}
+
 /// Bundles the shared loop-control state threaded through audio, MIDI, and DMX
 /// `play_from` / `play` methods.
 #[derive(Clone)]
@@ -69,8 +132,270 @@ pub struct LoopControl {
     pub active_section: Arc<parking_lot::RwLock<Option<crate::player::SectionBounds>>>,
     /// Shared flag to break out of a section loop.
     pub section_loop_break: Arc<AtomicBool>,
-    /// Accumulated time consumed by section loop iterations.
-    pub loop_time_consumed: Arc<parking_lot::Mutex<Duration>>,
+    /// A loop break's fade-out (a playlist `fade_out`), set by the player as it
+    /// breaks the loop.
+    pub break_fade: Arc<parking_lot::Mutex<Option<BreakFade>>>,
+    /// The sources fading out after a loop break, which a stop cuts.
+    pub break_fade_ids: Arc<parking_lot::Mutex<Vec<u64>>>,
+    /// How the song fades in under a song a loop break is fading out (a
+    /// playlist `fade_in`), set by the player as it breaks the loop and taken
+    /// by the audio device as the song starts.
+    pub start_fade: Arc<parking_lot::Mutex<Option<StartFade>>>,
+    /// This playback's section loop jumps, as they are committed to: by the
+    /// audio when it plays any, by a thread of their own otherwise. The
+    /// notes, lights and beat clock follow them, so none can decide a
+    /// moment before or after the others.
+    pub section_jumps: Arc<SectionJumpLog>,
+    /// The lighting palette the song plays in, decided as it starts and
+    /// not changed while it plays: the slots overridden by the song, and by
+    /// the playlist entry it plays from. Any slot not named is the show's
+    /// default.
+    pub palette: Arc<std::collections::HashMap<String, crate::lighting::effects::Color>>,
+}
+
+/// A playback's section loop jumps, in order, as they are committed to. Each
+/// follower reads it with a [`JumpCursor`] of its own.
+#[derive(Default)]
+pub struct SectionJumpLog {
+    jumps: parking_lot::Mutex<Jumps>,
+    /// Who commits the jumps: nobody yet, the audio, or the playback's own
+    /// publisher. One only, whatever happens to the audio at the start.
+    publisher: std::sync::atomic::AtomicU8,
+    /// The playback's clock and start position: the timeline the jumps are
+    /// timed on, read to know which have fallen due.
+    timeline: parking_lot::Mutex<Option<(crate::clock::PlaybackClock, Duration)>>,
+    /// Set once whoever commits the jumps has stopped playing: no more will
+    /// come. Until then the followers follow, even past the end of their own
+    /// notes or cues, since a section armed late, or one looping past them,
+    /// takes them back.
+    closed: AtomicBool,
+}
+
+/// The jumps of a [`SectionJumpLog`], with what they have put back counted
+/// as they come, and how many were due by the latest time asked about, so
+/// a status poll does not walk them all.
+#[derive(Default)]
+struct Jumps {
+    list: Vec<crate::section_loop::SectionJump>,
+    /// The time the jumps up to and including each put back, in all.
+    put_back: Vec<Duration>,
+    /// The latest time asked about, and how many jumps had fallen due by it.
+    due: Option<(Duration, usize)>,
+}
+
+impl Jumps {
+    fn push(&mut self, jump: crate::section_loop::SectionJump) {
+        let total = self.put_back.last().copied().unwrap_or_default() + jump.amount();
+        self.put_back.push(total);
+        self.list.push(jump);
+    }
+
+    /// How many jumps have fallen due by `at`: those from the first up to
+    /// one that falls later. Counted on from the latest time asked about,
+    /// when `at` is no earlier, as it is for the playback's own clock.
+    fn due_by(&mut self, at: Duration) -> usize {
+        let mut due = match self.due {
+            Some((asked, due)) if asked <= at => due,
+            _ => 0,
+        };
+        while self.list.get(due).is_some_and(|jump| jump.at <= at) {
+            due += 1;
+        }
+        self.due = Some((at, due));
+        due
+    }
+
+    /// The time the first `due` jumps put back.
+    fn put_back(&self, due: usize) -> Duration {
+        due.checked_sub(1)
+            .map_or(Duration::ZERO, |last| self.put_back[last])
+    }
+}
+
+/// Who commits a playback's section loop jumps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JumpPublisherRole {
+    Audio = 1,
+    Fallback = 2,
+}
+
+impl SectionJumpLog {
+    /// Takes on committing the jumps, unless another has already: true if
+    /// `role` has it now.
+    pub fn claim(&self, role: JumpPublisherRole) -> bool {
+        use std::sync::atomic::Ordering;
+        match self
+            .publisher
+            .compare_exchange(0, role as u8, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(current) => current == role as u8,
+        }
+    }
+
+    /// Sets the playback's clock and start position, which the jumps are
+    /// timed on.
+    pub fn set_timeline(&self, clock: crate::clock::PlaybackClock, start_time: Duration) {
+        *self.timeline.lock() = Some((clock, start_time));
+    }
+
+    /// The time the jumps fallen due by now put back, and how many they are:
+    /// read on the playback's own clock, the jumps' timeline. None due before
+    /// it has started.
+    pub fn put_back_now(&self) -> (Duration, usize) {
+        self.now()
+            .map_or((Duration::ZERO, 0), |now| self.put_back_by(now))
+    }
+
+    /// Where the playback is on its timeline (the start position plus its
+    /// clock), once its clock has started.
+    pub fn now(&self) -> Option<Duration> {
+        self.timeline
+            .lock()
+            .as_ref()
+            .filter(|(clock, _)| clock.has_started())
+            .map(|(clock, start_time)| *start_time + clock.elapsed())
+    }
+
+    /// The time the jumps falling due by `at` (on the playback timeline) put
+    /// back, and how many they are.
+    pub fn put_back_by(&self, at: Duration) -> (Duration, usize) {
+        let mut jumps = self.jumps.lock();
+        let due = jumps.due_by(at);
+        (jumps.put_back(due), due)
+    }
+
+    /// Where in the song playback is at `at` on the playback timeline, by
+    /// the jumps fallen due by then: `at` before any, and from the latest's
+    /// target on after one.
+    pub fn song_position(&self, at: Duration) -> Duration {
+        let mut jumps = self.jumps.lock();
+        let due = jumps.due_by(at);
+        due.checked_sub(1)
+            .map_or(at, |latest| jumps.list[latest].song_position(at))
+    }
+
+    /// Whether the audio has taken on committing the jumps.
+    pub fn claimed_by_audio(&self) -> bool {
+        self.publisher.load(std::sync::atomic::Ordering::Acquire) == JumpPublisherRole::Audio as u8
+    }
+
+    /// Where in the song the pass crossing out is, while a crossfading
+    /// song's latest pass has it playing on under the new one: the part of
+    /// the song (its crossfade) that plays only as a pass crosses out.
+    pub fn crossing_out(&self) -> Option<Duration> {
+        let now = self.now()?;
+        let mut jumps = self.jumps.lock();
+        let due = jumps.due_by(now);
+        let latest = jumps.list.get(due.checked_sub(1)?)?;
+        latest.outgoing_position(now).filter(|_| latest.pass)
+    }
+
+    /// Whether a jump committed at or after `index` that `pick` picks has
+    /// fallen due.
+    pub fn due_since(
+        &self,
+        index: usize,
+        pick: impl Fn(&crate::section_loop::SectionJump) -> bool,
+    ) -> bool {
+        let Some(now) = self.now() else {
+            return false;
+        };
+        let mut jumps = self.jumps.lock();
+        let due = jumps.due_by(now);
+        jumps
+            .list
+            .get(index..due)
+            .is_some_and(|jumps| jumps.iter().any(pick))
+    }
+
+    /// How many jumps have been committed, fallen due or not.
+    pub fn committed(&self) -> usize {
+        self.jumps.lock().list.len()
+    }
+
+    /// Records a jump committed to.
+    pub fn push(&self, jump: crate::section_loop::SectionJump) {
+        self.jumps.lock().push(jump);
+    }
+
+    /// Says no more jumps will come: the audio, or the publisher standing in
+    /// for it, has stopped playing.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether no more jumps will come.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// The jump at `index`, if it has been committed to.
+    fn get(&self, index: usize) -> Option<crate::section_loop::SectionJump> {
+        self.jumps.lock().list.get(index).cloned()
+    }
+}
+
+/// A follower's place in a [`SectionJumpLog`]: the jumps it has passed, and
+/// the time they have put back.
+pub struct JumpCursor {
+    log: Arc<SectionJumpLog>,
+    next: usize,
+    consumed: Duration,
+    /// The latest jump passed, which the song position is counted from.
+    last: Option<crate::section_loop::SectionJump>,
+}
+
+impl JumpCursor {
+    pub fn new(log: Arc<SectionJumpLog>) -> Self {
+        JumpCursor {
+            log,
+            next: 0,
+            consumed: Duration::ZERO,
+            last: None,
+        }
+    }
+
+    /// The next jump committed to, not yet passed.
+    pub fn peek(&self) -> Option<crate::section_loop::SectionJump> {
+        self.log.get(self.next)
+    }
+
+    /// Passes the next jump if it falls due by `at` on the playback timeline
+    /// (the start position plus the clock), giving it.
+    pub fn due(&mut self, at: Duration) -> Option<crate::section_loop::SectionJump> {
+        let jump = self.peek().filter(|jump| jump.at <= at)?;
+        self.next += 1;
+        self.consumed += jump.amount();
+        self.last = Some(jump.clone());
+        Some(jump)
+    }
+
+    /// Where in the song playback is at `at` on the playback timeline, by
+    /// the jumps passed: `at` itself before any, and from the latest's
+    /// target on after one ([`SectionJump::song_position`]).
+    ///
+    /// [`SectionJump::song_position`]: crate::section_loop::SectionJump::song_position
+    pub fn song_position(&self, at: Duration) -> Duration {
+        self.last.as_ref().map_or(at, |jump| jump.song_position(at))
+    }
+
+    /// The time the jumps passed have put back: playback time less this is
+    /// the position in the song.
+    pub fn consumed(&self) -> Duration {
+        self.consumed
+    }
+
+    /// Whether another jump may yet come: one committed and not passed, or
+    /// the log still open.
+    pub fn may_jump(&self) -> bool {
+        self.peek().is_some() || !self.log.is_closed()
+    }
+
+    /// The log followed.
+    pub fn log(&self) -> &Arc<SectionJumpLog> {
+        &self.log
+    }
 }
 
 impl LoopControl {
@@ -80,8 +405,24 @@ impl LoopControl {
             loop_break: Arc::new(AtomicBool::new(false)),
             active_section: Arc::new(parking_lot::RwLock::new(None)),
             section_loop_break: Arc::new(AtomicBool::new(false)),
-            loop_time_consumed: Arc::new(parking_lot::Mutex::new(Duration::ZERO)),
+            break_fade: Arc::new(parking_lot::Mutex::new(None)),
+            break_fade_ids: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            start_fade: Arc::new(parking_lot::Mutex::new(None)),
+            section_jumps: Arc::new(SectionJumpLog::default()),
+            palette: Arc::default(),
         }
+    }
+}
+
+impl LoopControl {
+    /// A `LoopControl` for a playback nothing commits loop jumps for: its
+    /// log closed from the start, so the lights and notes end with their
+    /// own content, as a song without loops does.
+    #[cfg(test)]
+    pub fn without_jumps() -> Self {
+        let loop_control = Self::new();
+        loop_control.section_jumps.close();
+        loop_control
     }
 }
 
@@ -110,8 +451,17 @@ enum CancelState {
 pub struct CancelHandle {
     /// A boolean that should be set to true if the underlying operation should be cancelled.
     cancelled: Arc<Mutex<CancelState>>,
+    /// Whether `cancelled` has left `Untouched`, mirrored for a lock-free
+    /// [`CancelHandle::is_cancelled`]: the audio callback reads it for every
+    /// source, and must not wait on the mutex a cancel holds as it wakes the
+    /// waiters. Set under the mutex, before they are woken.
+    cancelled_flag: Arc<AtomicBool>,
     /// The condvar will handle notification of cancelling.
     condvar: Arc<Condvar>,
+    /// Held while the audio schedules a loop jump, and while a loop break
+    /// fades the playback out and says it is breaking: a jump is either
+    /// scheduled before the break, and made under its fade, or not at all.
+    jumps: Arc<Mutex<()>>,
 }
 
 impl CancelHandle {
@@ -119,7 +469,9 @@ impl CancelHandle {
     pub fn new() -> CancelHandle {
         CancelHandle {
             cancelled: Arc::new(Mutex::new(CancelState::Untouched)),
+            cancelled_flag: Arc::new(AtomicBool::new(false)),
             condvar: Arc::new(Condvar::new()),
+            jumps: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -137,7 +489,19 @@ impl CancelHandle {
     /// true whichever way the cancellation came about — only the player-side
     /// cleanup cares about the difference.
     pub fn is_cancelled(&self) -> bool {
-        *self.cancelled.lock() != CancelState::Untouched
+        self.cancelled_flag.load(Ordering::Acquire)
+    }
+
+    /// Holds off the playback's loop jumps until the guard is dropped: the
+    /// audio takes it to schedule one, a loop break to fade and break
+    /// between them.
+    pub fn hold_jumps(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.jumps.lock()
+    }
+
+    /// Whether `other` is a clone of this handle: the same playback.
+    pub fn same_as(&self, other: &CancelHandle) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
     }
 
     /// Waits for the cancel handle to be cancelled or for finished to be set to true.
@@ -179,6 +543,7 @@ impl CancelHandle {
         let mut cancel_state = self.cancelled.lock();
         if *cancel_state == CancelState::Untouched {
             *cancel_state = CancelState::Cancelled;
+            self.cancelled_flag.store(true, Ordering::Release);
             // Signal directly — we already hold the mutex.
             self.condvar.notify_all();
         }
@@ -202,6 +567,7 @@ impl CancelHandle {
         let mut cancel_state = self.cancelled.lock();
         if *cancel_state == CancelState::Untouched {
             *cancel_state = CancelState::CancelledByFailure;
+            self.cancelled_flag.store(true, Ordering::Release);
             self.condvar.notify_all();
         }
     }
@@ -218,6 +584,93 @@ mod test {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn the_log_tells_a_pass_crossing_out_and_whose_jumps_are_due() {
+        use crate::section_loop::SectionJump;
+        let secs = Duration::from_secs;
+        let log = SectionJumpLog::default();
+        let clock = crate::clock::PlaybackClock::wall();
+        clock.start();
+        // On the timeline at 97s: a pass at 96s with a 4s crossfade is 1s
+        // into crossing out; a section's jump comes later.
+        log.set_timeline(clock, secs(97));
+        log.push(SectionJump {
+            at: secs(96),
+            from: secs(96),
+            to: Duration::ZERO,
+            overlap: secs(4),
+            pass: true,
+        });
+        let out = log.crossing_out().expect("crossing out");
+        assert!(out >= secs(97) && out < secs(98), "{out:?}");
+        // The pass is due, but it is not the section's own jump.
+        assert!(log.due_since(0, |jump| jump.pass));
+        assert!(!log.due_since(0, |jump| !jump.pass));
+        assert!(!log.due_since(1, |_| true), "none due since it");
+        log.push(SectionJump {
+            at: secs(500),
+            from: secs(10),
+            to: secs(5),
+            overlap: Duration::ZERO,
+            pass: false,
+        });
+        assert!(!log.due_since(1, |_| true), "committed, not yet due");
+    }
+
+    /// What the jumps falling due by a time put back, and the song position
+    /// then, come out as walking them all from the first would make them,
+    /// whatever order the times are asked in, jumps committed meanwhile and
+    /// one falling a moment before the jump ahead of it included.
+    #[test]
+    fn the_log_counts_what_is_due_as_a_walk_from_the_first_does() {
+        use crate::section_loop::SectionJump;
+        let ms = Duration::from_millis;
+        let walk = |jumps: &[SectionJump], at: Duration| {
+            jumps
+                .iter()
+                .take_while(|jump| jump.at <= at)
+                .fold((Duration::ZERO, 0), |(time, count), jump| {
+                    (time + jump.amount(), count + 1)
+                })
+        };
+        let jump = |at: u64, from: u64, to: u64| SectionJump {
+            at: ms(at),
+            from: ms(from),
+            to: ms(to),
+            overlap: Duration::ZERO,
+            pass: false,
+        };
+        let all = [
+            jump(18_000, 18_000, 10_000),
+            jump(26_000, 18_000, 10_000),
+            // Armed past its end a moment after a jump fired early.
+            jump(25_990, 17_990, 10_000),
+            jump(33_990, 18_000, 10_000),
+            jump(50_000, 34_010, 20_000),
+        ];
+        let log = SectionJumpLog::default();
+        let mut pushed = Vec::new();
+        let asks = [
+            0, 17_999, 18_000, 25_995, 26_000, 26_000, 20_000, 40_000, 33_990, 60_000, 1_000,
+            60_000,
+        ];
+        for (i, ask) in asks.into_iter().enumerate() {
+            if let Some(next) = all.get(i / 2) {
+                if i % 2 == 0 {
+                    log.push(next.clone());
+                    pushed.push(next.clone());
+                }
+            }
+            let at = ms(ask);
+            let (put_back, due) = walk(&pushed, at);
+            assert_eq!(log.put_back_by(at), (put_back, due), "asked at {ask}ms");
+            let position = due
+                .checked_sub(1)
+                .map_or(at, |latest| pushed[latest].song_position(at));
+            assert_eq!(log.song_position(at), position, "asked at {ask}ms");
+        }
+    }
 
     #[test]
     fn test_cancel_handle_cancelled() {
@@ -276,6 +729,23 @@ mod test {
 
         cancel_handle.cancel();
         assert!(join.join().unwrap());
+    }
+
+    /// Cancelled either way, the handle says so without its lock, and keeps
+    /// telling the two apart.
+    #[test]
+    fn test_cancel_flag_follows_either_cancel() {
+        let deliberate = CancelHandle::new();
+        let failed = CancelHandle::new();
+        assert!(!deliberate.is_cancelled() && !failed.is_cancelled());
+        deliberate.cancel();
+        failed.cancel_due_to_failure();
+        // A second cancel of the other kind changes nothing.
+        deliberate.cancel_due_to_failure();
+        failed.cancel();
+        assert!(deliberate.is_cancelled() && failed.is_cancelled());
+        assert!(!deliberate.cancelled_due_to_failure());
+        assert!(failed.cancelled_due_to_failure());
     }
 
     #[test]

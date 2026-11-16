@@ -61,9 +61,22 @@ side_effects="$TMP/side-effects"
 base_output="$(cd "$ROOT" && MTRACK_TEST_SIDE_EFFECTS="$side_effects" PATH="$TMP/bin:$PATH" ./setup.sh --dry-run)"
 video_output="$(cd "$ROOT" && MTRACK_TEST_SIDE_EFFECTS="$side_effects" PATH="$TMP/bin:$PATH" ./setup.sh --dry-run --video)"
 [ ! -e "$side_effects" ] || fail "setup --dry-run invoked a state-changing command"
-assert_contains "$base_output" "sudo apt-get install -y build-essential pkg-config libasound2-dev libudev-dev libssl-dev protobuf-compiler" "base apt package list"
 assert_not_contains "$base_output" "gstreamer" "base setup must remain free of GStreamer"
-assert_contains "$video_output" "sudo apt-get install -y build-essential pkg-config libasound2-dev libudev-dev libssl-dev protobuf-compiler libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav" "video apt package list"
+assert_not_contains "$base_output" "gst-libav" "base setup must remain free of GStreamer"
+case "$video_output" in
+  *"Detected platform: debian"*)
+    assert_contains "$base_output" "libdbus-1-dev" "base BLE dependency"
+    assert_contains "$video_output" "gstreamer1.0-libav" "Debian video codecs" ;;
+  *"Detected platform: arch"*)
+    assert_contains "$base_output" "dbus" "base BLE dependency"
+    assert_contains "$video_output" "gst-libav" "Arch video codecs" ;;
+  *"Detected platform: fedora"*)
+    assert_contains "$base_output" "dbus-devel" "base BLE dependency"
+    assert_contains "$video_output" "gstreamer1-devel" "Fedora video development libraries" ;;
+  *"Detected platform: macos"*)
+    assert_contains "$video_output" "gstreamer" "macOS GStreamer" ;;
+  *) fail "unsupported setup platform" ;;
+esac
 ok "setup package selection is explicit and side-effect free"
 
 echo "== manifest and workflow intent =="
@@ -93,13 +106,18 @@ workflow = (root / ".github/workflows/mtrack.yaml").read_text()
 clippy = workflow.split("  clippy:\n", 1)[1].split("\n  rustfmt-check:\n", 1)[0]
 assert "gstreamer" not in clippy.lower(), "ordinary clippy installs GStreamer"
 assert "--all-features" not in clippy, "ordinary clippy enables all features"
-assert "--no-default-features" in clippy, "ordinary clippy is not explicitly audio-only"
+assert "--features ble,hub,tsify" in clippy, "ordinary clippy must cover every non-video feature"
 video_job = workflow.split("  video:\n", 1)[1].split("\n  test-deb:\n", 1)[0]
 assert "cargo clippy" in video_job and "--features video" in video_job, "video clippy coverage missing"
 assert "cargo test --features video video" in video_job, "video diagnostics/startup tests missing"
 assert "cargo test --features video --test video_engine" in video_job, "video engine/preview tests missing"
 PY
 ok "manifest metadata and CI feature lanes match their intent"
+
+if [ "${1:-}" = "--metadata-only" ]; then
+  echo "Setup and manifest checks passed; Debian package generation was not requested."
+  exit 0
+fi
 
 echo "== cargo-deb video package metadata =="
 command -v cargo-deb >/dev/null || fail "cargo-deb is required"

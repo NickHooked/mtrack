@@ -2,6 +2,52 @@
 
 This document describes the current state of the experimental Linux video timeline work and is intended to help Michael continue development without having to reconstruct the earlier decisions.
 
+## Upstream refresh — 2026-11-16
+
+This branch is integrated with upstream `mdwn/mtrack` main at
+`5c6dc6dcda` (227 upstream commits since the original video baseline).
+The previous video branch tip is preserved locally as
+`backup/video-before-upstream-2026-11-16` (`43bd54e`).
+
+A search of the 36 public upstream branches, commit messages, issues and
+pull requests found no GStreamer/video timeline implementation or public
+reference to this fork. This does not establish whether the maintainer has
+unpublished work. Upstream issue #612 discusses audio/DMX/MIDI delay and
+mentions video sync as a possible use case, but contains no video implementation.
+
+Integration changes:
+
+- The video configuration and safe media timeline resolver now live in
+  `crates/mtrack-core`; the GStreamer engine stays optional in the player.
+- Song loading, duration reporting and media inventory retain video support.
+  MIDI EndOfTrack duration and SMPTE timing from this branch are retained
+  alongside upstream's shared MIDI tempo model.
+- The editor uses upstream's gRPC song APIs. Its separate preview WebSocket
+  remains `/api/songs/{name}/video-preview/ws`; build capabilities are read
+  from `/api/video/capabilities`, since upstream removed the old REST status API.
+- Browser tests use the new gRPC mocks. The development proxy, video CI lane
+  and release workflow include the dependencies introduced upstream.
+- Live Player video integration, capture, independent program output and the
+  other incomplete features below remain incomplete. This update is a port,
+  not completion of the live-video feature set.
+
+Build with `make build-video`. The current upstream frontend additionally
+requires the pinned wasm-pack, wasm-bindgen and wasm-opt tools described in
+`setup.sh` and `scripts/install-binaryen.sh`.
+
+Local validation for the refresh: frontend type checking, production build,
+targeted ESLint, all 33 video browser tests, 26 core video tests, 23 MIDI
+playback tests, 140 song tests, 69 backend video tests (run serially) and all
+24 GStreamer integration tests passed.
+The updated app was also exercised with the two-clip demo: preview start,
+play, pause and seek produced frames. Packaging metadata checks passed;
+the full Debian package and the full repository test suite were not run.
+
+The existing editor still drops per-clip composition properties such as
+position, size, opacity and fades when parsing its editable configuration.
+The demo's overlay therefore fills the preview; this refresh does not fix
+that earlier prototype limitation.
+
 ## Repository and branch
 
 The work is published in Nick Haakman's fork:

@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use super::description::{Channel, Description};
 use super::GdtfError;
 use crate::lighting::types::{
-    Cell, ChannelDef, ChannelFunction, FixtureType, PhysicalRange, PhysicalUnit,
+    Cell, ChannelDef, ChannelFunction, FixtureType, FunctionStep, PhysicalRange, PhysicalUnit,
 };
 
 /// A distilled fixture type plus everything the distiller had to skip or
@@ -53,20 +53,103 @@ pub struct ModeSummary {
     pub channel_count: usize,
 }
 
-/// Summarizes every mode in a description.
+/// The variable-strobe function's table across a description's modes:
+/// `None` when no mode has a strobe rate in hertz (the strobe curve means
+/// nothing then), else the most steps any mode's table has (0 when only
+/// the endpoints are known, and the declared curve is linear in hertz).
+pub fn strobe_table_steps(description: &Description) -> Option<usize> {
+    strobe_tables(description)
+        .into_iter()
+        .map(|table| table.steps)
+        .max()
+}
+
+/// One mode's variable-strobe function, as the strobe curve sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrobeTable {
+    pub mode: String,
+    pub function: String,
+    /// The hertz the function's endpoints declare.
+    pub from_hz: f64,
+    pub to_hz: f64,
+    /// Steps in its own table (ChannelSets with a physical value); 0 when
+    /// only the endpoints are known.
+    pub steps: usize,
+}
+
+/// Every mode's variable-strobe function (`Shutter1Strobe` with a rate in
+/// hertz), in document order.
+pub fn strobe_tables(description: &Description) -> Vec<StrobeTable> {
+    let mut out = Vec::new();
+    for mode in &description.modes {
+        for function in mode
+            .channels
+            .iter()
+            .flat_map(|channel| &channel.logical_channels)
+            .flat_map(|logical| &logical.functions)
+        {
+            if function.attribute != "Shutter1Strobe" {
+                continue;
+            }
+            let Some(range) = strobe_hz_range(function) else {
+                continue;
+            };
+            let from = function.dmx_from.map(|v| v.coarse()).unwrap_or(0);
+            out.push(StrobeTable {
+                mode: mode.name.clone(),
+                function: function.name.clone(),
+                from_hz: range.from,
+                to_hz: range.to,
+                steps: strobe_steps(function, from, u8::MAX).len(),
+            });
+        }
+    }
+    out
+}
+
+/// Summarizes every mode in a description. A channel on a template geometry
+/// counts once per `GeometryReference`, shifted by that reference's Break —
+/// the same placement [`distill`] makes — so the footprint is the one a
+/// patch must actually reserve.
 pub fn mode_summaries(description: &Description) -> Vec<ModeSummary> {
     description
         .modes
         .iter()
-        .map(|mode| ModeSummary {
-            name: mode.name.clone(),
-            footprint: mode
-                .channels
-                .iter()
-                .flat_map(|c| c.offsets.iter().copied())
-                .max()
-                .unwrap_or(0),
-            channel_count: mode.channels.len(),
+        .map(|mode| {
+            let mut footprint: u32 = 0;
+            let mut channel_count = 0usize;
+            // Placement warnings are the distiller's to report, not ours.
+            let mut ignored = Vec::new();
+            for channel in &mode.channels {
+                let top = channel.offsets.iter().copied().max().unwrap_or(0) as u32;
+                match instances_of(
+                    description,
+                    &channel.geometry,
+                    &channel.dmx_break,
+                    0,
+                    &mut ignored,
+                ) {
+                    Some(instances) if !channel.offsets.is_empty() => {
+                        for shift in instances.iter().filter_map(|i| i.shift) {
+                            // A byte past the universe is skipped by the
+                            // distiller, so it reserves nothing here.
+                            if top + shift as u32 <= 512 {
+                                channel_count += 1;
+                                footprint = footprint.max(top + shift as u32);
+                            }
+                        }
+                    }
+                    _ => {
+                        channel_count += 1;
+                        footprint = footprint.max(top);
+                    }
+                }
+            }
+            ModeSummary {
+                name: mode.name.clone(),
+                footprint: footprint as u16,
+                channel_count,
+            }
         })
         .collect()
 }
@@ -186,6 +269,31 @@ pub fn distill(
     // the sections below are the real ones, named as the rig model names
     // them.
     named = expand_templates(named, description, &mut warnings);
+
+    // The intensity masters go to the section nearest the root. A master
+    // dimmer and shutter sit on the head, yoke or base, above the rings and
+    // lenses whose own dimmers repeat the attribute; in document order a
+    // Spiider's background ring comes first, and `dimmer` would light the
+    // ring and leave the beam dark. Only these two: colour belongs to the
+    // emitters, and a Spiider's flower sits above the wash zones whose
+    // colour is the fixture's, so depth would pick the wrong one there.
+    // The shallowest occurrence swaps places with the first, which leaves
+    // every other channel, and so the ganging below, in document order.
+    for master in ["dimmer", "strobe"] {
+        let occurrences: Vec<usize> = (0..named.len())
+            .filter(|&i| named[i].name == master)
+            .collect();
+        let shallowest = occurrences
+            .iter()
+            .copied()
+            .min_by_key(|&i| geometry_depth(description, &named[i].geometry));
+        if let (Some(&first), Some(shallowest)) = (occurrences.first(), shallowest) {
+            let depth = |i: usize| geometry_depth(description, &named[i].geometry);
+            if depth(shallowest) < depth(first) {
+                named.swap(first, shallowest);
+            }
+        }
+    }
 
     // Pass two. Geometries carrying exactly the same attribute set are
     // identical sections — pixels, batten segments — and are ganged: the
@@ -578,6 +686,29 @@ fn geometry_offset(description: &Description, name: &str) -> [f64; 3] {
     [m[0][3], m[1][3], m[2][3]]
 }
 
+/// How far below the root a geometry sits, counted the way
+/// [`geometry_offset`] walks an instance path: the outer chain, then each
+/// inner segment's chain below its template root. Unknown names sort last.
+fn geometry_depth(description: &Description, name: &str) -> usize {
+    let mut depth = 0;
+    for (segment_index, segment) in name.split('/').enumerate() {
+        let Some(mut at) = description
+            .geometries
+            .iter()
+            .position(|g| g.name == segment)
+        else {
+            return usize::MAX;
+        };
+        let mut chain = 1;
+        while let Some(parent) = description.geometries[at].parent {
+            chain += 1;
+            at = parent;
+        }
+        depth += if segment_index > 0 { chain - 1 } else { chain };
+    }
+    depth
+}
+
 /// Row-major 4×4 product `a · b`.
 fn multiply(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
     let mut out = [[0.0; 4]; 4];
@@ -606,6 +737,11 @@ fn canonical_channel_name(attribute: &str) -> Option<&'static str> {
         "ColorAdd_WW" => "warm_white",
         "ColorAdd_CW" => "cool_white",
         "ColorAdd_UV" => "uv",
+        // Subtractive mixing (a mover's CMY flags). The engine keeps colour in
+        // RGB and writes these as its complement at output.
+        "ColorSub_C" => "cyan",
+        "ColorSub_M" => "magenta",
+        "ColorSub_Y" => "yellow",
         "Pan" => "pan",
         "Tilt" => "tilt",
         "Zoom" => "zoom",
@@ -705,6 +841,7 @@ fn convert_functions(
         }
         let physical = strobe_hz_range(function);
         converted.push(ChannelFunction {
+            steps: strobe_steps(function, *dmx_from, dmx_to),
             name: canonical_function_name(function),
             dmx_from: *dmx_from,
             dmx_to,
@@ -712,6 +849,52 @@ fn convert_functions(
         });
     }
     converted
+}
+
+/// A strobe-frequency function's own table, from its ChannelSets: each
+/// set runs from its DMXFrom to the next set's DMXFrom − 1 (the last to
+/// the function's end) over its PhysicalFrom..PhysicalTo (a set with no
+/// PhysicalTo holds its PhysicalFrom). Sets without a physical value bound
+/// their neighbours but are not steps. Empty for any other function.
+pub(crate) fn strobe_steps(
+    function: &super::description::Function,
+    dmx_from: u8,
+    dmx_to: u8,
+) -> Vec<FunctionStep> {
+    if strobe_hz_range(function).is_none() {
+        return Vec::new();
+    }
+    let mut sets: Vec<(u8, Option<(f64, f64)>)> = function
+        .sets
+        .iter()
+        .filter_map(|set| {
+            let start = set.dmx_from?.coarse().clamp(dmx_from, dmx_to);
+            let physical = set
+                .physical_from
+                .map(|from| (from, set.physical_to.unwrap_or(from)));
+            Some((start, physical))
+        })
+        .collect();
+    // In DMX order; on a shared start the first in the document stands.
+    sets.sort_by_key(|(start, _)| *start);
+    sets.dedup_by_key(|(start, _)| *start);
+    let mut steps = Vec::new();
+    for (i, (start, physical)) in sets.iter().enumerate() {
+        let Some((from, to)) = physical else {
+            continue;
+        };
+        let end = match sets.get(i + 1) {
+            Some((next, _)) => next.saturating_sub(1).max(*start),
+            None => dmx_to,
+        };
+        steps.push(FunctionStep {
+            dmx_from: *start,
+            dmx_to: end,
+            from: *from,
+            to: *to,
+        });
+    }
+    steps
 }
 
 /// The Hz range of a strobe-frequency function, when it has one.
@@ -1029,6 +1212,32 @@ mod tests {
     }
 
     #[test]
+    fn the_section_nearest_the_root_claims_the_plain_name() {
+        // A Robe Spiider's shape: the background ring sits inside the head
+        // and its dimmer comes first in the file; the master dimmer on the
+        // head comes later. `dimmer` must be the master's, or a show's
+        // dimmer lights the ring and leaves the beam dark.
+        let xml = r#"<GDTF><FixtureType Name="Spider" Manufacturer="m">
+  <Geometries><Geometry Name="Base"><Geometry Name="Yoke"><Geometry Name="Head"><Geometry Name="Background"/></Geometry></Geometry></Geometry></Geometries>
+  <DMXModes>
+    <DMXMode Name="M" Geometry="Base">
+      <DMXChannels>
+        <DMXChannel Offset="1" Geometry="Background"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="BackgroundDimmer" Attribute="Dimmer" DMXFrom="0/1"/></LogicalChannel></DMXChannel>
+        <DMXChannel Offset="2" Geometry="Background"><LogicalChannel Attribute="ColorAdd_R"><ChannelFunction Name="R" Attribute="ColorAdd_R" DMXFrom="0/1"/></LogicalChannel></DMXChannel>
+        <DMXChannel Offset="3" Geometry="Head"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Master Dimmer" Attribute="Dimmer" DMXFrom="0/1"/></LogicalChannel></DMXChannel>
+      </DMXChannels>
+    </DMXMode>
+  </DMXModes>
+</FixtureType></GDTF>"#;
+        let description = parse_description(xml).unwrap();
+        let distilled = distill(&description, "M", "Spider").unwrap();
+        let defs = distilled.fixture_type.channel_defs();
+        assert_eq!(defs["dimmer"].offset, 3, "the head's master dimmer");
+        assert_eq!(defs["dimmer:background"].offset, 1);
+        assert_eq!(defs["red"].offset, 2);
+    }
+
+    #[test]
     fn differing_sections_keep_the_first_and_suffix_the_rest() {
         // A master dimmer beside a section with a dimmer and color: the
         // master's dimmer is the fixture's; the section's is kept by name.
@@ -1231,6 +1440,19 @@ mod tests {
     <DMXChannel Offset="13" Geometry="Lens"><LogicalChannel Attribute="ColorAdd_W"><ChannelFunction Name="W" Attribute="ColorAdd_W" DMXFrom="0/1"/></LogicalChannel></DMXChannel>
   </DMXChannels></DMXMode></DMXModes>
 </FixtureType></GDTF>"#;
+
+    #[test]
+    fn mode_summary_counts_template_references() {
+        let description = parse_description(TEMPLATE_PIXELS).unwrap();
+        let summary = &mode_summaries(&description)[0];
+        let distilled = distill(&description, "Pixel", "Templ").unwrap();
+        // Background channels 1-5 (three of them), then the four Lens
+        // channels at 10-13 once per reference; P3's Break puts its bytes
+        // 8 past the template's (offsets 18-21).
+        assert_eq!(summary.channel_count, 3 + 4 * 3);
+        assert_eq!(summary.footprint, 21);
+        assert_eq!(summary.footprint, distilled.fixture_type.footprint());
+    }
 
     #[test]
     fn template_channels_expand_per_reference_and_gang_by_shape() {

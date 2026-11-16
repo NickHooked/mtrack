@@ -1,0 +1,131 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+
+/**
+ * The 3D view's Preview mode (lighting UI design, section 12.1): a show
+ * evaluated offline at a moment, in the shape of a live frame of the stage stream (`StageState`),
+ * so the scene is fed the same way from either source.
+ */
+
+import type {
+  FixtureMetadata,
+  Preview,
+  PreviewEffect,
+  SongInfo,
+} from "../../gen/rules/mtrack_rules";
+import { lightingClient } from "../grpc/client";
+import { mapPreview } from "../grpc/lighting";
+import { callError } from "../grpc/library";
+import { rules } from "../rules";
+import { sectionColor } from "../sectionColors";
+
+/** Evaluates a song's shows at the given times (seconds). Throws with the
+ *  server's message when the song is unknown or its lighting does not load. */
+export async function evaluatePreview(
+  song: string,
+  times: number[],
+): Promise<Preview> {
+  try {
+    return mapPreview(
+      await lightingClient.evaluateSongLighting({ song, times }),
+    );
+  } catch (e) {
+    throw callError(e, "Failed to evaluate");
+  }
+}
+
+export interface SectionSegment {
+  name: string;
+  /** Percent of the song's length. */
+  start: number;
+  width: number;
+  color: string;
+}
+
+/** The song's sections as strip segments, from the beat grid the same way
+ *  the dashboard's timeline places them. Empty without a grid. */
+export function sectionSegments(song: SongInfo): SectionSegment[] {
+  const grid = song.beat_grid;
+  const total = song.duration_ms / 1000;
+  if (!grid || total <= 0) return [];
+  const at = (measure: number, beat: number | null | undefined) =>
+    rules.grid_query(grid, { measure, beat: beat ?? 1 })?.secs ?? total;
+  return song.sections.map((s, i) => {
+    const from = Math.min(total, at(s.start_measure, s.start_beat));
+    const to = Math.min(total, at(s.end_measure, s.end_beat));
+    return {
+      name: s.name,
+      start: (from / total) * 100,
+      width: (Math.max(from, to) / total) * 100 - (from / total) * 100,
+      color: sectionColor(s.color ?? undefined, i),
+    };
+  });
+}
+
+/** One group's effects at the moment, for the "at this moment" list. */
+export interface GroupActivity {
+  group: string;
+  effects: {
+    kind: string;
+    elapsed: number;
+    duration: number;
+    percent: number;
+  }[];
+}
+
+/** The active effects gathered under the group each one's cue named (an
+ *  effect naming several groups appears under each), groups sorted. */
+export function groupActivity(effects: PreviewEffect[]): GroupActivity[] {
+  const byGroup = new Map<string, GroupActivity["effects"]>();
+  for (const effect of effects) {
+    const groups = effect.groups?.length
+      ? effect.groups
+      : [effect.fixtures.join(", ")];
+    const percent =
+      effect.duration > 0
+        ? Math.min(100, Math.round((effect.elapsed / effect.duration) * 100))
+        : 100;
+    for (const group of groups) {
+      const list = byGroup.get(group) ?? [];
+      list.push({
+        kind: effect.kind,
+        elapsed: effect.elapsed,
+        duration: effect.duration,
+        percent,
+      });
+      byGroup.set(group, list);
+    }
+  }
+  return [...byGroup.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([group, list]) => ({ group, effects: list }));
+}
+
+/** How many fixtures take their colour from a wheel the scene does not
+ *  model (it draws them white). */
+export function wheelFixtureCount(
+  metadata: Record<string, FixtureMetadata>,
+): number {
+  return Object.values(metadata).filter((m) => {
+    const caps = m.capabilities ?? [];
+    return caps.includes("color_wheel") && !caps.includes("color");
+  }).length;
+}
+
+/** The song's lighting editor at a time, in seconds. */
+export function timelineLink(song: string, seconds: number): string {
+  return `#/songs/${encodeURIComponent(song)}/lighting?t=${
+    Math.round(seconds * 1000) / 1000
+  }`;
+}

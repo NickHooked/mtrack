@@ -6,23 +6,26 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:stage": "vite build --config vite.stage.config.ts",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "test:unit": "vitest run",
     "test": "playwright test --project=mock",
     "test:e2e": "playwright test --project=e2e",
     "test:mock": "playwright test --project=mock",
+    "test:journeys": "playwright test --config=playwright.journeys.config.ts",
     "screenshots:mock": "playwright test --config=playwright.screenshots.config.ts",
     "screenshots:live": "playwright test --config=playwright.screenshots.live.config.ts",
     "screenshots": "npm run screenshots:mock && npm run screenshots:live"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@playwright/test": "^1.57.0",
+    "@playwright/test": "^1.64.1",
     "@sveltejs/vite-plugin-svelte": "^7",
     "@types/express": "^5.0.6",
-    "@types/ws": "^8.18.1",
+    "@types/ws": "^8.18.2",
     "eslint": "^10.0.2",
     "eslint-plugin-svelte": "^3.15.0",
     "express": "^5.2.1",
@@ -35,7 +38,8 @@
     "typescript": "^6",
     "typescript-eslint": "^8.56.1",
     "vite": "^8",
-    "ws": "^8.19.0"
+    "vitest": "^5.1.0",
+    "ws": "^8.23.0"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2",
@@ -50,6 +54,7 @@
   "overrides": {
     "svelte-i18n": {
       "esbuild": "$esbuild"
-    }
+    },
+    "minimatch": "11.0.3"
   }
 }

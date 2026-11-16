@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     error::Error,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     thread,
     time::Duration,
 };
@@ -50,6 +50,209 @@ use super::{
 /// long before coming up degraded, once, at boot. A correctly configured rig
 /// never reaches this path at all.
 const TERMINAL_GRACE: Duration = Duration::from_secs(30);
+
+/// What a hardware reload did: begun at once, or deferred until the player
+/// is idle. A config change's reply says which, or a change deferred under
+/// a song reads as one that has taken effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareReload {
+    /// The hardware is coming up on the current config.
+    Applied,
+    /// A song is playing, paused or fading out, or an auto play is waiting:
+    /// the reload runs once the player is idle.
+    Deferred,
+}
+
+impl HardwareReload {
+    /// Whether the change has been applied to the running hardware.
+    pub fn applied(self) -> bool {
+        self == HardwareReload::Applied
+    }
+
+    /// What a config change's reply says of the reload, when deferred.
+    pub fn message(self) -> Option<&'static str> {
+        match self {
+            HardwareReload::Applied => None,
+            HardwareReload::Deferred => Some(
+                "The config was saved. A song is playing or paused, so the hardware \
+                 reload waits until the player is idle, and the change takes effect then.",
+            ),
+        }
+    }
+}
+
+/// What became of a saved config change on the running hardware: applied,
+/// deferred until the player is idle, or not applied because the reload
+/// failed. The change itself is saved in all three: every control surface
+/// answers it as saved, with the new checksum, and says which of these it
+/// was (`applied`, and a `message` when it is not). Errors before the save
+/// (a stale checksum, an invalid section) are the surfaces' own to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigApply {
+    /// The hardware is coming up on the saved config.
+    Applied,
+    /// A song is playing, paused or fading out, or an auto play is waiting:
+    /// the reload runs once the player is idle.
+    Deferred,
+    /// The reload could not run, and the change takes effect at the next
+    /// reload or restart.
+    Failed(String),
+}
+
+impl ConfigApply {
+    /// Whether the change has been applied to the running hardware.
+    pub fn applied(&self) -> bool {
+        *self == ConfigApply::Applied
+    }
+
+    /// Which it was, as a reply's `reload` field names it: `applied`,
+    /// `deferred` or `failed`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ConfigApply::Applied => "applied",
+            ConfigApply::Deferred => "deferred",
+            ConfigApply::Failed(_) => "failed",
+        }
+    }
+
+    /// What a config change's reply says of the reload, when it is not
+    /// applied.
+    pub fn message(&self) -> Option<String> {
+        match self {
+            ConfigApply::Applied => None,
+            ConfigApply::Deferred => HardwareReload::Deferred.message().map(str::to_string),
+            ConfigApply::Failed(e) => Some(format!(
+                "The config was saved, but the hardware reload failed, so the change takes \
+                 effect at the next reload or restart: {e}"
+            )),
+        }
+    }
+}
+
+/// What became of a saved config change: its hardware reload, and, when the
+/// change moved the songs or playlists, or asks for them to be reloaded (a
+/// metronome default), a song reload that failed. Both are carried, so one
+/// does not hide the other. The surfaces map it to `applied`, `reload` (the
+/// hardware's), `message`, and, from the web UI and MCP, `songs_error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChange {
+    pub hardware: ConfigApply,
+    /// Why the songs could not be reloaded, when they could not: the player
+    /// keeps the songs, and the song paths, it had.
+    pub songs_error: Option<String>,
+    /// For a deferred hardware reload, the deferred reload generation it
+    /// waits for (see [`DeferredReloads`]): it has started once
+    /// `DeferredReloads::started` reaches it.
+    pub awaits: Option<u64>,
+}
+
+impl From<ConfigApply> for ConfigChange {
+    fn from(hardware: ConfigApply) -> Self {
+        ConfigChange {
+            hardware,
+            songs_error: None,
+            awaits: None,
+        }
+    }
+}
+
+/// The deferred hardware reloads, counted: each time one starts, or is
+/// refused (it cannot start at all), the generation goes up. A config save
+/// deferred waits for the generation after the one started when it was
+/// deferred, so a surface knows its wait for playback to stop is over once
+/// `started` reaches it, whatever it saw in between. What the reload's round
+/// then makes of each device is the hardware status's to say, per
+/// subsystem, not this.
+///
+/// The count starts over with the process: a surface holding a generation
+/// from before a restart tells by [`process_id`] that the wait is over (the
+/// restarted process loaded the saved config).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeferredReloads {
+    /// The last generation started or refused.
+    pub started: u64,
+    /// The recent refusals, oldest first, each with its generation and why:
+    /// a save is told of its own, not of one that came after it.
+    pub refused: std::collections::VecDeque<(u64, String)>,
+}
+
+/// How many refusals [`DeferredReloads`] keeps.
+const REFUSALS_KEPT: usize = 8;
+
+/// This process's id, the same for its whole life and another for the next:
+/// a deferred reload generation is this process's, and one from another
+/// process names nothing still to wait for.
+pub fn process_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or_default();
+        nanos ^ (u64::from(std::process::id()) << 32)
+    })
+}
+
+impl ConfigChange {
+    /// Whether the change has been taken up in full: the hardware applied,
+    /// and the songs, if they were reloaded, reloaded.
+    pub fn applied(&self) -> bool {
+        self.hardware.applied() && self.songs_error.is_none()
+    }
+
+    /// The hardware reload's kind (see [`ConfigApply::kind`]).
+    pub fn kind(&self) -> &'static str {
+        self.hardware.kind()
+    }
+
+    /// What the reply says, when the change is not taken up in full: the
+    /// hardware's, then the songs'.
+    pub fn message(&self) -> Option<String> {
+        let songs = self.songs_error.as_ref().map(|e| {
+            format!(
+                "The config was saved, but the songs could not be reloaded, so the player \
+                 keeps the songs it had: {e}"
+            )
+        });
+        match (self.hardware.message(), songs) {
+            (Some(hardware), Some(songs)) => Some(format!("{hardware} {songs}")),
+            (hardware, songs) => hardware.or(songs),
+        }
+    }
+}
+
+/// What to say when a profile maps tracks past the channels its audio device
+/// has, or `None` if every mapping fits.
+///
+/// Checked once the device is open and its real width known, so the mistake
+/// is in the journal and on the status page at startup; playback still
+/// refuses a song mapped past the device, as a backstop.
+fn mappings_past_channels(
+    mappings: &HashMap<String, Vec<u16>>,
+    channels: u16,
+    device: &str,
+) -> Option<String> {
+    let mut past: Vec<String> = mappings
+        .iter()
+        .filter_map(|(track, outputs)| {
+            let over: Vec<String> = outputs
+                .iter()
+                .filter(|&&output| output > channels)
+                .map(u16::to_string)
+                .collect();
+            (!over.is_empty()).then(|| format!("{track} -> {}", over.join(", ")))
+        })
+        .collect();
+    if past.is_empty() {
+        return None;
+    }
+    past.sort();
+    Some(format!(
+        "audio device {device} has {channels} channels, but the profile maps tracks past \
+         them ({}); songs using those tracks will not play",
+        past.join("; ")
+    ))
+}
 
 /// How often an unchanged init failure is repeated in the log.
 const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -100,7 +303,7 @@ impl Player {
     /// written to `HardwareState` as they become available, so playback can
     /// use whatever hardware is ready. Respects dependency ordering:
     ///   Phase 1: Audio + DMX (parallel)
-    ///   Phase 2: MIDI (needs DMX), Sample engine (needs Audio) — parallel
+    ///   Phase 2: MIDI, Sample engine (needs Audio) — parallel
     ///   Phase 3: Trigger engine (needs Sample engine), status reporting
     /// `cancel` is captured by the *spawner*, not read here.
     ///
@@ -112,6 +315,9 @@ impl Player {
     /// opens, two trigger engines, and whichever finished last winning, with
     /// the other's input stream stranded. The guard is only ever as good as
     /// the token the round is holding.
+    ///
+    /// The MIDI device a reload took down waits in the hardware state's
+    /// `midi_handoff`, kept if the profile's MIDI config is the same.
     pub(super) async fn init_hardware_async(
         self: &Arc<Self>,
         config: config::Player,
@@ -126,11 +332,20 @@ impl Player {
             Some(p) => (*p).clone(),
             None => {
                 info!("No matching hardware profile found; starting with no hardware");
+                // Nor any MIDI device: one handed over is let go.
                 if !install_if_current(&self.hardware, &cancel, |hw| {
                     hw.hostname = Some(hostname);
+                    hw.midi_handoff = None;
                 }) {
                     return;
                 }
+                // With no profile there are no controllers either: those a
+                // profile removed by this reload stop, as they would have
+                // had it named another.
+                if cancel.is_cancelled() {
+                    return;
+                }
+                self.start_controllers(Vec::new());
                 // Re-checked under the lock for the same reason as the tail.
                 if !install_if_current(&self.hardware, &cancel, |_| {}) {
                     return;
@@ -143,6 +358,7 @@ impl Player {
         // Store the active profile name and hostname.
         if !install_if_current(&self.hardware, &cancel, |hw| {
             hw.profile_name = Some(profile.hostname().unwrap_or("default").to_string());
+            hw.profile_file = profile.source_file().map(String::from);
             hw.hostname = Some(hostname);
         }) {
             return;
@@ -174,10 +390,25 @@ impl Player {
                                     device = audio_config.audio().device(),
                                     "Audio device initialized"
                                 );
+                                let mappings = audio_config.track_mappings_hash();
+                                // Said now, not at the first song: playback
+                                // refuses such a song, and nobody should learn
+                                // that on stage. The device is kept.
+                                let overflow = device.channels().and_then(|channels| {
+                                    mappings_past_channels(
+                                        &mappings,
+                                        channels,
+                                        audio_config.audio().device(),
+                                    )
+                                });
+                                if let Some(why) = &overflow {
+                                    error!("{why}");
+                                }
                                 Ok((
                                     device.clone(),
-                                    audio_config.track_mappings_hash(),
+                                    mappings,
                                     audio_config.audio().clone(),
+                                    overflow,
                                 ))
                             }
                             Err(e) => Err(e),
@@ -193,9 +424,14 @@ impl Player {
             async {
                 if let Some(dmx_config) = dmx_config {
                     let bp = bp.clone();
+                    // Its wait for olad ends with the round: the next round
+                    // waits for this one to finish (`spawn_after`).
+                    let stop = cancel2.clone();
                     let outcome = Self::retry_until_ready("dmx engine", cancel2, move || {
-                        dmx::create_engine(Some(&dmx_config), bp.as_deref())
-                            .map_err(|e| e.to_string())
+                        dmx::create_engine_until(Some(&dmx_config), bp.as_deref(), &|| {
+                            stop.is_cancelled()
+                        })
+                        .map_err(|e| e.to_string())
                     })
                     .await;
                     self.record_init_outcome("dmx", outcome, &cancel).flatten()
@@ -212,7 +448,7 @@ impl Player {
 
         // Write Phase 1 results to hardware state.
         let (device, mappings, resolved_audio) = match audio_result {
-            Some((device, mappings, resolved_audio)) => {
+            Some((device, mappings, resolved_audio, overflow)) => {
                 let clock_source = match device.sample_counter().zip(device.sample_rate()) {
                     Some((counter, rate)) => ClockSource::Audio {
                         sample_counter: counter,
@@ -239,6 +475,9 @@ impl Player {
 
                 let installed = install_if_current(&self.hardware, &cancel, |hw| {
                     hw.device = Some(device.clone());
+                    if let Some(why) = overflow {
+                        hw.init_warnings.insert("audio".to_string(), why);
+                    }
                     hw.mappings = Some(Arc::new(mappings.clone()));
                     hw.track_gains = Some(track_gains);
                     hw.clock_source = clock_source;
@@ -246,6 +485,9 @@ impl Player {
                 if !installed {
                     return;
                 }
+                // The rebuilt gains come from the profile, and may differ
+                // from the ones a remote screen last read.
+                self.bump_gains_revision();
                 (Some(device), Some(mappings), Some(resolved_audio))
             }
             None => (None, None, None),
@@ -261,12 +503,16 @@ impl Player {
             if let Some(ref tx) = *self.broadcast_tx.lock() {
                 dmx_engine.set_broadcast_tx(tx.clone());
             }
+            // A new engine has its own lighting system: the stage stream's
+            // layout is to be read again.
+            self.bump_stage_layout();
             // Start the state sampler if a sender was provided. The cancel
             // token ensures this sampler stops when hardware is reloaded.
             if let Some(ref state_tx) = *self.state_tx.lock() {
                 let effect_engine = dmx_engine.effect_engine();
                 crate::state::start_sampler_cancellable(
                     effect_engine,
+                    Some(dmx_engine.test_overlay()),
                     state_tx.clone(),
                     cancel.clone(),
                 );
@@ -277,16 +523,68 @@ impl Player {
             return;
         }
 
-        // Phase 2: MIDI (needs DMX) + Sample engine (needs Audio) — parallel.
+        // Phase 2: MIDI + Sample engine (needs Audio) — parallel.
         let midi_config = profile.midi().cloned();
+        let midi_fingerprint = midi_config
+            .as_ref()
+            .and_then(|c| crate::util::to_yaml_string(c).ok());
         let cancel3 = cancel.clone();
-        let dmx_engine_for_midi = dmx_result.clone();
+        // Looked at, not taken: a reload cancelling this round before it
+        // installs leaves the device for the next one. One of another config
+        // is let go before a new device opens.
+        let mut previous_midi = None;
+        if !install_if_current(&self.hardware, &cancel, |hw| match &hw.midi_handoff {
+            Some((previous, _)) if midi_fingerprint.as_ref() == Some(previous) => {
+                previous_midi = hw.midi_handoff.clone();
+            }
+            _ => hw.midi_handoff = None,
+        }) {
+            return;
+        }
 
         let (midi_result, sample_engine) = tokio::join!(
             async {
                 if let Some(midi_config) = midi_config {
+                    // The device a reload took down, if its config is the
+                    // same: a new one would restart every MIDI controller,
+                    // which a save of anything else has no call to. It is
+                    // opened afresh in place all the same, as one unplugged
+                    // and plugged back in is heard again only then; if it
+                    // cannot be, it is gone, and a new one is opened.
+                    // A device opened anew goes on with the tempo the one it
+                    // replaces held between songs, read once a reopen has
+                    // stopped its clock: a schedule still running sets its
+                    // tempo as it ends.
+                    let previous_device = previous_midi.as_ref().map(|(_, device)| device.clone());
+                    let kept = match previous_midi {
+                        Some((previous, device))
+                            if midi_fingerprint.as_ref() == Some(&previous) =>
+                        {
+                            let reopening = device.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                reopening.reopen().map_err(|e| e.to_string())
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => Some(device),
+                                Ok(Err(e)) => {
+                                    info!(error = %e, "MIDI device could not be reopened; opening it anew");
+                                    None
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Reopening the MIDI device panicked; opening it anew");
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    if kept.is_some() {
+                        return kept;
+                    }
+                    let held = previous_device.and_then(|device| device.held_tempo());
                     let outcome = Self::retry_until_ready("midi device", cancel3, move || {
-                        midi::get_device(Some(midi_config.clone()), dmx_engine_for_midi.clone())
+                        midi::get_device_holding(Some(midi_config.clone()), held)
                             .map_err(|e| e.to_string())
                     })
                     .await;
@@ -309,17 +607,16 @@ impl Player {
             }
         );
 
-        if cancel.is_cancelled() {
-            return;
-        }
-
-        // Write Phase 2 results.
-        if let Some(ref midi_device) = midi_result {
-            if !install_if_current(&self.hardware, &cancel, |hw| {
+        // Write Phase 2 results. The device handed over is kept now, or
+        // was not wanted: it is let go either way.
+        if !install_if_current(&self.hardware, &cancel, |hw| {
+            hw.midi_handoff = None;
+            if let Some(ref midi_device) = midi_result {
                 hw.midi_device = Some(midi_device.clone());
-            }) {
-                return;
+                hw.midi_config = midi_fingerprint.clone();
             }
+        }) {
+            return;
         }
         if let Some(ref se) = sample_engine {
             if !install_if_current(&self.hardware, &cancel, |hw| {
@@ -386,10 +683,7 @@ impl Player {
             };
 
             if let Some(status_events) = status_events {
-                let player = self.clone();
-                tokio::spawn(async move {
-                    player.report_status(status_events).await;
-                });
+                self.report_status(status_events, cancel.clone());
             }
         }
 
@@ -403,6 +697,8 @@ impl Player {
         }
         self.init_done_tx.send_modify(|v| *v = true);
         info!("Hardware initialization complete");
+        // Nothing is playing yet: ambient light, at once.
+        self.idle_ambient(false);
     }
 
     /// Unwraps an init outcome, recording a terminal failure so status can
@@ -553,24 +849,79 @@ impl Player {
 
     /// Reinitializes all hardware devices from the current config.
     ///
-    /// Rejects the request if the player is currently playing. Cancels any
-    /// in-flight init, resets hardware to empty, and spawns a new async init
-    /// round. Returns immediately — does not wait for devices to be found.
-    pub async fn reload_hardware(self: &Arc<Self>) -> Result<(), Box<dyn Error>> {
-        if self.is_playing().await {
-            return Err("Cannot reload hardware during playback".into());
-        }
+    /// Cancels any in-flight init, resets hardware to empty, and spawns a new
+    /// async init round. Returns immediately — does not wait for devices to be
+    /// found.
+    ///
+    /// While a song plays, is paused, or an auto play waits out its gap, the
+    /// reload is deferred rather than refused, and runs once the player is
+    /// idle. The callers check for playback before saving a config, but a
+    /// play can still land between that check and this reload: refusing it
+    /// then left the save acknowledged and the rig running the old config
+    /// until something else reloaded it (#578). A song still fading out, as
+    /// a looping song ends or after a loop break, holds it too: the reset
+    /// would cut the fade short. Returns which it did, for a config change's
+    /// reply to say.
+    pub async fn reload_hardware(self: &Arc<Self>) -> Result<HardwareReload, Box<dyn Error>> {
+        Ok(self.reload_hardware_awaiting().await?.0)
+    }
+
+    /// [`Player::reload_hardware`], with the deferred reload generation a
+    /// deferral waits for, taken under the join lock a deferred reload
+    /// starts under, so it is never one already started.
+    async fn reload_hardware_awaiting(
+        self: &Arc<Self>,
+    ) -> Result<(HardwareReload, Option<u64>), Box<dyn Error>> {
+        let store = self.config_store().ok_or("No config store available")?;
 
         // Held until this reload has spawned its round, so a concurrent reload
         // cannot read a newer config, spawn, and then be cancelled by an older
         // one that had already read its own.
         let _reload_guard = self.reload_lock.clone().lock_owned().await;
 
-        let config = self
-            .config_store()
-            .ok_or("No config store available")?
-            .read_config()
-            .await;
+        let config = store.read_config().await;
+
+        // Held through the reset and the spawn, so a song cannot start on the
+        // hardware this tears down: a start checks the hardware is ready under
+        // this lock, and finds it not ready once this lets go. Taken after the
+        // reload lock, never before it, as the deferred reload takes them too.
+        let join = self.join.lock().await;
+        // An auto play waiting counts as playing: the reset would leave the
+        // hardware initializing when its gap ends, and its start would fail.
+        // So does a paused song: a show in progress, its lights held, which
+        // must resume at once. A position cued by a seek while stopped is
+        // not: nothing plays, and nothing is held.
+        let (playing, fading, ending) = {
+            let transport = self.transport.lock();
+            (
+                join.is_some() || transport.auto_play.waiting.is_some() || transport.is_paused(),
+                transport.fading_out(),
+                transport.ending.fading.is_some(),
+            )
+        };
+        if playing || fading.is_some() {
+            self.hardware_reload_pending.store(true, Ordering::Relaxed);
+            // An ending runs the reload once its fade is over. A loop break's
+            // fade outlasting the song it moved to has nothing that would,
+            // with the player idle: a timer does.
+            if let (false, Some(left), false) = (playing, fading, ending) {
+                let player = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(left).await;
+                    player.reload_deferred_hardware();
+                });
+            }
+            info!("Hardware reload deferred until playback ends");
+            let awaits = self.deferred_reloads.lock().started + 1;
+            return Ok((HardwareReload::Deferred, Some(awaits)));
+        }
+        // This reload covers one deferred before it: the deferral is over,
+        // and the next generation has started. The reload is applying from
+        // here: a device not present retries in the round, perhaps for good,
+        // and the hardware status shows that per subsystem.
+        if self.hardware_reload_pending.swap(false, Ordering::Relaxed) {
+            self.deferred_reloads.lock().started += 1;
+        }
 
         // Cancel the previous init round and take the replacement token here,
         // so the round spawned below carries it from the start.
@@ -589,38 +940,193 @@ impl Player {
         // them keeps running left `emit_song_change` iterating an empty list
         // for the rest of the process — a Morningstar pedalboard would simply
         // stop receiving song changes, with nothing logged. They are cleared
-        // by `start_controllers_inner` instead, at the point the controllers
+        // by `Controller::update` instead, at the point the controllers
         // that own them are actually torn down.
+        //
+        // The MIDI device is left for the new round, which keeps it if the
+        // MIDI config is the same. With none installed, the round cancelled
+        // here had not got that far, and the one it was left for still waits.
         {
             let mut hw = self.hardware.write();
             let notifiers = std::mem::take(&mut hw.song_change_notifiers);
+            let midi_handoff = hw
+                .midi_config
+                .take()
+                .zip(hw.midi_device.take())
+                .or_else(|| hw.midi_handoff.take());
             *hw = HardwareState {
                 device: None,
                 mappings: None,
                 track_gains: None,
                 midi_device: None,
+                midi_config: None,
+                midi_handoff,
                 dmx_engine: None,
                 sample_engine: None,
                 trigger_engine: None,
                 clock_source: ClockSource::Wall,
                 song_change_notifiers: notifiers,
                 profile_name: None,
+                profile_file: None,
                 hostname: None,
                 init_errors: HashMap::new(),
+                init_warnings: HashMap::new(),
             };
         }
         self.init_done_tx.send_modify(|v| *v = false);
+        // The DMX engine is gone, and its venue with it, until the new round
+        // installs one.
+        self.bump_stage_layout();
 
         // Spawn new async init, handing it the token captured above rather
         // than letting it read the shared cell when it is first polled.
         let init_player = self.clone();
         let bp = self.base_path.clone();
-        tokio::spawn(async move {
+        spawn_after(&self.init_round, async move {
             init_player.init_hardware_async(config, bp, cancel).await;
         });
+        drop(join);
 
         info!("Hardware reload initiated");
-        Ok(())
+        Ok((HardwareReload::Applied, None))
+    }
+
+    /// Whether a hardware reload a config change asked for is deferred
+    /// until the player is idle.
+    #[cfg(test)]
+    pub(crate) fn hardware_reload_pending(&self) -> bool {
+        self.hardware_reload_pending.load(Ordering::Relaxed)
+    }
+
+    /// The deferred hardware reloads started or refused so far, for the
+    /// status (see [`DeferredReloads`]).
+    pub fn deferred_reloads(&self) -> DeferredReloads {
+        self.deferred_reloads.lock().clone()
+    }
+
+    /// Applies a config change already saved to the config store to the
+    /// running hardware: the one path every control surface takes after a
+    /// save, so they agree on what a save while a song plays does. The
+    /// change is saved whatever the player is doing, and the hardware
+    /// reload waits for the player to be idle (see
+    /// [`Player::reload_hardware`]). The controllers are restarted only by
+    /// a change to them, so a surface's own transport survives a change
+    /// made over it.
+    pub async fn apply_config_change(self: &Arc<Self>) -> ConfigChange {
+        // A change to where songs or playlists live is taken up at once, as
+        // a song edit's reload would take it up. Where they live was checked
+        // before the save ([`crate::player::SongSources::prepare`]); a reload that fails all
+        // the same (a scan error) leaves the player, and every surface's song
+        // paths, as they were, and the reply carries it beside the
+        // hardware's outcome.
+        //
+        // A change to the lighting layers is taken up the same way: the
+        // songs' light shows hold their layers as positions in the set, so
+        // they are parsed again against the new one. (The DMX engine takes
+        // the set up when the hardware reload below rebuilds it.)
+        let new_layers = match self.config_store() {
+            Some(store) => Some(store.read_config().await.layer_set()),
+            None => None,
+        };
+        let layers_changed = new_layers
+            .as_ref()
+            .is_some_and(|new| new != self.layers().as_ref());
+        if let Some(new) = new_layers.filter(|_| layers_changed) {
+            info!("The lighting layers changed: reloading the songs");
+            self.set_layers(new);
+        }
+        let songs_error = match self.resolve_song_sources().await {
+            Some(sources) if layers_changed || Some(&sources) != self.song_sources().as_ref() => {
+                info!("The songs or playlists moved: reloading them");
+                // A config changed outside the whole-config save (a hand
+                // edit, read in by a profile save) has had no check: the
+                // same one, which makes the songs directory where startup
+                // would, runs here, and a location it refuses is not
+                // reloaded from.
+                let prepared = match self.config_store() {
+                    Some(store) => {
+                        let config = store.read_config().await;
+                        let player = self.clone();
+                        tokio::task::spawn_blocking(move || player.prepare_song_sources(&config))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                            .map(|_| ())
+                    }
+                    None => Ok(()),
+                };
+                let reloaded = match prepared {
+                    Ok(()) => self.reload_songs().await.map_err(|e| e.to_string()),
+                    Err(e) => Err(format!("the songs or playlists cannot be used: {e}")),
+                };
+                reloaded.err().inspect(|e| {
+                    warn!("Reloading songs after a config change failed: {}", e);
+                })
+            }
+            _ => None,
+        };
+        // Flattened at once: `Box<dyn Error>` is not Send, and the surfaces
+        // await this.
+        let (hardware, awaits) = match self
+            .reload_hardware_awaiting()
+            .await
+            .map_err(|e| e.to_string())
+        {
+            Ok((HardwareReload::Applied, _)) => (ConfigApply::Applied, None),
+            Ok((HardwareReload::Deferred, awaits)) => (ConfigApply::Deferred, awaits),
+            Err(e) => {
+                warn!("Hardware reload after a config change failed: {}", e);
+                (ConfigApply::Failed(e), None)
+            }
+        };
+        ConfigChange {
+            hardware,
+            songs_error,
+            awaits,
+        }
+    }
+
+    /// Runs a hardware reload deferred by playback, if one is pending, now
+    /// that the player may be idle. Called wherever a song stops, a pause or
+    /// an auto play is called off, or a song's fade-out is over; the reload
+    /// looks again under the join lock, and defers once more if the player
+    /// is not idle after all — a song a loop break moves to, or one started
+    /// in the meantime.
+    pub(super) fn reload_deferred_hardware(&self) {
+        if !self.hardware_reload_pending.load(Ordering::Relaxed) {
+            return;
+        }
+        // On a task of its own: callers hold the join lock the reload takes.
+        // The clone shares all of this player's state, so the reload is this
+        // player's.
+        let player = Arc::new(self.clone());
+        tokio::spawn(async move {
+            if !player.hardware_reload_pending.load(Ordering::Relaxed) {
+                return;
+            }
+            info!("Playback has ended: running the deferred hardware reload");
+            if let Err(e) = player.reload_hardware().await.map_err(|e| e.to_string()) {
+                warn!("Deferred hardware reload failed: {}", e);
+                // Nothing will make it run now: the generation is over,
+                // refused, and the status says why. Under the reload and join
+                // locks a deferral and a start are made under, so a deferral
+                // in between is not wiped, and one already covered is not
+                // counted twice.
+                let _reload = player.reload_lock.clone().lock_owned().await;
+                let _join = player.join.lock().await;
+                if player
+                    .hardware_reload_pending
+                    .swap(false, Ordering::Relaxed)
+                {
+                    let mut reloads = player.deferred_reloads.lock();
+                    reloads.started += 1;
+                    let generation = reloads.started;
+                    reloads.refused.push_back((generation, e));
+                    while reloads.refused.len() > REFUSALS_KEPT {
+                        reloads.refused.pop_front();
+                    }
+                }
+            }
+        });
     }
 
     /// Whether the audio device this player holds open is the one `name` names.
@@ -648,7 +1154,7 @@ impl Player {
                     return SubsystemStatus {
                         status: "connected".to_string(),
                         name,
-                        error: None,
+                        error: hw.init_warnings.get(subsystem).cloned(),
                     };
                 }
                 // Checked before `init_done`, because a subsystem that gave up is
@@ -701,6 +1207,7 @@ impl Player {
             init_done,
             hostname: hw.hostname.clone(),
             profile: hw.profile_name.clone(),
+            profile_file: hw.profile_file.clone(),
             audio: status_for(
                 "audio",
                 hw.device.is_some(),
@@ -724,6 +1231,13 @@ impl Player {
                     .as_ref()
                     .map(|_| "Trigger Engine".to_string()),
             ),
+            lighting_venue: super::LightingVenueStatus::from_registration(
+                hw.dmx_engine
+                    .as_ref()
+                    .and_then(|d| d.venue_registration())
+                    .as_ref(),
+            ),
+            test_output: hw.dmx_engine.as_ref().and_then(|d| d.test_output_status()),
         }
     }
 
@@ -744,55 +1258,48 @@ impl Player {
     }
 
     fn start_controllers_inner(self: &Arc<Self>, config: Vec<config::Controller>, force: bool) {
-        // Restarting controllers tears down the transport a caller may be
-        // speaking on: a config change requested over gRPC would drop that
-        // client's own connection mid-response. Since a hardware reload runs
-        // this every time, leaving unchanged controllers alone is what makes it
-        // safe for those paths to reload at all.
-        let fingerprint = crate::util::to_yaml_string(&config).ok();
-        if !force && fingerprint.is_some() && *self.controller_config.lock() == fingerprint {
+        // Restarting a controller tears down the transport a caller may be
+        // speaking on: a config change requested over gRPC or MCP would drop
+        // that client's own connection mid-response. Since a hardware reload
+        // runs this every time, restarting only the controllers whose config
+        // changed is what makes it safe for those paths to reload at all.
+        // Held throughout, so two starts cannot both bind the same ports.
+        let mut current = self.controller.lock();
+        let controller = current.get_or_insert_with(|| {
+            crate::controller::Controller::new(Vec::new(), Arc::clone(self))
+        });
+        if !controller.update(config, Arc::clone(self), force) {
             info!("Controllers unchanged; leaving them running");
             return;
         }
-
-        // Shut down any existing controllers, and drop the notifiers they
-        // registered — the replacements register their own.
-        if let Some(old) = self.controller.lock().take() {
-            info!("Shutting down existing controllers");
-            old.shutdown();
-        }
-        self.hardware.write().song_change_notifiers.clear();
-
-        if config.is_empty() {
+        if controller.statuses().is_empty() {
             info!("No controllers configured");
-            *self.controller_config.lock() = fingerprint;
             return;
         }
-
-        let controller = crate::controller::Controller::new(config, Arc::clone(self));
-        // Only a clean start is remembered. `Controller::new` records per-driver
-        // failures and carries on, and a reload restarts controllers *before*
-        // the init round has installed any devices — so the MIDI driver finds no
-        // device and errors. Recording the fingerprint there would make the next
-        // call, the init round's own, skip the restart that heals it, and the
-        // controller would stay dead with nothing logged until someone pressed
-        // Restart Controllers. A failed start stays retryable.
-        let healthy = controller.statuses().iter().all(|s| s.status != "error");
-        if !healthy {
-            let failed: Vec<&str> = controller
-                .statuses()
-                .iter()
-                .filter(|s| s.status == "error")
-                .map(|s| s.kind.as_str())
-                .collect();
+        // A controller that failed to start is started again by the next
+        // call. Controllers restarted *before* an init round has installed
+        // its devices -- say, from "restart controllers" during a reload --
+        // leave the MIDI driver with no device, and the init round's own
+        // call then heals it.
+        let failed: Vec<String> = controller
+            .statuses()
+            .into_iter()
+            .filter(|s| s.status == "error")
+            .map(|s| s.kind)
+            .collect();
+        if !failed.is_empty() {
             warn!(
                 failed = ?failed,
                 "Some controllers did not start; they will be retried on the next reload"
             );
         }
-        *self.controller.lock() = Some(controller);
-        *self.controller_config.lock() = healthy.then_some(fingerprint).flatten();
         info!("Controllers started");
+    }
+
+    /// Drops the song-change notifiers the MIDI controllers registered, as
+    /// they are restarted: the replacements register their own.
+    pub(crate) fn clear_song_change_notifiers(&self) {
+        self.hardware.write().song_change_notifiers.clear();
     }
 
     /// Reloads controllers from the current config store.
@@ -812,8 +1319,8 @@ impl Player {
             .unwrap_or_default();
 
         // Forced: this is only reached from the operator's explicit "restart
-        // controllers", and from the config paths that have just changed them.
-        // Both mean "do it", not "do it if you think something changed".
+        // controllers", which means "do it", not "do it if you think something
+        // changed". A config change leaves it to the hardware reload.
         self.restart_controllers_forced(controllers);
         Ok(())
     }
@@ -821,7 +1328,43 @@ impl Player {
     /// Returns the status of all active controllers.
     pub fn controller_statuses(&self) -> Vec<crate::controller::ControllerStatus> {
         match self.controller.lock().as_ref() {
-            Some(controller) => controller.statuses().to_vec(),
+            Some(controller) => controller.statuses(),
+            None => vec![],
+        }
+    }
+
+    /// The Bluetooth controller's pairing, for the web API to open the
+    /// pairing window and list or forget paired phones. `None` unless a
+    /// Bluetooth controller is configured and has been started; its
+    /// operations say so when it is not running, as when the radio is
+    /// blocked.
+    pub fn ble_handle(&self) -> Option<crate::controller::ble::BleHandle> {
+        self.controller.lock().as_ref()?.ble_handle()
+    }
+
+    /// Where the `index`th controller's listener is bound, for a test to
+    /// reach one started on port 0.
+    #[cfg(test)]
+    pub(crate) fn controller_bound_addr(&self, index: usize) -> crate::controller::BoundAddr {
+        self.controller
+            .lock()
+            .as_ref()
+            .expect("controllers started")
+            .bound_addr(index)
+    }
+
+    /// Makes `controller` the player's, for a test of what reaches the
+    /// running controllers.
+    #[cfg(test)]
+    pub(crate) fn install_controller(&self, controller: crate::controller::Controller) {
+        *self.controller.lock() = Some(controller);
+    }
+
+    /// The tasks of the running controllers.
+    #[cfg(test)]
+    pub(crate) fn controller_tasks(&self) -> Vec<tokio::task::AbortHandle> {
+        match self.controller.lock().as_ref() {
+            Some(controller) => controller.tasks(),
             None => vec![],
         }
     }
@@ -838,8 +1381,15 @@ impl Player {
         self.hardware.write().song_change_notifiers.push(notifier);
     }
 
-    /// Reports status as MIDI events.
-    pub(super) async fn report_status(&self, status_events: StatusEvents) {
+    /// Reports status as MIDI events, until `cancel` -- the init round's --
+    /// is cancelled. The loop holds the round's MIDI device: one left running
+    /// past a hardware reload kept it open, and each reload added another
+    /// loop beside it, all of them emitting.
+    pub(super) fn report_status(
+        &self,
+        status_events: StatusEvents,
+        cancel: CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let _enter = self.span.enter();
         info!("Reporting status");
 
@@ -847,35 +1397,39 @@ impl Player {
             Some(device) => device,
             None => {
                 warn!("MIDI device not present for status reporting; skipping");
-                return;
+                return None;
             }
         };
         let join = self.join.clone();
+        let transport = self.transport.clone();
 
-        // This thread will run until the process is terminated.
-        let _join_handle = tokio::spawn(async move {
-            loop {
+        Some(tokio::spawn(async move {
+            while !cancel.is_cancelled() {
                 {
                     let join = join.lock().await;
+                    // Cancelled while it waited for the lock: the round's
+                    // successor reports from here on.
+                    if cancel.is_cancelled() {
+                        break;
+                    }
 
-                    let emit_result: Result<(), Box<dyn Error>> = if join.is_none() {
-                        status_events
-                            .idling_events
-                            .iter()
-                            .try_for_each(|event| midi_device.emit(Some(*event)))
-                    } else {
-                        status_events
-                            .playing_events
-                            .iter()
-                            .try_for_each(|event| midi_device.emit(Some(*event)))
-                    };
+                    let auto_play_waiting = transport.lock().auto_play.waiting.is_some();
+                    let emit_result: Result<(), Box<dyn Error>> = status_events
+                        .current(join.is_some(), auto_play_waiting)
+                        .iter()
+                        .try_for_each(|event| midi_device.emit(Some(*event)));
 
                     if let Err(err) = emit_result {
                         error!(err = err.as_ref(), "error emitting status event")
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                // Cancelled while the status shows, the off events still go
+                // out, so nothing is left lit that no loop turns off.
+                let cancelled = tokio::select! {
+                    _ = cancel.cancelled() => true,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => false,
+                };
 
                 {
                     let status_event_emit_result: Result<(), Box<dyn Error>> = status_events
@@ -888,9 +1442,15 @@ impl Player {
                     }
                 }
 
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                if cancelled {
+                    break;
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
             }
-        });
+        }))
     }
 }
 
@@ -931,6 +1491,29 @@ pub(super) fn init_sample_engine(
     }
 
     Some(Arc::new(RwLock::new(engine)))
+}
+
+/// Spawns a hardware init round to run once the round before it, the task in
+/// `slot`, has finished, and puts it in `slot` for the next.
+///
+/// A cancelled round stops at its next check, but a device it was opening by
+/// then -- the trigger engine's cpal input, say -- stays open until the round
+/// drops it on its way out. A round run alongside it opened the same device
+/// and was refused it as busy, and went on without it (#603). Rounds run one
+/// after another, each opening nothing until its predecessor has let go.
+pub(super) fn spawn_after(
+    slot: &parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    round: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    let mut slot = slot.lock();
+    let previous = slot.take();
+    *slot = Some(tokio::spawn(async move {
+        if let Some(previous) = previous {
+            // A panic in the previous round has let go of its devices as well.
+            let _ = previous.await;
+        }
+        round.await;
+    }));
 }
 
 /// Initializes the trigger engine if configured and sample engine is available.
@@ -1020,8 +1603,54 @@ pub(super) fn init_trigger_engine(
 
 #[cfg(test)]
 mod test {
+
+    /// A round starts only once the round before it has finished, even when
+    /// the earlier one is still busy with a device it was opening (#603).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_init_round_waits_for_the_one_before_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let slot = parking_lot::Mutex::new(None);
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_saw = Arc::new(parking_lot::Mutex::new(None));
+        super::spawn_after(&slot, {
+            let first_done = first_done.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                first_done.store(true, Ordering::SeqCst);
+            }
+        });
+        super::spawn_after(&slot, {
+            let first_done = first_done.clone();
+            let second_saw = second_saw.clone();
+            async move {
+                *second_saw.lock() = Some(first_done.load(Ordering::SeqCst));
+            }
+        });
+        let last = slot.lock().take().unwrap();
+        last.await.unwrap();
+        assert_eq!(
+            *second_saw.lock(),
+            Some(true),
+            "the second round ran alongside the first"
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn mappings_past_the_device_are_named() {
+        let mut mappings = HashMap::new();
+        mappings.insert("click".to_string(), vec![1]);
+        mappings.insert("bass".to_string(), vec![8, 9]);
+        mappings.insert("keys".to_string(), vec![12]);
+        assert_eq!(mappings_past_channels(&mappings, 12, "dev"), None);
+        let why = mappings_past_channels(&mappings, 8, "alsa:plughw:CARD=Headphones,DEV=0")
+            .expect("bass and keys are past 8");
+        assert!(why.contains("has 8 channels"), "{why}");
+        assert!(why.contains("bass -> 9; keys -> 12"), "{why}");
+        assert!(!why.contains("click"), "{why}");
+    }
 
     /// A failure nobody has classified. Stands in for MIDI and DMX, whose
     /// errors are all retryable today.
@@ -1057,14 +1686,18 @@ mod test {
             mappings: None,
             track_gains: None,
             midi_device: None,
+            midi_config: None,
+            midi_handoff: None,
             dmx_engine: None,
             sample_engine: None,
             trigger_engine: None,
             clock_source: ClockSource::Wall,
             song_change_notifiers: Vec::new(),
             profile_name: None,
+            profile_file: None,
             hostname: None,
             init_errors: std::collections::HashMap::new(),
+            init_warnings: std::collections::HashMap::new(),
         })
     }
 
@@ -1077,11 +1710,11 @@ mod test {
     /// paths able to reload.
     #[test]
     fn unchanged_controllers_are_left_running() {
-        let a = vec![config::Controller::Grpc(config::GrpcController::new(7654))];
-        let b = vec![config::Controller::Grpc(config::GrpcController::new(7654))];
-        let different = vec![config::Controller::Grpc(config::GrpcController::new(7655))];
+        let a = config::Controller::Grpc(config::GrpcController::new(7654));
+        let b = config::Controller::Grpc(config::GrpcController::new(7654));
+        let different = config::Controller::Grpc(config::GrpcController::new(7655));
 
-        let fingerprint = |c: &Vec<config::Controller>| crate::util::to_yaml_string(c).ok();
+        let fingerprint = |c: &config::Controller| crate::util::to_yaml_string(c).ok();
         assert_eq!(
             fingerprint(&a),
             fingerprint(&b),
@@ -1327,14 +1960,7 @@ mod test {
     #[tokio::test]
     async fn a_failed_subsystem_is_reported_with_its_reason() {
         let player = crate::player::Player::new_with_devices(
-            crate::player::PlayerDevices {
-                audio: None,
-                mappings: None,
-                midi: None,
-                dmx_engine: None,
-                sample_engine: None,
-                trigger_engine: None,
-            },
+            crate::testutil::player::no_devices(),
             HashMap::new(),
             "all_songs".to_string(),
             None,

@@ -13,6 +13,8 @@
      *
      * -->
 <script lang="ts">
+  import { ConnectError } from "@connectrpc/connect";
+  import { onDestroy } from "svelte";
   /* eslint-disable @typescript-eslint/no-explicit-any */
   import {
     fetchLightingFile,
@@ -25,27 +27,50 @@
     fetchWaveform,
     uploadTrack,
     importFileToSong,
-    type SongSummary,
-    type WaveformTrack,
   } from "../../lib/api/songs";
   import type {
+    Include,
     LightFile,
     LightShow,
     Sequence,
     TempoSection,
   } from "../../lib/lighting/types";
-  import { parseLightFile } from "../../lib/lighting/parser";
-  import { serializeLightFile } from "../../lib/lighting/serializer";
+  import { tempoSourceOf } from "../../lib/lighting/timeline-state";
+  import { absoluteTimestamp, emptyCue } from "../../lib/lighting/types";
+  import { rules } from "../../lib/rules";
+  import { layerNames } from "../../lib/lighting/layers";
+  import type {
+    IncludeSource,
+    Layout,
+    PlayDeclined,
+    SongInfo,
+    TempoSource,
+    TrackPeaks,
+  } from "../../gen/rules/mtrack_rules";
   import TimelineEditor from "../lighting/timeline/TimelineEditor.svelte";
+  import PalettePanel from "../lighting/PalettePanel.svelte";
+  import {
+    mergeSlots,
+    ownSlots,
+    providePalette,
+    provideSequenceParams,
+    type SlotColor,
+  } from "../../lib/lighting/palette";
   import { configToSection } from "../../lib/tempoConvert";
   import LightingSummary from "../lighting/LightingSummary.svelte";
   import { isPhone } from "../../lib/util/media";
   import FileUpload from "./FileUpload.svelte";
   import FileBrowser from "./FileBrowser.svelte";
+  import {
+    isLightShowFile,
+    isMidiFile,
+    midiAccept,
+    withoutExtension,
+  } from "../../lib/util/paths";
   import { t } from "svelte-i18n";
   import { showConfirm, showPrompt } from "../../lib/dialog.svelte";
   import { playerClient } from "../../lib/grpc/client";
-  import { playbackStore, wsConnected } from "../../lib/ws/stores";
+  import { playbackStore, watchConnected } from "../../lib/ws/stores";
   import { create } from "@bufbuild/protobuf";
   import { DurationSchema } from "@bufbuild/protobuf/wkt";
   import { get } from "svelte/store";
@@ -58,7 +83,7 @@
   }
 
   interface Props {
-    song: SongSummary;
+    song: SongInfo;
     onreload: () => void;
     dirty?: boolean;
     onchange?: () => void;
@@ -67,6 +92,12 @@
     /** The song's `tempo:` block, offered as a copy source in the
      * lighting tempo editor. */
     songTempo?: import("../../lib/api/songs").TempoConfig | null;
+    /** Where to put the timeline's cursor when it opens, in milliseconds. */
+    initialCursorMs?: number | null;
+    /** The palette slots the song's files declare (their own and those of
+     *  the files they include), with their defaults, as edited: what the
+     *  song's palette overrides are offered against. */
+    declaredSlots?: SlotColor[] | null;
   }
 
   let {
@@ -77,14 +108,21 @@
     onaddlightfile,
     onremovelightfile,
     songTempo = null,
+    initialCursorMs = null,
+    // Written for the parent that binds it; never read back here.
+    // eslint-disable-next-line no-useless-assignment
+    declaredSlots = $bindable(),
   }: Props = $props();
 
   let error = $state("");
   let tab = $state<"timeline" | "raw">("timeline");
 
   let lightFiles = $state<LoadedLightFile[]>([]);
-  let waveformTracks = $state<WaveformTrack[]>([]);
+  let waveformTracks = $state<TrackPeaks[]>([]);
   let mergedLightFile = $state<LightFile>({ sequences: [], shows: [] });
+  /** The files the song's light files include, fetched for the player's
+   *  layout (which reads them as the player would off the disk). */
+  let includeSources = $state<IncludeSource[]>([]);
   let rawFileIndex = $state(0);
   let rawContent = $state("");
   let validationResult = $state<{ valid: boolean; errors?: string[] } | null>(
@@ -99,15 +137,47 @@
   let venueGroupsError = $state("");
   let pendingDeletes = $state<string[]>([]);
   let sequenceNames = $derived(mergedLightFile.sequences.map((s) => s.name));
+
+  /** The palette slots the song's files declare: each file's own block,
+   *  and those of the files they include (which merge into the includer).
+   *  The first to declare a slot sets its color. */
+  let paletteSlots = $derived.by(() => {
+    const own = lightFiles
+      .filter((lf) => !lf.parseError)
+      .map((lf) => ownSlots(lf.parsed));
+    const included = includeSources.map((inc) =>
+      inc.source === undefined
+        ? []
+        : ownSlots(rules.document(inc.source, inc.path).document ?? emptyFile),
+    );
+    return mergeSlots(...own, ...included);
+  });
+  const emptyFile: LightFile = { sequences: [], shows: [] };
+  providePalette(() => paletteSlots);
+  provideSequenceParams(() =>
+    Object.fromEntries(
+      mergedLightFile.sequences.map((s) => [s.name, s.params ?? []]),
+    ),
+  );
+  /** Whether the files are loaded: until they are, the slots are not
+   *  the song's to report. */
+  let filesLoaded = $state(false);
+  $effect(() => {
+    if (filesLoaded) declaredSlots = paletteSlots;
+  });
   let uploading = $state(false);
   let showMidiDmxModal = $state(false);
   let showFileBrowser = $state(false);
 
-  // Playback state derived from the WebSocket playback store
+  // Playback state derived from the `Watch` playback store
   let pbState = $state(get(playbackStore));
+  // Released when the editor goes, not when the effect below is cleaned up:
+  // that runs again whenever a state it read changes, and the lock would
+  // then stay as the first status left it.
   const unsubPlayback = playbackStore.subscribe((v) => (pbState = v));
+  onDestroy(unsubPlayback);
 
-  // WebSocket connection state (accessed via $wsConnected in template)
+  // Connection state (accessed via $watchConnected in template)
 
   // Client-side interpolation for smooth playhead
   let lastKnownMs = $state(0);
@@ -133,7 +203,7 @@
       const now = performance.now();
       const elapsed = now - lastUpdateTime;
       // Cap interpolation drift to 2s — beyond that, hold at lastKnownMs
-      // until the next WebSocket update arrives (prevents large jumps on reconnect).
+      // until the next playback update arrives (prevents large jumps on reconnect).
       const capped = Math.min(elapsed, 2000);
       interpolatedMs = Math.min(
         lastKnownMs + capped,
@@ -160,7 +230,7 @@
     // Auto-save if dirty
     if (dirty) {
       try {
-        await saveLightingFiles();
+        await saveLightingFiles("files");
       } catch (e) {
         error = `Auto-save failed: ${e instanceof Error ? e.message : e}`;
         return;
@@ -186,11 +256,15 @@
         startTime: create(DurationSchema, { seconds, nanos }),
       });
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes("already playing")) {
+      // The player names why a play was declined by key.
+      const declined =
+        e instanceof ConnectError
+          ? e.metadata.get(rules.play_declined_key())
+          : null;
+      if (declined === ("already_playing" satisfies PlayDeclined)) {
         error = "Another song is playing. Stop it first.";
       } else {
-        error = `Playback failed: ${msg}`;
+        error = `Playback failed: ${e instanceof Error ? e.message : e}`;
       }
     }
   }
@@ -214,6 +288,160 @@
     }
   }
 
+  /** Where `file`, a name inside the song's folder, is under the songs
+   * root. Every `path` in [[lightFiles]] is one of these: the lighting API
+   * takes them, and the server lists the song's files that way. The
+   * song.yaml entry is the bare `file`; the parent strips the folder. */
+  function rootPath(file: string): string {
+    return song.base_dir ? `${song.base_dir}/${file}` : file;
+  }
+
+  /** The file a song without lighting gets, named after the song. */
+  function defaultLightFilePath(): string {
+    const stem = song.name.replace(/[^a-zA-Z0-9_-]/g, "_") || "show";
+    return rootPath(`${stem}.light`);
+  }
+
+  /** What a song without lighting opens with: one empty show, so the
+   * timeline has a lane. It is not a file until something is put in it. */
+  function placeholderLightFile(): LightFile {
+    return { sequences: [], shows: [{ name: "Main", cues: [] }] };
+  }
+
+  /** The file as written, read by the player's own grammar; what the
+   *  editor cannot hold (a file that does not parse, or defines what the
+   *  show editor does not edit) is an error. */
+  function parseLightFile(raw: string, path: string): LightFile {
+    const read = rules.document(raw, path);
+    if (read.error !== undefined || !read.document) {
+      throw new Error(read.error ?? "could not read the file");
+    }
+    return read.document;
+  }
+
+  /** The song's own tempo map, for a file with no tempo block: its
+   *  `tempo:` block, else the beat grid of its click track. */
+  let songTempoSource = $derived<TempoSource | null>(
+    songTempo
+      ? { config: songTempo }
+      : song.beat_grid
+        ? { grid: song.beat_grid }
+        : null,
+  );
+
+  /** The tempo map the timeline snaps and places against. */
+  let tempoSource = $derived(
+    tempoSourceOf(mergedLightFile.tempo, songTempoSource),
+  );
+
+  /** The player's layout of the show as it is being edited: each file
+   *  written out and read back by the one parser, with its own path (its
+   *  `include`s resolve against its own folder, as the player resolves
+   *  them), the files it includes and the song's tempo, as loading the
+   *  song would; the files' shows and sequences side by side. */
+  /** Why a document is not written: the editor made one the writer
+   *  cannot read (never a file's own). */
+  const unwritable =
+    "the editor's document of this file is not one it can write";
+
+  let layout = $derived.by(() => {
+    const merged: Layout = { shows: [], sequences: [], end_ms: 0 };
+    const errors: string[] = [];
+    for (const lf of lightFiles) {
+      if (lf.parseError) continue;
+      const source = rules.document_write(lf.parsed);
+      if (source === undefined) {
+        errors.push(`${lf.path}: ${unwritable}`);
+        continue;
+      }
+      const laid = rules.layout({
+        source,
+        path: lf.path,
+        layers: $layerNames,
+        song_tempo: songTempoSource ?? undefined,
+        includes: includeSources,
+        until_ms: song.duration_ms || 60000,
+      });
+      if (laid.error !== undefined) {
+        errors.push(
+          lightFiles.length > 1 ? `${lf.path}: ${laid.error}` : laid.error,
+        );
+        continue;
+      }
+      merged.tempo ??= laid.tempo;
+      merged.shows.push(...laid.shows);
+      merged.sequences.push(...laid.sequences);
+      merged.end_ms = Math.max(merged.end_ms, laid.end_ms);
+    }
+    if (errors.length > 0) merged.error = errors.join("\n");
+    return merged;
+  });
+
+  /** The last layout that laid out: what the timeline keeps drawing while
+   *  an edit does not lay out, with the error said. */
+  let lastGoodLayout = $state<Layout | null>(null);
+  $effect(() => {
+    if (layout.error === undefined) lastGoodLayout = layout;
+  });
+  let shownLayout = $derived<Layout>(
+    layout.error === undefined
+      ? layout
+      : { ...(lastGoodLayout ?? layout), error: layout.error },
+  );
+
+  /** Fetches every file the loaded files include, and the files those
+   *  include, once each; one that cannot be fetched is held with the
+   *  reason, so the layout reports the include as the player would. */
+  async function loadIncludes() {
+    const sources: IncludeSource[] = [];
+    const seen: Record<string, true> = {};
+    const queue = lightFiles
+      .filter((lf) => !lf.parseError)
+      .flatMap((lf) => lf.parsed.includes ?? [])
+      .map((inc) => inc.path);
+    while (queue.length > 0) {
+      const path = queue.shift()!;
+      if (seen[path]) continue;
+      seen[path] = true;
+      try {
+        const source = await fetchLightingFile(path);
+        sources.push({ path, source });
+        for (const inc of rules.document(source, path).document?.includes ??
+          []) {
+          queue.push(inc.path);
+        }
+      } catch (e: any) {
+        sources.push({ path, error: e.message });
+      }
+    }
+    includeSources = sources;
+  }
+
+  /** Whether a file has a cue or a sequence in it. */
+  function hasContent(lf: LoadedLightFile): boolean {
+    return (
+      lf.parsed.sequences.length > 0 ||
+      lf.parsed.shows.some((s) => s.cues.length > 0)
+    );
+  }
+
+  /** Whether `lf` is still the placeholder a lighting-less song opened
+   * with: not the song's yet, with no cue and no sequence. A tempo alone
+   * does not make it a file while another file of the song can carry it
+   * (an edit puts the tempo on every file); with no other file it does,
+   * as the tempo has to live somewhere. Saving writes an untouched
+   * placeholder nowhere, so a song that was only ever opened gets no file. */
+  function isUntouchedPlaceholder(lf: LoadedLightFile): boolean {
+    if (song.lighting_files.includes(lf.path) || hasContent(lf)) return false;
+    if (lf.parsed.tempo == null) return true;
+    return lightFiles.some(
+      (other) =>
+        other !== lf &&
+        !other.parseError &&
+        (song.lighting_files.includes(other.path) || hasContent(other)),
+    );
+  }
+
   async function loadLighting() {
     try {
       error = "";
@@ -225,7 +453,7 @@
         try {
           const raw = await fetchLightingFile(filePath);
           try {
-            const parsed = parseLightFile(raw);
+            const parsed = parseLightFile(raw, filePath);
             loaded.push({ path: filePath, raw, parsed });
           } catch (e: any) {
             loaded.push({
@@ -244,20 +472,23 @@
       // If no lighting files exist, create an implicit one so the editor
       // is immediately usable. It only gets written to disk on save.
       if (lightFiles.length === 0) {
-        const implicitPath = `${song.name.replace(/[^a-zA-Z0-9_-]/g, "_") || "show"}.light`;
+        const implicitPath = defaultLightFilePath();
         lightFiles = [
           {
             path: implicitPath,
             raw: "",
-            parsed: {
-              sequences: [],
-              shows: [{ name: "Main", cues: [] }],
-            },
+            parsed: placeholderLightFile(),
           },
         ];
       }
 
       rebuildMergedLightFile();
+      // The included files' palettes are slots the including file's effects
+      // may use.
+      if (lightFiles.some((lf) => lf.parsed.includes?.length)) {
+        void loadIncludes();
+      }
+      filesLoaded = true;
 
       rawFileIndex = 0;
       rawContent = loaded.length > 0 ? loaded[0].raw : "";
@@ -276,6 +507,7 @@
   function rebuildMergedLightFile() {
     const allShows: LightShow[] = [];
     const allSequences: Sequence[] = [];
+    const allIncludes: Include[] = [];
     let tempo: TempoSection | undefined;
 
     for (const lf of lightFiles) {
@@ -283,9 +515,15 @@
       if (!tempo && lf.parsed.tempo) tempo = lf.parsed.tempo;
       allShows.push(...lf.parsed.shows);
       allSequences.push(...lf.parsed.sequences);
+      allIncludes.push(...(lf.parsed.includes ?? []));
     }
 
-    mergedLightFile = { tempo, sequences: allSequences, shows: allShows };
+    mergedLightFile = {
+      tempo,
+      sequences: allSequences,
+      shows: allShows,
+      ...(allIncludes.length > 0 ? { includes: allIncludes } : {}),
+    };
   }
 
   function onTimelineChange(lf: LightFile) {
@@ -301,6 +539,9 @@
       const origSeqCount = loaded.parsed.sequences.length;
 
       loaded.parsed = {
+        ...(loaded.parsed.includes ? { includes: loaded.parsed.includes } : {}),
+        // The timeline holds no palette: the file keeps its own.
+        ...(loaded.parsed.palette ? { palette: loaded.parsed.palette } : {}),
         tempo: lf.tempo,
         shows: lf.shows.slice(showOffset, showOffset + origShowCount),
         sequences: lf.sequences.slice(seqOffset, seqOffset + origSeqCount),
@@ -319,7 +560,7 @@
 
     if (hasOverflow || hasTempoOnly) {
       if (lightFiles.length === 0) {
-        const newPath = `${song.name.replace(/[^a-zA-Z0-9_-]/g, "_") || "show"}.light`;
+        const newPath = defaultLightFilePath();
         const shows = lf.shows.slice(showOffset);
         // When auto-creating for tempo-only, add a default show so lanes appear
         if (shows.length === 0) {
@@ -356,35 +597,83 @@
     }
   }
 
-  /** Save all modified lighting files. Called by parent's unified Save button. */
-  export async function saveLightingFiles() {
-    // Process pending deletions
-    for (const path of pendingDeletes) {
-      try {
-        await deleteLightingFile(path);
-      } catch {
-        // File may already be gone
-      }
-    }
-    pendingDeletes = [];
+  /** A palette edit the player accepted: the file as edited replaces the
+   *  loaded one, and the timeline is drawn from it again. */
+  function onPaletteChange(index: number, edited: LightFile) {
+    const loaded = lightFiles[index];
+    if (!loaded || loaded.parseError) return;
+    loaded.parsed = edited;
+    rebuildMergedLightFile();
+    dirty = true;
+    onchange?.();
+  }
 
-    // Save all current lighting files
-    for (const lf of lightFiles) {
-      if (lf.parseError) continue;
-      // Register newly created files with song.yaml
-      if (!song.lighting_files.includes(lf.path)) {
-        onaddlightfile?.(lf.path);
-      }
-      const content = serializeLightFile(lf.parsed);
-      lf.raw = content;
-      await saveLightingFile(lf.path, content);
+  /** Folds what is typed in the Raw tab into its file, so a save writes
+   * it. Text that does not parse fails the save, by name, rather than
+   * being left out of it. */
+  function flushRaw() {
+    if (tab !== "raw") return;
+    const lf = lightFiles[rawFileIndex];
+    if (!lf || rawContent === lf.raw) return;
+    try {
+      lf.parsed = parseLightFile(rawContent, lf.path);
+    } catch (e: any) {
+      throw new Error(`${lf.path.replace(/^.*\//, "")}: ${e.message}`, {
+        cause: e,
+      });
     }
-    dirty = false;
+    lf.raw = rawContent;
+    lf.parseError = undefined;
+    rebuildMergedLightFile();
+    void loadIncludes();
+  }
+
+  async function writeLightFile(lf: LoadedLightFile) {
+    const content = rules.document_write(lf.parsed);
+    if (content === undefined) throw new Error(`${lf.path}: ${unwritable}`);
+    await saveLightingFile(lf.path, content);
+    lf.raw = content;
+  }
+
+  /** Saves the song's lighting files around the song.yaml save, in two
+   * calls by the parent's Save button. "before" the config save: files
+   * not yet the song's are written and registered, so the reload that
+   * save starts finds them on disk. "after" it: files the song already
+   * had are written, checked against the tempo the saved config loads
+   * them with, and removed files are deleted, their entries gone from
+   * the config by then. A failure in either leaves the rest for a retry.
+   * "files", for the auto-save before a play-from, writes every file
+   * and deletes nothing: the config still names the removed ones. */
+  export async function saveLightingFiles(phase: "before" | "after" | "files") {
+    if (phase !== "after") {
+      flushRaw();
+      for (const lf of lightFiles) {
+        if (lf.parseError || isUntouchedPlaceholder(lf)) continue;
+        if (song.lighting_files.includes(lf.path)) continue;
+        onaddlightfile?.(lf.path);
+        await writeLightFile(lf);
+      }
+    }
+    if (phase !== "before") {
+      for (const lf of lightFiles) {
+        if (lf.parseError || !song.lighting_files.includes(lf.path)) continue;
+        await writeLightFile(lf);
+      }
+    }
+    if (phase === "after") {
+      while (pendingDeletes.length > 0) {
+        await deleteLightingFile(pendingDeletes[0]);
+        pendingDeletes = pendingDeletes.slice(1);
+      }
+    }
+    if (phase !== "before") dirty = pendingDeletes.length > 0;
   }
 
   function switchToRaw() {
     if (lightFiles.length > 0 && !lightFiles[rawFileIndex]?.parseError) {
-      rawContent = serializeLightFile(lightFiles[rawFileIndex].parsed);
+      rawContent =
+        rules.document_write(lightFiles[rawFileIndex].parsed) ??
+        lightFiles[rawFileIndex].raw;
     }
     tab = "raw";
   }
@@ -392,11 +681,15 @@
   function switchToTimeline() {
     if (tab === "raw" && lightFiles.length > 0) {
       try {
-        const parsed = parseLightFile(rawContent);
+        const parsed = parseLightFile(
+          rawContent,
+          lightFiles[rawFileIndex].path,
+        );
         lightFiles[rawFileIndex].parsed = parsed;
         lightFiles[rawFileIndex].raw = rawContent;
         lightFiles[rawFileIndex].parseError = undefined;
         rebuildMergedLightFile();
+        void loadIncludes();
       } catch (e: any) {
         error = `Parse error: ${e.message}. Fix in Raw DSL tab.`;
         return;
@@ -415,7 +708,10 @@
   function selectRawFile(index: number) {
     if (lightFiles[rawFileIndex] && !lightFiles[rawFileIndex].parseError) {
       try {
-        lightFiles[rawFileIndex].parsed = parseLightFile(rawContent);
+        lightFiles[rawFileIndex].parsed = parseLightFile(
+          rawContent,
+          lightFiles[rawFileIndex].path,
+        );
         lightFiles[rawFileIndex].raw = rawContent;
       } catch {
         // Keep old
@@ -427,7 +723,11 @@
 
   async function handleValidate() {
     try {
-      validationResult = await validateLighting(rawContent, song.name);
+      validationResult = await validateLighting(
+        rawContent,
+        song.name,
+        lightFiles[rawFileIndex]?.path,
+      );
     } catch (e: any) {
       validationResult = { valid: false, errors: [e.message] };
     }
@@ -440,23 +740,43 @@
     }
     const name = await showPrompt($t("songLighting.addDslPrompt"));
     if (!name) return;
-    const fileName = name.endsWith(".light") ? name : `${name}.light`;
-    const showName = fileName.replace(/\.light$/, "");
-    const defaultContent = `show "${showName}" {\n    @00:00.000\n}\n`;
+    // A name, in the song's folder: no path in it.
+    if (/[\\/]/.test(name) || name === "..") {
+      error = $t("songLighting.badFileName");
+      return;
+    }
+    // A light show file in any case (`songs::FileKind`): `Show.LIGHT` is
+    // kept as named, as the player reads it.
+    const fileName = isLightShowFile(name) ? name : `${name}.light`;
+    const showName = withoutExtension(fileName);
+    // One show of the file's name, with an empty cue at 0, as the player's
+    // writer writes it.
+    const defaultContent =
+      rules.document_write({
+        sequences: [],
+        shows: [{ name: showName, cues: [emptyCue(absoluteTimestamp(0))] }],
+      }) ?? "";
 
-    const baseDir = song.base_dir;
-    const fullPath = baseDir ? `${baseDir}/${fileName}` : fileName;
+    const fullPath = rootPath(fileName);
+    // The song's own name is the placeholder's; naming the first file so
+    // fills the placeholder in. Any other file already there stays.
+    const existing = lightFiles.findIndex((lf) => lf.path === fullPath);
+    if (existing >= 0 && !isUntouchedPlaceholder(lightFiles[existing])) {
+      error = $t("songLighting.fileExists", { values: { name: fileName } });
+      return;
+    }
 
     try {
-      const parsed = parseLightFile(defaultContent);
+      const parsed = parseLightFile(defaultContent, fullPath);
       // Inherit tempo from current merged state so it isn't lost
       if (mergedLightFile.tempo && !parsed.tempo) {
         parsed.tempo = mergedLightFile.tempo;
       }
-      lightFiles = [
-        ...lightFiles,
-        { path: fullPath, raw: defaultContent, parsed },
-      ];
+      const entry = { path: fullPath, raw: defaultContent, parsed };
+      lightFiles =
+        existing >= 0
+          ? lightFiles.map((lf, i) => (i === existing ? entry : lf))
+          : [...lightFiles, entry];
       rebuildMergedLightFile();
       onaddlightfile?.(fullPath);
       dirty = true;
@@ -497,8 +817,7 @@
           fileName = `dmx_${fileName}`;
         }
         const renamedFile = new File([file], fileName, { type: file.type });
-        const res = await uploadTrack(song.name, renamedFile);
-        if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+        await uploadTrack(song.name, renamedFile);
       }
       onreload();
     } catch (err: any) {
@@ -514,17 +833,10 @@
     try {
       for (const path of paths) {
         let filename = path.split("/").pop() ?? path;
-        if (
-          !filename.startsWith("dmx_") &&
-          (filename.endsWith(".mid") || filename.endsWith(".midi"))
-        ) {
+        if (!filename.startsWith("dmx_") && isMidiFile(filename)) {
           filename = `dmx_${filename}`;
         }
-        const res = await importFileToSong(song.name, path, filename);
-        if (!res.ok) {
-          const data = await res.json().catch(() => null);
-          throw new Error(data?.error ?? `Import failed: ${res.status}`);
-        }
+        await importFileToSong(song.name, path, filename);
       }
       onreload();
     } catch (err: any) {
@@ -540,14 +852,13 @@
     loadLighting();
     loadVenueGroups();
     return () => {
-      unsubPlayback();
       stopInterpolation();
     };
   });
 </script>
 
 <div class="lighting-section">
-  {#if !$wsConnected}
+  {#if !$watchConnected}
     <div class="warn-banner">
       {$t("songLighting.notConnected")}
     </div>
@@ -626,8 +937,34 @@
           {venueGroupsError}
         </div>
       {/if}
+      {#if shownLayout.error !== undefined}
+        <div class="error-banner" data-testid="layout-error">
+          {shownLayout.error}
+        </div>
+      {/if}
+      <details class="palette-card" data-testid="palette-card">
+        <summary>
+          {$t("palette.title")}
+          <span class="palette-count" data-testid="palette-count"
+            >{paletteSlots.length}</span
+          >
+        </summary>
+        <p class="palette-hint">{$t("palette.hint")}</p>
+        {#each lightFiles as lf, i (lf.path)}
+          {#if !lf.parseError}
+            <PalettePanel
+              file={lf.parsed}
+              fileName={lightFiles.length > 1 ? lf.path : undefined}
+              idPrefix={`palette-${i}`}
+              onchange={(edited) => onPaletteChange(i, edited)}
+            />
+          {/if}
+        {/each}
+      </details>
       <TimelineEditor
         lightFile={mergedLightFile}
+        layout={shownLayout}
+        {tempoSource}
         groups={venueGroups}
         {sequenceNames}
         songDurationMs={song.duration_ms}
@@ -636,6 +973,7 @@
         hasBeatGrid={!!song.beat_grid}
         hasMidi={song.has_midi}
         songTempo={songTempo ? configToSection(songTempo) : null}
+        {initialCursorMs}
         {isPlaying}
         {playheadMs}
         onchange={onTimelineChange}
@@ -735,7 +1073,7 @@
         <div class="modal-section">
           <span class="modal-section-label">{$t("songLighting.upload")}</span>
           <FileUpload
-            accept=".mid,.midi"
+            accept={midiAccept()}
             label={uploading
               ? $t("common.uploading")
               : $t("songLighting.dropMidiDmx")}
@@ -768,6 +1106,32 @@
 {/if}
 
 <style>
+  .palette-card {
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    border: 1px solid var(--card-border);
+    border-radius: var(--nc-radius-md);
+    background: var(--inset-bg);
+  }
+  .palette-card summary {
+    cursor: pointer;
+    font-family: var(--nc-font-sans);
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--nc-fg-2);
+  }
+  .palette-count {
+    margin-left: 6px;
+    font-family: var(--nc-font-mono);
+    color: var(--nc-fg-1);
+  }
+  .palette-hint {
+    margin: 8px 0;
+    font-size: 13px;
+    color: var(--nc-fg-2);
+  }
   .lighting-section {
     display: flex;
     flex-direction: column;

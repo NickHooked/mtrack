@@ -13,6 +13,9 @@
 //
 
 import { waitLocale } from "./lib/i18n";
+// The player's rules module: loaded before anything can ask it a question.
+import initRules from "./gen/rules/mtrack_rules";
+import rulesUrl from "./gen/rules/mtrack_rules_bg.wasm?url";
 // Importing the theme module subscribes the document to the user's
 // stored / system theme preference and applies `.nc--dark` to <html>
 // before the app mounts, so we never flash light-on-dark.
@@ -20,10 +23,44 @@ import "./lib/theme";
 import "./app.css";
 import App from "./App.svelte";
 import { mount } from "svelte";
+import {
+  applyStageMetadata,
+  applyStageState,
+  connect,
+  provideStageFeed,
+} from "./lib/ws/stores";
+import {
+  FeedLease,
+  installStageTiming,
+  openStageStream,
+} from "./lib/stage/grpc-feed";
+
+// The gRPC stream `Watch` that feeds the stores: opened here, before the
+// rules module has loaded, so the first events are waiting when the app
+// mounts. The stage is not on it: its stores read the gRPC stream
+// `WatchStage`, one stream for the page, opened when something first shows
+// the stage.
+installStageTiming();
+provideStageFeed(
+  new FeedLease(() =>
+    openStageStream({ metadata: applyStageMetadata, state: applyStageState }),
+  ),
+);
+connect();
 
 async function start() {
-  await waitLocale();
-  mount(App, { target: document.getElementById("app")! });
+  const target = document.getElementById("app")!;
+  try {
+    await Promise.all([waitLocale(), initRules({ module_or_path: rulesUrl })]);
+  } catch (error) {
+    // Without the rules module every position and meter on every page
+    // would be a question with no answer: say so instead of a blank page.
+    console.error("could not load the player's rules module", error);
+    target.textContent =
+      "Could not load the player's rules module. Reload the page; if this keeps happening, the UI build is incomplete.";
+    return;
+  }
+  mount(App, { target });
 }
 
 start();

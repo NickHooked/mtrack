@@ -11,28 +11,58 @@
 // You should have received a copy of the GNU General Public License along with
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
+mod advert;
+mod asset;
+mod config_service;
+mod config_songs;
+mod config_uploads;
+mod lighting_convert;
+mod lighting_service;
+mod playlist_settings;
+mod playlists;
+mod remote;
+mod songs;
+mod stage;
+mod watch;
+
+use crate::config::store::ConfigSection;
 use std::{error::Error, io, net::SocketAddr, sync::Arc};
 
 use tokio::task::JoinHandle;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, span, warn, Level};
+use tonic_health::pb::health_server::{Health, HealthServer};
+use tracing::{info, span, Level};
+
+use crate::songs::SongProto;
+use crate::util::FaultKind;
 
 use crate::{
     config,
-    player::Player,
+    player::{Player, PLAY_DECLINED_KEY},
     proto::player::v1::{
+        config_service_server::ConfigServiceServer,
+        lighting_service_server::LightingServiceServer,
         player_service_server::{PlayerService, PlayerServiceServer},
-        AddProfileRequest, AudioHealth, Cue, GetActiveEffectsRequest, GetActiveEffectsResponse,
-        GetConfigRequest, GetConfigResponse, GetCuesRequest, GetCuesResponse, GetTrackGainsRequest,
-        GetTrackGainsResponse, LoopSectionRequest, LoopSectionResponse, NextRequest, NextResponse,
-        PlayFromRequest, PlayRequest, PlayResponse, PlaySongFromRequest, PreviousRequest,
-        PreviousResponse, RemoveProfileRequest, SectionAckRequest, SectionAckResponse, SeekRequest,
-        SeekResponse, SeekToSectionRequest, SetTrackGainRequest, SetTrackGainResponse,
-        SetTrackMuteRequest, SetTrackMuteResponse, StatusRequest, StatusResponse, StopRequest,
-        StopResponse, StopSamplesRequest, StopSamplesResponse, StopSectionLoopRequest,
-        StopSectionLoopResponse, SwitchToPlaylistRequest, SwitchToPlaylistResponse, TrackGain,
+        AddProfileRequest, AmbientStatus, AudioHealth, AutoPlayStatus, CancelAutoPlayRequest,
+        CancelAutoPlayResponse, Cue, DeletePlaylistRequest, DeletePlaylistResponse,
+        GetActiveEffectsRequest, GetActiveEffectsResponse, GetConfigRequest, GetConfigResponse,
+        GetCuesRequest, GetCuesResponse, GetLightingAssetRequest, GetNetworkInfoRequest,
+        GetNetworkInfoResponse, GetPlaylistRequest, GetPlaylistResponse, GetSongRequest,
+        GetSongResponse, GetTrackGainsRequest, GetTrackGainsResponse, ListLightShowsRequest,
+        ListLightShowsResponse, ListPlaylistsRequest, ListPlaylistsResponse, ListSongsRequest,
+        ListSongsResponse, LoopSectionRequest, LoopSectionResponse, NavigateToSongRequest,
+        NavigateToSongResponse, NextRequest, NextResponse, PlayFromRequest, PlayRequest,
+        PlayResponse, PlaySongFromRequest, PlaylistEntry, PlaylistSummary, PreviousRequest,
+        PreviousResponse, RemoveProfileRequest, SavePlaylistRequest, SectionAckRequest,
+        SectionAckResponse, SeekRequest, SeekResponse, SeekToSectionRequest, SetAmbientModeRequest,
+        SetAmbientModeResponse, SetLockRequest, SetLockResponse, SetTrackGainRequest,
+        SetTrackGainResponse, SetTrackMuteRequest, SetTrackMuteResponse, Song, StageFrame,
+        StageLayout, StageUpdate, StatusRequest, StatusResponse, StopRequest, StopResponse,
+        StopSamplesRequest, StopSamplesResponse, StopSectionLoopRequest, StopSectionLoopResponse,
+        SwitchToPlaylistRequest, SwitchToPlaylistResponse, TrackGain, TrackNames,
         UpdateAudioRequest, UpdateConfigResponse, UpdateControllersRequest, UpdateDmxRequest,
-        UpdateMidiRequest, UpdateProfileRequest, FILE_DESCRIPTOR_SET,
+        UpdateMidiRequest, UpdateProfileRequest, UpdateSongSettingsRequest, WatchRequest,
+        WatchStageRequest, WatchStatusRequest, FILE_DESCRIPTOR_SET,
     },
 };
 
@@ -42,6 +72,10 @@ pub struct Driver {
     player: Arc<Player>,
     /// The socket address to host the gRPC server on.
     addr: SocketAddr,
+    /// Where the server is listening, once it is.
+    bound: super::BoundAddr,
+    /// Whether to advertise the server by mDNS once it is.
+    advertise: bool,
 }
 
 impl Driver {
@@ -49,40 +83,244 @@ impl Driver {
         config: config::GrpcController,
         player: Arc<Player>,
     ) -> Result<Arc<Self>, Box<dyn Error>> {
-        let addr: SocketAddr = format!("0.0.0.0:{}", config.port()).parse()?;
+        // Parsed as an `IpAddr`, so an IPv6 literal needs no brackets.
+        let ip: std::net::IpAddr = config
+            .bind_address()
+            .parse()
+            .map_err(|e| format!("invalid bind_address `{}`: {e}", config.bind_address()))?;
+        let addr = SocketAddr::new(ip, config.port());
 
-        Ok(Arc::new(Driver { player, addr }))
+        Ok(Arc::new(Driver {
+            player,
+            addr,
+            bound: super::BoundAddr::new(),
+            advertise: config.advertise(),
+        }))
     }
 }
 
 impl super::Driver for Driver {
+    fn bound_addr(&self) -> Option<super::BoundAddr> {
+        Some(self.bound.clone())
+    }
+
     fn monitor_events(&self) -> JoinHandle<Result<(), io::Error>> {
         let addr = self.addr;
         let player = self.player.clone();
+        let bound = self.bound.clone();
+        let advertise = self.advertise;
 
         tokio::spawn(async move {
             let reflection_service = tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
+                // The health service too, so `grpcurl` can call it with no
+                // proto file to hand.
+                .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
                 .build_v1()
                 .map_err(io::Error::other)?;
 
+            // Bound here rather than by `serve`, to know the address: the
+            // port the OS picked, for a port of 0. TCP_NODELAY as `serve` sets.
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let addr = listener.local_addr()?;
             {
                 let _enter = span!(Level::INFO, "gRPC Server").entered();
-                info!("Starting gRPC server");
+                info!("Starting gRPC server on {addr}");
             }
-
-            let player_server = match player.config_store() {
-                Some(store) => PlayerServer::with_config_store(player, store),
-                None => PlayerServer::new(player),
+            // The port first: whoever waits on `bound` may ask the player for
+            // it at once. Not a loopback listener's: `GetNetworkInfo` gives
+            // the port to a phone to reach over Wi-Fi, and it could not.
+            if !addr.ip().is_loopback() {
+                player.set_grpc_port(Some(addr.port()));
+            }
+            bound.set(addr);
+            // Cleared when this task ends or is aborted, but only if the
+            // port is still this one's: a restart binds after this is gone.
+            let _listening = ListeningPort {
+                player: player.clone(),
+                port: addr.port(),
             };
+            // After the bind, so the port is the real one; ended with this
+            // task, whether it finishes or is aborted by a restart. Trouble
+            // starting it is logged there and never reaches the server.
+            let _advert = advert::start(
+                advertise,
+                addr,
+                &crate::config::resolve_hostname(),
+                player.web_port(),
+            );
 
             Server::builder()
                 .add_service(reflection_service)
-                .add_service(PlayerServiceServer::new(player_server))
-                .serve(addr)
+                .add_service(health_service().await)
+                .add_service(player_service(player.clone()))
+                .add_service(config_service(player.clone()))
+                .add_service(lighting_service(player))
+                .serve_with_incoming(
+                    tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true)),
+                )
                 .await
                 .map_err(io::Error::other)
         })
+    }
+}
+
+/// Tells the player its gRPC controller stopped listening, when dropped.
+struct ListeningPort {
+    player: Arc<Player>,
+    port: u16,
+}
+
+impl Drop for ListeningPort {
+    fn drop(&mut self) {
+        if self.player.grpc_port() == Some(self.port) {
+            self.player.set_grpc_port(None);
+        }
+    }
+}
+
+/// The position in the song a status reports, as the wire carries it: the
+/// player's one reading, shared by every surface that serves a status.
+#[allow(clippy::result_large_err)]
+pub(crate) fn elapsed_to_proto(
+    elapsed: Result<Option<std::time::Duration>, String>,
+) -> Result<Option<prost_types::Duration>, Status> {
+    match elapsed {
+        Ok(Some(elapsed)) => Ok(Some(
+            prost_types::Duration::try_from(elapsed)
+                .map_err(|e| Status::from_error(Box::new(e)))?,
+        )),
+        Ok(None) => Ok(None),
+        Err(e) => Err(Status::internal(e)),
+    }
+}
+
+/// The song waiting to start by itself and how long until it does, as the
+/// wire carries it.
+#[allow(clippy::result_large_err)]
+pub(crate) fn auto_play_to_proto(
+    auto_play: Option<(String, std::time::Duration)>,
+) -> Result<Option<AutoPlayStatus>, Status> {
+    auto_play
+        .map(|(song, starts_in)| {
+            Ok(AutoPlayStatus {
+                song,
+                starts_in: Some(
+                    prost_types::Duration::try_from(starts_in)
+                        .map_err(|e| Status::internal(e.to_string()))?,
+                ),
+            })
+        })
+        .transpose()
+}
+
+/// The player's gRPC service, behind the lock: what both the gRPC
+/// controller and the web UI's gRPC-Web route serve.
+pub(crate) fn player_service(player: Arc<Player>) -> LockGuard<PlayerServiceServer<PlayerServer>> {
+    let server = match player.config_store() {
+        Some(store) => PlayerServer::with_config_store(player.clone(), store),
+        None => PlayerServer::new(player.clone()),
+    };
+    LockGuard {
+        inner: PlayerServiceServer::new(server),
+        player,
+    }
+}
+
+/// The editor service, behind the lock: what the gRPC controller and the
+/// web UI's gRPC-Web route serve beside [`player_service`]. Bluetooth does
+/// not carry it.
+pub(crate) fn config_service(
+    player: Arc<Player>,
+) -> LockGuard<ConfigServiceServer<config_service::ConfigServer>> {
+    LockGuard {
+        inner: ConfigServiceServer::new(config_service::ConfigServer::new(player.clone())),
+        player,
+    }
+}
+
+/// The lighting pages' service, behind the lock: what the gRPC controller
+/// and the web UI's gRPC-Web route serve beside [`player_service`].
+/// Bluetooth does not carry it.
+pub(crate) fn lighting_service(
+    player: Arc<Player>,
+) -> LockGuard<LightingServiceServer<lighting_service::LightingServer>> {
+    LockGuard {
+        inner: LightingServiceServer::new(lighting_service::LightingServer::new(player.clone())),
+        player,
+    }
+}
+
+/// The standard `grpc.health.v1.Health` service, reporting the server as a
+/// whole and the player, editor and lighting services as serving. It is not behind the lock: a
+/// health check must answer on a locked player. The gRPC controller and the
+/// web UI's gRPC-Web route both serve it.
+pub(crate) async fn health_service() -> HealthServer<impl Health> {
+    let (reporter, service) = tonic_health::server::health_reporter();
+    reporter
+        .set_serving::<PlayerServiceServer<PlayerServer>>()
+        .await;
+    reporter
+        .set_serving::<ConfigServiceServer<config_service::ConfigServer>>()
+        .await;
+    reporter
+        .set_serving::<LightingServiceServer<lighting_service::LightingServer>>()
+        .await;
+    service
+}
+
+/// Refuses every RPC the lock policy does not leave open while the player
+/// is locked, before it reaches its handler, as MCP's `call_tool` gate and
+/// the web UI's lock middleware do. A new RPC is refused while locked until
+/// [`crate::player::lock_policy::OPEN_WHILE_LOCKED`] lists it.
+#[derive(Clone)]
+pub(crate) struct LockGuard<S> {
+    inner: S,
+    player: Arc<Player>,
+}
+
+impl<S> tonic::server::NamedService for LockGuard<S>
+where
+    S: tonic::server::NamedService,
+{
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S, B> tower::Service<http::Request<B>> for LockGuard<S>
+where
+    S: tower::Service<http::Request<B>, Response = http::Response<tonic::body::Body>>
+        + tonic::server::NamedService,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = futures_util::future::BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        use futures_util::FutureExt;
+        // `/<service name>/<RPC>`: the RPC is what the lock policy names.
+        let path = request.uri().path();
+        let rpc = path
+            .strip_prefix('/')
+            .and_then(|path| path.strip_prefix(S::NAME))
+            .and_then(|path| path.strip_prefix('/'))
+            .unwrap_or(path);
+        if let Err(e) = self
+            .player
+            .check_lock(crate::player::lock_policy::Surface::Grpc, rpc)
+        {
+            let refused = Status::failed_precondition(e.to_string()).into_http();
+            return futures_util::future::ready(Ok(refused)).boxed();
+        }
+        self.inner.call(request).boxed()
     }
 }
 
@@ -133,7 +371,14 @@ impl PlayerServer {
         let song = match result {
             Ok(Some(song)) => song,
             Ok(None) => {
-                return Err(Status::failed_precondition(self.declined_reason().await));
+                let declined = self.player.play_declined().await;
+                let mut status = Status::failed_precondition(declined.to_string());
+                // The reason by key too, so a client tells a song in the
+                // way from the other refusals without matching words.
+                if let Ok(key) = declined.key().parse() {
+                    status.metadata_mut().insert(PLAY_DECLINED_KEY, key);
+                }
+                return Err(status);
             }
             Err(e) => return Err(Status::failed_precondition(e)),
         };
@@ -142,63 +387,49 @@ impl PlayerServer {
         }))
     }
 
-    /// Reloads the hardware so a config mutation takes effect, then builds the
-    /// response.
+    /// Saves `section` from its JSON (empty for `null`), as MCP's tools
+    /// and the store parse it, then applies it.
+    async fn update_section(
+        &self,
+        section: ConfigSection,
+        json: &str,
+        checksum: &str,
+    ) -> Result<Response<UpdateConfigResponse>, Status> {
+        let store = self.require_config_store()?;
+        let body = if json.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(json).map_err(|e| {
+                Status::invalid_argument(format!("invalid {} JSON: {e}", section.name()))
+            })?
+        };
+        let snapshot = store
+            .update_section(section, body, checksum)
+            .await
+            .map_err(config_error_to_status)?;
+        self.reload_and_respond(snapshot).await
+    }
+
+    /// Applies a saved config change to the running hardware, then builds
+    /// the response: the new checksum, and whether the change is applied.
     ///
     /// The web UI's mutation endpoints have always reloaded; these had not, so
     /// a client could change the audio device, receive a fresh checksum, and
-    /// find the running hardware unchanged until the process restarted. That
-    /// asymmetry is the same shape as the profile-file bug: the write is
-    /// acknowledged and quietly has no effect.
+    /// find the running hardware unchanged until the process restarted. The
+    /// reply says whether it was applied, deferred until the player is idle,
+    /// or not applied because the reload failed, as every surface's does (see
+    /// [`crate::player::ConfigApply`]).
     ///
-    /// Safe to do from inside a gRPC call because `start_controllers` leaves
-    /// controllers running when their config has not changed — otherwise this
+    /// Safe to do from inside a gRPC call because the reload leaves each
+    /// controller running whose config has not changed -- otherwise this
     /// would tear down the very transport carrying the response.
     #[allow(clippy::result_large_err)]
     async fn reload_and_respond(
         &self,
         snapshot: config::store::ConfigSnapshot,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        // Flattened immediately: `Box<dyn Error>` is not Send and must not live
-        // across the await that follows.
-        if let Err(e) = self
-            .player
-            .reload_hardware()
-            .await
-            .map_err(|e| e.to_string())
-        {
-            // Reported, not just logged. The most common cause is playback —
-            // `reload_hardware` refuses during it — and answering with a fresh
-            // checksum while nothing was applied is precisely the "acknowledged
-            // and quietly ineffective" behaviour this helper exists to end. The
-            // config *is* persisted at this point, so the message has to say so
-            // rather than implying the write was rolled back.
-            warn!("Hardware reload after config update failed: {}", e);
-            return Err(Status::failed_precondition(format!(
-                "the config was saved but the running hardware was not reloaded, so it \
-                 will not take effect until the next reload or restart: {e}"
-            )));
-        }
-        // Deliberately not `reload_controllers`: that forces a restart, which
-        // would tear down the transport carrying this response. The hardware
-        // reload above already restarts controllers when their config actually
-        // changed, and leaves them alone when it did not — so a caller is only
-        // disconnected by a change it made to the controllers themselves.
-        snapshot_to_update_response(snapshot)
-    }
-
-    /// Why the player declined to start, determined from its current state
-    /// rather than assumed.
-    async fn declined_reason(&self) -> String {
-        if self.player.is_playing().await {
-            return "song already playing".to_string();
-        }
-        if self.player.get_playlist().songs().is_empty() {
-            return "the playlist is empty — no songs loaded, which usually \
-                    means none passed validation at startup (check the log)"
-                .to_string();
-        }
-        "the player did not start a song".to_string()
+        let outcome = self.player.apply_config_change().await;
+        snapshot_to_update_response(snapshot, outcome)
     }
 
     /// Returns a reference to the config store or a NOT_FOUND error.
@@ -210,24 +441,273 @@ impl PlayerServer {
     }
 }
 
-/// Converts a ConfigError to a gRPC Status.
-fn config_error_to_status(e: config::ConfigError) -> Status {
-    match e {
-        config::ConfigError::StaleChecksum { .. } => Status::failed_precondition(e.to_string()),
-        config::ConfigError::InvalidProfileIndex { .. } => Status::out_of_range(e.to_string()),
-        _ => Status::internal(e.to_string()),
+/// One open stage stream: what it last sent, and what it waits on. It is
+/// the stream's whole state, so dropping the stream (the client went away)
+/// ends everything at once.
+struct StageWatch {
+    player: Arc<Player>,
+    /// The sampler's snapshots; `None` until the player has a state sender.
+    states: Option<tokio::sync::watch::Receiver<Arc<crate::state::StateSnapshot>>>,
+    /// The player's layout revision, and the one the layout was built at.
+    revisions: tokio::sync::watch::Receiver<u64>,
+    revision: u64,
+    /// The least time between two sends; zero for the sampler's own rate.
+    interval: std::time::Duration,
+    /// The layout the client holds; `None` before the first. Its id is how
+    /// many this stream has sent, so a frame can say which it is read
+    /// against.
+    layout: Option<StageLayout>,
+    /// The last frame sent, so one that says the same is not sent again.
+    frame: Option<StageFrame>,
+    /// The frame that follows a layout just sent.
+    queued: Option<StageFrame>,
+    sent_at: Option<tokio::time::Instant>,
+    done: bool,
+}
+
+impl StageWatch {
+    fn new(player: Arc<Player>, max_rate: u32) -> Self {
+        Self {
+            states: player.state_rx(),
+            revisions: player.stage_layout_rx(),
+            revision: 0,
+            interval: match max_rate {
+                0 => std::time::Duration::ZERO,
+                rate => std::time::Duration::from_secs(1) / rate,
+            },
+            layout: None,
+            frame: None,
+            queued: None,
+            sent_at: None,
+            done: false,
+            player,
+        }
+    }
+
+    /// The stream itself.
+    fn into_stream(self) -> futures_util::stream::BoxStream<'static, Result<StageUpdate, Status>> {
+        use futures_util::StreamExt;
+        futures_util::stream::unfold(self, |mut watch| async move {
+            watch.next().await.map(|update| (update, watch))
+        })
+        .boxed()
+    }
+
+    /// The next message: the layout and a frame at once on open, then a
+    /// frame for each snapshot that says something new, with a layout before
+    /// it when the venue changed or the snapshot no longer fits the one sent.
+    async fn next(&mut self) -> Option<Result<StageUpdate, Status>> {
+        use crate::proto::player::v1::stage_update::Update;
+        if self.done {
+            return None;
+        }
+        if let Some(frame) = self.queued.take() {
+            return Some(Ok(StageUpdate {
+                update: Some(Update::Frame(frame)),
+            }));
+        }
+        loop {
+            // The first pass sends what there is now; the rest wait for a
+            // change, and then for the caller's interval to pass, so the
+            // snapshot read below is the newest of however many arrived.
+            if self.layout.is_some() {
+                if !self.changed().await {
+                    return None;
+                }
+                if let Some(sent_at) = self.sent_at {
+                    tokio::time::sleep_until(sent_at + self.interval).await;
+                }
+            }
+
+            // The revision is read before the layout is built, so a venue
+            // change during the build is seen as one after it.
+            let revision = *self.revisions.borrow_and_update();
+            let snapshot = self.snapshot();
+            let current = self
+                .layout
+                .as_ref()
+                .filter(|layout| revision == self.revision && stage::fits(&snapshot, layout));
+            if let Some(layout) = current {
+                let frame = stage::stage_frame(&snapshot, layout);
+                if self.frame.as_ref() == Some(&frame) {
+                    continue;
+                }
+                self.frame = Some(frame.clone());
+                self.sent_at = Some(tokio::time::Instant::now());
+                return Some(Ok(StageUpdate {
+                    update: Some(Update::Frame(frame)),
+                }));
+            }
+
+            let mut layout = match self.build_layout(snapshot.clone()).await {
+                Ok(layout) => layout,
+                Err(status) => {
+                    self.done = true;
+                    return Some(Err(status));
+                }
+            };
+            // Never 0, which a client reads as no id at all.
+            let sent = self.layout.as_ref().map_or(0, |layout| layout.id);
+            layout.id = sent.wrapping_add(1).max(1);
+            // A frame always follows a layout, whatever the last one said:
+            // it is read against this layout, not that one.
+            let frame = stage::stage_frame(&snapshot, &layout);
+            self.revision = revision;
+            self.frame = Some(frame.clone());
+            self.queued = Some(frame);
+            self.layout = Some(layout.clone());
+            self.sent_at = Some(tokio::time::Instant::now());
+            return Some(Ok(StageUpdate {
+                update: Some(Update::Layout(layout)),
+            }));
+        }
+    }
+
+    /// Waits for a new snapshot or a new layout revision. False when the
+    /// player is gone and neither will come.
+    async fn changed(&mut self) -> bool {
+        let states = &mut self.states;
+        let snapshot = async {
+            match states {
+                Some(states) => states.changed().await.is_ok(),
+                None => std::future::pending().await,
+            }
+        };
+        let (state_closed, alive) = tokio::select! {
+            ok = snapshot => (!ok, true),
+            revision = self.revisions.changed() => (false, revision.is_ok()),
+        };
+        if state_closed {
+            // The player was given another state sender: follow that one.
+            self.states = self.player.state_rx();
+        }
+        alive
+    }
+
+    /// The newest snapshot, marked seen. A player with no state sender (no
+    /// sampler was ever wired) has an empty stage; one given a sender later
+    /// is picked up at the next layout revision.
+    fn snapshot(&mut self) -> Arc<crate::state::StateSnapshot> {
+        if self.states.is_none() {
+            self.states = self.player.state_rx();
+        }
+        match self.states.as_mut() {
+            Some(states) => states.borrow_and_update().clone(),
+            None => Arc::default(),
+        }
+    }
+
+    /// The layout for `snapshot`, from the lighting system the player has
+    /// now: read again each time, since a hardware reload replaces the
+    /// engine. On the blocking pool, because the lighting system's lock is
+    /// held across disk reads while a venue reloads.
+    async fn build_layout(
+        &self,
+        snapshot: Arc<crate::state::StateSnapshot>,
+    ) -> Result<StageLayout, Status> {
+        let player = self.player.clone();
+        tokio::task::spawn_blocking(move || {
+            let handles = player.broadcast_handles();
+            let metadata = crate::webui::state::stage_metadata(
+                handles
+                    .as_ref()
+                    .and_then(|handles| handles.lighting_system.as_ref()),
+            );
+            stage::stage_layout(&metadata, &snapshot, player.layers().names())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("the stage layout could not be read: {e}")))
     }
 }
 
-/// Converts a ConfigSnapshot to an UpdateConfigResponse by serializing to YAML.
+/// The song a navigation landed on, as the player answers it: the one it
+/// moved to, or the one it stays on (playing, or at the list's end), as
+/// MCP answers too. Only an empty playlist is a failure.
+#[allow(clippy::result_large_err)]
+fn navigated(song: Option<Arc<crate::songs::Song>>) -> Result<Song, Status> {
+    song.ok_or_else(|| Status::failed_precondition("playlist is empty"))?
+        .to_proto()
+        .map_err(Status::from)
+}
+
+/// A playback position a request sent, the start of the song when it sent
+/// none. A negative one is turned down, as every surface turns it down.
+#[allow(clippy::result_large_err)]
+fn position_arg(position: Option<prost_types::Duration>) -> Result<std::time::Duration, Status> {
+    position
+        .map(std::time::Duration::try_from)
+        .transpose()
+        .map_err(|e| Status::invalid_argument(format!("Invalid duration: {}", e)))
+        .map(Option::unwrap_or_default)
+}
+
+/// Ambient light's mode and state, as the player's status read it: absent
+/// without a DMX engine; `available: false` with a read that did not answer.
+fn ambient_to_proto(
+    ambient: Option<crate::player::DmxRead<crate::player::AmbientStatus>>,
+) -> Option<AmbientStatus> {
+    Some(ambient_state_to_proto(&ambient?.view()))
+}
+
+/// Ambient light as the status reports it on every surface, as the wire
+/// carries it: the read's answer, or `available: false` and why.
+fn ambient_state_to_proto(ambient: &crate::webui::wire::messages::AmbientState) -> AmbientStatus {
+    use crate::webui::wire::messages::AmbientState;
+    match ambient {
+        AmbientState::Read(ambient) => AmbientStatus {
+            mode: ambient.mode.as_str().to_string(),
+            state: ambient.state.clone(),
+            show: ambient.show.clone(),
+            source: ambient.source.map(|source| source.as_str().to_string()),
+            available: None,
+            reason: None,
+        },
+        AmbientState::Unread(unread) => AmbientStatus {
+            mode: String::new(),
+            state: String::new(),
+            show: None,
+            source: None,
+            available: Some(unread.available),
+            reason: Some(unread.reason.clone()),
+        },
+    }
+}
+
+/// A fault as a gRPC status: the one table from [`FaultKind`] to a code.
+fn fault_status(kind: FaultKind, message: String) -> Status {
+    match kind {
+        FaultKind::NotFound => Status::not_found(message),
+        FaultKind::Precondition => Status::failed_precondition(message),
+        FaultKind::Invalid => Status::invalid_argument(message),
+        FaultKind::Internal => Status::internal(message),
+    }
+}
+
+/// Converts a ConfigError to a gRPC Status.
+fn config_error_to_status(e: config::ConfigError) -> Status {
+    fault_status(e.kind(), e.to_string())
+}
+
+/// Converts a ConfigSnapshot to an UpdateConfigResponse by serializing to
+/// YAML, saying what became of the change on the running hardware.
+#[allow(clippy::result_large_err)]
 fn snapshot_to_update_response(
     snapshot: config::store::ConfigSnapshot,
+    outcome: crate::player::ConfigChange,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let yaml = crate::util::to_yaml_string(&snapshot.config)
         .map_err(|e| Status::internal(format!("serialization error: {}", e)))?;
     Ok(Response::new(UpdateConfigResponse {
         yaml,
         checksum: snapshot.checksum,
+        applied: outcome.applied(),
+        message: outcome.message().unwrap_or_default(),
+        reload: outcome.kind().to_string(),
+        songs_error: outcome.songs_error.clone(),
+        awaits_reload: outcome.awaits,
+        awaits_process: outcome
+            .awaits
+            .map(|_| crate::player::process_id().to_string()),
     }))
 }
 
@@ -242,13 +722,7 @@ impl PlayerService for PlayerServer {
         &self,
         request: Request<PlayFromRequest>,
     ) -> Result<Response<PlayResponse>, Status> {
-        let start_time = request
-            .into_inner()
-            .start_time
-            .map(std::time::Duration::try_from)
-            .transpose()
-            .map_err(|e| Status::invalid_argument(format!("Invalid duration: {}", e)))?
-            .unwrap_or(std::time::Duration::ZERO);
+        let start_time = position_arg(request.into_inner().start_time)?;
 
         self.play_response(
             self.player
@@ -264,12 +738,7 @@ impl PlayerService for PlayerServer {
         request: Request<PlaySongFromRequest>,
     ) -> Result<Response<PlayResponse>, Status> {
         let req = request.into_inner();
-        let start_time = req
-            .start_time
-            .map(std::time::Duration::try_from)
-            .transpose()
-            .map_err(|e| Status::invalid_argument(format!("Invalid duration: {}", e)))?
-            .unwrap_or(std::time::Duration::ZERO);
+        let start_time = position_arg(req.start_time)?;
 
         self.play_response(
             self.player
@@ -281,13 +750,7 @@ impl PlayerService for PlayerServer {
     }
 
     async fn seek(&self, request: Request<SeekRequest>) -> Result<Response<SeekResponse>, Status> {
-        let position = request
-            .into_inner()
-            .position
-            .map(std::time::Duration::try_from)
-            .transpose()
-            .map_err(|e| Status::invalid_argument(format!("Invalid duration: {}", e)))?
-            .unwrap_or(std::time::Duration::ZERO);
+        let position = position_arg(request.into_inner().position)?;
 
         self.player
             .seek_to(position)
@@ -312,52 +775,37 @@ impl PlayerService for PlayerServer {
         &self,
         _: Request<PreviousRequest>,
     ) -> Result<Response<PreviousResponse>, Status> {
-        if self.player.is_playing().await && !self.player.is_current_song_looping() {
-            return Err(Status::failed_precondition("can't navigate while playing"));
-        }
-        let current_song = self
-            .player
-            .get_playlist()
-            .current()
-            .ok_or_else(|| Status::failed_precondition("playlist is empty"))?;
-        let previous_song = self
-            .player
-            .prev()
-            .await
-            .ok_or_else(|| Status::failed_precondition("playlist is empty"))?;
-
-        if current_song.name() == previous_song.name() {
-            return Err(Status::out_of_range(
-                "already at the beginning of the playlist",
-            ));
-        }
-
         Ok(Response::new(PreviousResponse {
-            song: Some(previous_song.to_proto()?),
+            song: Some(navigated(self.player.prev().await)?),
         }))
     }
 
     async fn next(&self, _: Request<NextRequest>) -> Result<Response<NextResponse>, Status> {
-        if self.player.is_playing().await && !self.player.is_current_song_looping() {
-            return Err(Status::failed_precondition("can't navigate while playing"));
-        }
-        let current_song = self
-            .player
-            .get_playlist()
-            .current()
-            .ok_or_else(|| Status::failed_precondition("playlist is empty"))?;
-        let next_song = self
-            .player
-            .next()
-            .await
-            .ok_or_else(|| Status::failed_precondition("playlist is empty"))?;
-
-        if current_song.name() == next_song.name() {
-            return Err(Status::out_of_range("already at the end of the playlist"));
-        }
-
         Ok(Response::new(NextResponse {
-            song: Some(next_song.to_proto()?),
+            song: Some(navigated(self.player.next().await)?),
+        }))
+    }
+
+    async fn navigate_to_song(
+        &self,
+        request: Request<NavigateToSongRequest>,
+    ) -> Result<Response<NavigateToSongResponse>, Status> {
+        use crate::playlist::EntryError;
+
+        let req = request.into_inner();
+        let expected = Some(req.song_name.as_str()).filter(|name| !name.is_empty());
+        let song = self
+            .player
+            .navigate_to_song(req.position as usize, expected)
+            .await
+            .map_err(|e| match e {
+                EntryError::OutOfRange { .. } => Status::out_of_range(e.to_string()),
+                EntryError::Changed { .. } | EntryError::Unloadable(_) => {
+                    Status::failed_precondition(e.to_string())
+                }
+            })?;
+        Ok(Response::new(NavigateToSongResponse {
+            song: Some(song.to_proto()?),
         }))
     }
 
@@ -378,63 +826,46 @@ impl PlayerService for PlayerServer {
         self.player
             .switch_to_playlist(&playlist_name)
             .await
-            .map_err(|e| {
-                if e.contains("not found") {
-                    Status::not_found(e)
-                } else {
-                    Status::failed_precondition(e)
-                }
-            })?;
+            .map_err(|e| fault_status(e.kind(), e.to_string()))?;
         Ok(Response::new(SwitchToPlaylistResponse {}))
     }
 
     async fn status(&self, _: Request<StatusRequest>) -> Result<Response<StatusResponse>, Status> {
-        let playlist_name = self.player.get_playlist().name().to_string();
+        // The player's one status, its DMX reads bounded: a wedged effects
+        // loop leaves the ambient light out rather than hanging the call.
+        let status = self.player.playback_status().await;
 
-        let elapsed = {
-            let elapsed = self.player.elapsed().await;
-            match elapsed {
-                Ok(play_start_time) => match play_start_time {
-                    Some(play_start_time) => match prost_types::Duration::try_from(play_start_time)
-                    {
-                        Ok(play_start_time) => Some(play_start_time),
-                        Err(e) => return Err(Status::from_error(Box::new(e))),
-                    },
-                    None => None,
-                },
-                Err(e) => return Err(Status::internal(e.to_string())),
-            }
-        };
+        let elapsed = elapsed_to_proto(status.elapsed)?;
 
-        let current_song = match self.player.get_playlist().current() {
+        let current_song = match &status.current_song {
             Some(song) => Some(song.to_proto()?),
             None => None,
         };
 
-        let playing = self.player.is_playing().await;
-
         // Hardware health travels with playback state so a remote monitor can
         // tell "silent because nothing is playing" from "silent and it should
         // not be" without a second call.
-        let audio_health = self
-            .player
-            .hardware_status()
-            .audio_output
-            .map(|h| AudioHealth {
-                status: h.status.as_str().to_string(),
-                callback_alive: h.callback_alive,
-                writing_signal: h.writing_signal,
-                recoveries: h.recoveries,
-                underruns: h.underruns,
-                last_error: h.last_error,
-            });
+        let audio_health = status.audio_health.map(|h| AudioHealth {
+            status: h.status.as_str().to_string(),
+            callback_alive: h.callback_alive,
+            writing_signal: h.writing_signal,
+            recoveries: h.recoveries,
+            underruns: h.underruns,
+            last_error: h.last_error,
+        });
+
+        let auto_play = auto_play_to_proto(status.auto_play)?;
+
+        let ambient = ambient_to_proto(status.ambient);
 
         Ok(Response::new(StatusResponse {
-            playlist_name: playlist_name.to_string(),
+            playlist_name: status.playlist.name().to_string(),
             current_song,
-            playing,
+            playing: status.playing,
             elapsed,
             audio_health,
+            ambient,
+            auto_play,
         }))
     }
 
@@ -468,10 +899,7 @@ impl PlayerService for PlayerServer {
         &self,
         _: Request<GetActiveEffectsRequest>,
     ) -> Result<Response<GetActiveEffectsResponse>, Status> {
-        let active_effects = self
-            .player
-            .format_active_effects()
-            .unwrap_or_else(|| "No DMX engine available".to_string());
+        let active_effects = self.player.active_effects_summary();
 
         Ok(Response::new(GetActiveEffectsResponse { active_effects }))
     }
@@ -497,78 +925,44 @@ impl PlayerService for PlayerServer {
         &self,
         request: Request<UpdateAudioRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        let store = self.require_config_store()?;
         let req = request.into_inner();
-        let audio: Option<config::Audio> = if req.audio_json.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&req.audio_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid audio JSON: {}", e)))?,
-            )
-        };
-        let snapshot = store
-            .update_audio(audio, &req.expected_checksum)
-            .await
-            .map_err(config_error_to_status)?;
-        self.reload_and_respond(snapshot).await
+        self.update_section(
+            ConfigSection::Audio,
+            &req.audio_json,
+            &req.expected_checksum,
+        )
+        .await
     }
 
     async fn update_midi(
         &self,
         request: Request<UpdateMidiRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        let store = self.require_config_store()?;
         let req = request.into_inner();
-        let midi: Option<config::Midi> = if req.midi_json.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&req.midi_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid MIDI JSON: {}", e)))?,
-            )
-        };
-        let snapshot = store
-            .update_midi(midi, &req.expected_checksum)
+        self.update_section(ConfigSection::Midi, &req.midi_json, &req.expected_checksum)
             .await
-            .map_err(config_error_to_status)?;
-        self.reload_and_respond(snapshot).await
     }
 
     async fn update_dmx(
         &self,
         request: Request<UpdateDmxRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        let store = self.require_config_store()?;
         let req = request.into_inner();
-        let dmx: Option<config::Dmx> = if req.dmx_json.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::from_str(&req.dmx_json)
-                    .map_err(|e| Status::invalid_argument(format!("invalid DMX JSON: {}", e)))?,
-            )
-        };
-        let snapshot = store
-            .update_dmx(dmx, &req.expected_checksum)
+        self.update_section(ConfigSection::Dmx, &req.dmx_json, &req.expected_checksum)
             .await
-            .map_err(config_error_to_status)?;
-        self.reload_and_respond(snapshot).await
     }
 
     async fn update_controllers(
         &self,
         request: Request<UpdateControllersRequest>,
     ) -> Result<Response<UpdateConfigResponse>, Status> {
-        let store = self.require_config_store()?;
         let req = request.into_inner();
-        let controllers: Vec<config::Controller> = serde_json::from_str(&req.controllers_json)
-            .map_err(|e| Status::invalid_argument(format!("invalid controllers JSON: {}", e)))?;
-        let snapshot = store
-            .update_controllers(controllers, &req.expected_checksum)
-            .await
-            .map_err(config_error_to_status)?;
-        self.reload_and_respond(snapshot).await
+        self.update_section(
+            ConfigSection::Controllers,
+            &req.controllers_json,
+            &req.expected_checksum,
+        )
+        .await
     }
 
     async fn add_profile(
@@ -592,8 +986,22 @@ impl PlayerService for PlayerServer {
     ) -> Result<Response<UpdateConfigResponse>, Status> {
         let store = self.require_config_store()?;
         let req = request.into_inner();
-        let profile: config::Profile = serde_json::from_str(&req.profile_json)
+        let body: serde_json::Value = serde_json::from_str(&req.profile_json)
             .map_err(|e| Status::invalid_argument(format!("invalid profile JSON: {}", e)))?;
+        // Sections the request leaves out keep their current values (#523).
+        let profile = store
+            .profile_from_update(req.index as usize, body)
+            .await
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let losses = self
+            .player
+            .layer_losses_at(req.index as usize, &profile)
+            .await;
+        if !losses.is_empty() {
+            return Err(Status::failed_precondition(
+                crate::player::layer_loss_message(&losses),
+            ));
+        }
         let snapshot = store
             .update_profile(req.index as usize, profile, &req.expected_checksum)
             .await
@@ -653,15 +1061,7 @@ impl PlayerService for PlayerServer {
         let applied = self
             .player
             .set_track_gain(&req.track, req.gain_db as f32)
-            .map_err(|e| match e {
-                crate::player::TrackGainError::NoAudioProfile => {
-                    Status::failed_precondition(e.to_string())
-                }
-                crate::player::TrackGainError::NonFinite(_)
-                | crate::player::TrackGainError::UnknownTrack(_) => {
-                    Status::invalid_argument(e.to_string())
-                }
-            })?;
+            .map_err(|e| fault_status(e.kind(), e.to_string()))?;
         Ok(Response::new(SetTrackGainResponse {
             applied_gain_db: applied as f64,
         }))
@@ -675,16 +1075,33 @@ impl PlayerService for PlayerServer {
         let muted = self
             .player
             .set_track_mute(&req.track, req.muted)
-            .map_err(|e| match e {
-                crate::player::TrackGainError::NoAudioProfile => {
-                    Status::failed_precondition(e.to_string())
-                }
-                crate::player::TrackGainError::NonFinite(_)
-                | crate::player::TrackGainError::UnknownTrack(_) => {
-                    Status::invalid_argument(e.to_string())
-                }
-            })?;
+            .map_err(|e| fault_status(e.kind(), e.to_string()))?;
         Ok(Response::new(SetTrackMuteResponse { muted }))
+    }
+
+    async fn set_ambient_mode(
+        &self,
+        request: Request<SetAmbientModeRequest>,
+    ) -> Result<Response<SetAmbientModeResponse>, Status> {
+        let name = request.into_inner().mode;
+        let mode = crate::dmx::engine::AmbientMode::parse_or_error(&name)
+            .map_err(Status::invalid_argument)?;
+        let player = self.player.clone();
+        tokio::task::spawn_blocking(move || player.set_ambient_mode(mode))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(SetAmbientModeResponse {
+            ambient: ambient_to_proto(self.player.ambient_status().await),
+        }))
+    }
+
+    async fn cancel_auto_play(
+        &self,
+        _: Request<CancelAutoPlayRequest>,
+    ) -> Result<Response<CancelAutoPlayResponse>, Status> {
+        Ok(Response::new(CancelAutoPlayResponse {
+            cancelled: self.player.cancel_waiting_auto_play(),
+        }))
     }
 
     async fn get_track_gains(
@@ -710,31 +1127,284 @@ impl PlayerService for PlayerServer {
             .collect();
         Ok(Response::new(GetTrackGainsResponse { gains }))
     }
+
+    async fn list_playlists(
+        &self,
+        request: Request<ListPlaylistsRequest>,
+    ) -> Result<Response<ListPlaylistsResponse>, Status> {
+        let names = self.player.list_playlists();
+        let playlists = if request.into_inner().detailed {
+            let loaded = self.player.playlists_snapshot();
+            names
+                .iter()
+                .map(|name| PlaylistSummary {
+                    name: name.clone(),
+                    song_count: loaded.get(name).map(|p| p.songs().len()).unwrap_or(0) as u32,
+                    reserved: crate::playlist::is_reserved_name(name),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Response::new(ListPlaylistsResponse {
+            names,
+            active: self.player.get_playlist().name().to_string(),
+            playlists,
+        }))
+    }
+
+    async fn get_playlist(
+        &self,
+        request: Request<GetPlaylistRequest>,
+    ) -> Result<Response<GetPlaylistResponse>, Status> {
+        let request = request.into_inner();
+        let name = request.name;
+        let playlist = if name.is_empty() {
+            self.player.get_playlist()
+        } else {
+            self.player
+                .playlists_snapshot()
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| Status::not_found(format!("Playlist '{name}' not found")))?
+        };
+        let mut response = playlist_response(&playlist)?;
+        if request.with_library {
+            // The songs a playlist could have, and each one's tracks, as the
+            // web UI's editor offers them.
+            let library = self.player.songs();
+            for song in library.sorted_list() {
+                response.available_songs.push(song.name().to_string());
+                if let Some(palette) = songs::song_palette(&song) {
+                    response
+                        .song_palettes
+                        .insert(song.name().to_string(), palette);
+                }
+                response.song_tracks.insert(
+                    song.name().to_string(),
+                    TrackNames {
+                        names: song.output_track_names(),
+                    },
+                );
+            }
+        }
+        if request.with_palettes {
+            // Only this playlist's songs, and nothing of the library.
+            for song_name in playlist.songs() {
+                if let Some(palette) = playlist
+                    .get_song(song_name)
+                    .and_then(|song| songs::song_palette(&song))
+                {
+                    response.song_palettes.insert(song_name.clone(), palette);
+                }
+            }
+        }
+        Ok(Response::new(response))
+    }
+
+    async fn save_playlist(
+        &self,
+        request: Request<SavePlaylistRequest>,
+    ) -> Result<Response<GetPlaylistResponse>, Status> {
+        let req = request.into_inner();
+        let name = req.name.clone();
+        let store = self.require_config_store()?;
+        playlists::save(&self.player, store, req).await?;
+        // As GetPlaylist reports it now, after the reload.
+        let playlist = self
+            .player
+            .playlists_snapshot()
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("Playlist '{name}' not found")))?;
+        Ok(Response::new(playlist_response(&playlist)?))
+    }
+
+    async fn list_light_shows(
+        &self,
+        _: Request<ListLightShowsRequest>,
+    ) -> Result<Response<ListLightShowsResponse>, Status> {
+        let paths = match &self.config_store {
+            Some(store) => playlists::light_shows(&self.player, store).await?,
+            None => Vec::new(),
+        };
+        Ok(Response::new(ListLightShowsResponse { paths }))
+    }
+
+    async fn list_songs(
+        &self,
+        request: Request<ListSongsRequest>,
+    ) -> Result<Response<ListSongsResponse>, Status> {
+        let root = songs::listing_root(&self.player, self.config_store.as_deref()).await;
+        let request = request.into_inner();
+        // A detailed list is the web UI's: every song at once, not a page
+        // that fits a Bluetooth message.
+        let (budget, detail) = if request.detailed {
+            (usize::MAX, songs::Detail::Full)
+        } else {
+            (songs::PAGE_BUDGET, songs::Detail::Brief)
+        };
+        Ok(Response::new(songs::list(
+            &self.player,
+            root.as_deref(),
+            request.start,
+            budget,
+            detail,
+        )))
+    }
+
+    async fn get_song(
+        &self,
+        request: Request<GetSongRequest>,
+    ) -> Result<Response<GetSongResponse>, Status> {
+        let name = request.into_inner().name;
+        let song = songs::get(&self.player, self.config_store.as_deref(), &name).await?;
+        Ok(Response::new(song))
+    }
+
+    async fn update_song_settings(
+        &self,
+        request: Request<UpdateSongSettingsRequest>,
+    ) -> Result<Response<GetSongResponse>, Status> {
+        let song = songs::update(
+            &self.player,
+            self.config_store.as_deref(),
+            request.into_inner(),
+        )
+        .await?;
+        Ok(Response::new(song))
+    }
+
+    async fn delete_playlist(
+        &self,
+        request: Request<DeletePlaylistRequest>,
+    ) -> Result<Response<DeletePlaylistResponse>, Status> {
+        let store = self.require_config_store()?;
+        playlists::delete(&self.player, store, &request.into_inner().name).await?;
+        Ok(Response::new(DeletePlaylistResponse {}))
+    }
+
+    async fn set_lock(
+        &self,
+        request: Request<SetLockRequest>,
+    ) -> Result<Response<SetLockResponse>, Status> {
+        // What the web UI's lock toggle does, and all it does.
+        self.player.set_locked(request.into_inner().locked);
+        Ok(Response::new(SetLockResponse {
+            locked: self.player.is_locked(),
+        }))
+    }
+
+    type WatchStageStream = futures_util::stream::BoxStream<'static, Result<StageUpdate, Status>>;
+
+    /// A player with no lighting (no DMX engine, or no sampler wired) is not
+    /// an error, as it is not for `GetActiveEffects`: the stream opens with
+    /// an empty layout and an empty frame, and says more if lighting comes
+    /// up under it.
+    async fn watch_stage(
+        &self,
+        request: Request<WatchStageRequest>,
+    ) -> Result<Response<Self::WatchStageStream>, Status> {
+        let watch = StageWatch::new(self.player.clone(), request.into_inner().max_rate);
+        Ok(Response::new(watch.into_stream()))
+    }
+
+    type WatchStream = watch::WatchStream;
+
+    /// What the web UI watches (playback, logs, waveform, hardware, reloads),
+    /// as one stream: see [`watch::watch`]. A read, so open while locked.
+    async fn watch(
+        &self,
+        request: Request<WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        Ok(Response::new(watch::watch(
+            self.player.clone(),
+            request.into_inner(),
+        )))
+    }
+
+    type WatchStatusStream = remote::StatusStream;
+
+    /// The compact status Bluetooth pushes, as a stream: see
+    /// [`remote::watch`]. A read, so open while locked.
+    async fn watch_status(
+        &self,
+        _request: Request<WatchStatusRequest>,
+    ) -> Result<Response<Self::WatchStatusStream>, Status> {
+        Ok(Response::new(remote::watch(self.player.clone())))
+    }
+
+    async fn get_network_info(
+        &self,
+        _request: Request<GetNetworkInfoRequest>,
+    ) -> Result<Response<GetNetworkInfoResponse>, Status> {
+        Ok(Response::new(remote::network_info(&self.player)))
+    }
+
+    type GetLightingAssetStream = asset::AssetStream;
+
+    /// The web UI's `/lighting-assets/`, read the same way, in chunks.
+    async fn get_lighting_asset(
+        &self,
+        request: Request<GetLightingAssetRequest>,
+    ) -> Result<Response<Self::GetLightingAssetStream>, Status> {
+        let request = request.into_inner();
+        let project = self
+            .config_store
+            .as_ref()
+            .map(|store| crate::util::project_dir_of(store.path()));
+        let stream = asset::open(project, request.path, request.gzip).await?;
+        Ok(Response::new(stream))
+    }
+}
+
+/// A playlist as `GetPlaylist` reports it.
+#[allow(clippy::result_large_err)]
+fn playlist_response(playlist: &crate::playlist::Playlist) -> Result<GetPlaylistResponse, Status> {
+    let settings = playlist_settings::Reported::of_loaded(playlist);
+    let entries = playlist
+        .songs()
+        .iter()
+        .zip(settings.entries)
+        .map(|(song_name, settings)| {
+            let duration = playlist
+                .get_song(song_name)
+                .map(|song| prost_types::Duration::try_from(song.length()))
+                .transpose()
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok(PlaylistEntry {
+                song_name: song_name.clone(),
+                duration,
+                settings: Some(settings),
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    Ok(GetPlaylistResponse {
+        name: playlist.name().to_string(),
+        entries,
+        position: playlist.entry().map(|index| index as u32),
+        ambient: settings.ambient,
+        revision: settings.revision,
+        available_songs: Vec::new(),
+        song_tracks: std::collections::HashMap::new(),
+        song_palettes: std::collections::HashMap::new(),
+    })
 }
 
 #[cfg(test)]
 mod test {
-    use std::{
-        collections::HashMap,
-        error::Error,
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        path::Path,
-        sync::Arc,
-        time::Duration,
-    };
+    use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
-    use tokio::net::TcpListener;
     use tonic::transport::Channel;
 
     use crate::{
         config,
         controller::{grpc::Driver, Driver as _},
         playlist,
-        playlist::Playlist,
         proto::player::v1::{
-            player_service_client::PlayerServiceClient, LoopSectionRequest, NextRequest,
-            PlayRequest, PreviousRequest, StatusRequest, StopRequest, StopSectionLoopRequest,
-            SwitchToPlaylistRequest,
+            player_service_client::PlayerServiceClient, GetPlaylistRequest, ListPlaylistsRequest,
+            LoopSectionRequest, NextRequest, PlayRequest, PreviousRequest, StatusRequest,
+            StopRequest, StopSectionLoopRequest, SwitchToPlaylistRequest,
         },
         songs,
         testutil::eventually,
@@ -788,65 +1458,17 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_grpc() -> Result<(), Box<dyn Error>> {
-        let songs = songs::get_all_songs(Path::new("assets/songs"))?;
-        let pl = Playlist::new(
-            "playlist",
-            &config::Playlist::deserialize(Path::new("assets/playlist.yaml"))?,
-            songs.clone(),
-        )?;
-        let mut playlists = HashMap::new();
-        playlists.insert(
-            "all_songs".to_string(),
-            playlist::from_songs(songs.clone())?,
-        );
-        playlists.insert("playlist".to_string(), pl);
-        let player = Player::new(
-            playlists,
-            "playlist".to_string(),
-            &config::Player::new(
-                vec![],
-                Some(config::Audio::new("mock-device")),
-                Some(config::Midi::new("mock-midi-device", None)),
-                None,
-                HashMap::new(),
-                "assets/songs",
-            ),
-            None,
-        )?;
+        let player = crate::testutil::player::assets_player()
+            .midi("mock-midi-device")
+            .build()?;
         player.await_hardware_ready().await;
         let binding = player
             .audio_device()
             .expect("audio device should be present");
         let device = binding.to_mock()?;
 
-        // Get a random port.
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let listener = TcpListener::bind(addr).await?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-
-        println!("Using port {} for testing.", port);
-
-        let driver = Driver::new(config::GrpcController::new(port), player.clone())?;
-        tokio::spawn(driver.monitor_events());
-        let mut client: Option<PlayerServiceClient<Channel>> = None;
-        for _ in 0..5 {
-            match PlayerServiceClient::connect(format!("http://127.0.0.1:{}", port)).await {
-                Ok(connected_client) => client = Some(connected_client),
-                Err(e) => {
-                    println!("Sleeping for 50ms and trying to connect again. {}", e);
-                }
-            }
-
-            if client.is_some() {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
         // Direct the player.
-        let mut client = client.expect("client was none");
+        let mut client = serve_grpc(player.clone()).await?;
 
         // Verify initial playlist name in status
         let resp = client.status(StatusRequest {}).await?;
@@ -979,57 +1601,27 @@ mod test {
         ),
         Box<dyn Error>,
     > {
-        let songs = songs::get_all_songs(Path::new("assets/songs"))?;
-        let pl = Playlist::new(
-            "playlist",
-            &config::Playlist::deserialize(Path::new("assets/playlist.yaml"))?,
-            songs.clone(),
-        )?;
-        let mut playlists = HashMap::new();
-        playlists.insert(
-            "all_songs".to_string(),
-            playlist::from_songs(songs.clone())?,
-        );
-        playlists.insert("playlist".to_string(), pl);
-        let player = Player::new(
-            playlists,
-            "playlist".to_string(),
-            &config::Player::new(
-                vec![],
-                Some(config::Audio::new("mock-device")),
-                Some(config::Midi::new("mock-midi-device", None)),
-                None,
-                track_mappings,
-                "assets/songs",
-            ),
-            None,
-        )?;
+        let player = crate::testutil::player::assets_player()
+            .midi("mock-midi-device")
+            .track_mappings(track_mappings)
+            .build()?;
         player.await_hardware_ready().await;
+        // Players start locked; these tests exercise the handlers, not the lock.
+        player.set_locked(false);
         let device = player.audio_device().expect("audio device").to_mock()?;
+        let client = serve_grpc(player.clone()).await?;
+        Ok((player, client, device))
+    }
 
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-        let listener = TcpListener::bind(addr).await?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-
-        let driver = Driver::new(config::GrpcController::new(port), player.clone())?;
-        tokio::spawn(driver.monitor_events());
-
-        let mut client = None;
-        for _ in 0..10 {
-            match PlayerServiceClient::connect(format!("http://127.0.0.1:{}", port)).await {
-                Ok(c) => {
-                    client = Some(c);
-                    break;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-        Ok((
-            player,
-            client.expect("gRPC client connection failed"),
-            device,
-        ))
+    /// Serves `player` over gRPC on a port the OS picks; a client for it.
+    async fn serve_grpc(
+        player: Arc<Player>,
+    ) -> Result<PlayerServiceClient<Channel>, Box<dyn Error>> {
+        // Port 0: the server binds one the OS picks, and says which.
+        let driver = Driver::new(config::GrpcController::new(0), player.clone())?;
+        drop(driver.monitor_events());
+        let port = driver.bound.port().await;
+        Ok(PlayerServiceClient::connect(format!("http://127.0.0.1:{port}")).await?)
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1119,6 +1711,86 @@ mod test {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_list_playlists() -> Result<(), Box<dyn Error>> {
+        let (player, mut client, _device) = setup_grpc().await?;
+
+        let listed = client
+            .list_playlists(ListPlaylistsRequest::default())
+            .await?;
+        let listed = listed.into_inner();
+        assert_eq!(listed.names, player.list_playlists());
+        assert_eq!(listed.names, ["all_songs", "playlist"]);
+        assert_eq!(listed.active, "playlist");
+
+        client
+            .switch_to_playlist(SwitchToPlaylistRequest {
+                playlist_name: "all_songs".to_string(),
+            })
+            .await?;
+        let listed = client
+            .list_playlists(ListPlaylistsRequest::default())
+            .await?;
+        assert_eq!(listed.into_inner().active, "all_songs");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_get_playlist() -> Result<(), Box<dyn Error>> {
+        let (player, mut client, _device) = setup_grpc().await?;
+
+        // An empty name is the active playlist.
+        let active = client
+            .get_playlist(GetPlaylistRequest {
+                name: String::new(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        assert_eq!(active.name, "playlist");
+        let songs: Vec<&str> = active
+            .entries
+            .iter()
+            .map(|e| e.song_name.as_str())
+            .collect();
+        assert_eq!(songs, *player.get_playlist().songs());
+        assert!(active.entries.iter().all(|e| e.duration.is_some()));
+        assert_eq!(active.position, Some(0));
+
+        // Moving the playlist moves the position.
+        client.next(NextRequest {}).await?;
+        let moved = client
+            .get_playlist(GetPlaylistRequest {
+                name: "playlist".to_string(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        assert_eq!(moved.position, Some(1));
+
+        // A playlist by name, whether or not it is active.
+        let all = client
+            .get_playlist(GetPlaylistRequest {
+                name: "all_songs".to_string(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+        assert_eq!(all.name, "all_songs");
+        assert_eq!(all.entries.len(), 10);
+        assert_eq!(all.position, Some(0));
+
+        let status = client
+            .get_playlist(GetPlaylistRequest {
+                name: "nonexistent".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an unknown playlist is not found");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_grpc_play_already_playing() -> Result<(), Box<dyn Error>> {
         let (_player, mut client, device) = setup_grpc().await?;
 
@@ -1127,11 +1799,15 @@ mod test {
         assert!(resp.into_inner().song.is_some());
         eventually(|| device.is_playing(), "Song never started playing");
 
-        // Second play while already playing should fail.
-        let result = client.play(PlayRequest {}).await;
-        assert!(
-            result.is_err(),
-            "play() while playing should be a precondition failure"
+        // Second play while already playing should fail, naming why by key.
+        let status = client.play(PlayRequest {}).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            status
+                .metadata()
+                .get(crate::player::PLAY_DECLINED_KEY)
+                .map(|v| v.to_str().unwrap()),
+            Some("already_playing")
         );
 
         client.stop(StopRequest {}).await?;
@@ -1190,7 +1866,7 @@ mod test {
         // play_from with a start time should succeed and return the song.
         let start = prost_types::Duration {
             seconds: 0,
-            nanos: 500_000_000,
+            nanos: 250_000_000,
         };
         let resp = client
             .play_from(PlayFromRequest {
@@ -1222,17 +1898,96 @@ mod test {
         Ok(())
     }
 
+    /// While a song plays the player stays on it, and the reply says so:
+    /// the song answered is the one the player is on, as MCP answers.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_grpc_next_while_playing() -> Result<(), Box<dyn Error>> {
-        let (_player, mut client, device) = setup_grpc().await?;
+        let (player, mut client, device) = setup_grpc().await?;
 
         client.play(PlayRequest {}).await?;
         eventually(|| device.is_playing(), "Song never started playing");
 
-        // next while playing should fail.
-        let result = client.next(NextRequest {}).await;
-        assert!(result.is_err(), "next() while playing should fail");
-        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        let current = player.get_playlist().current().unwrap().name().to_string();
+        let result = client.next(NextRequest {}).await?.into_inner();
+        assert_eq!(result.song.unwrap().name, current);
+        assert_eq!(player.get_playlist().current().unwrap().name(), current);
+
+        client.stop(StopRequest {}).await?;
+        eventually(|| !device.is_playing(), "Song never stopped");
+        Ok(())
+    }
+
+    fn navigate_request(
+        position: u32,
+        name: &str,
+    ) -> crate::proto::player::v1::NavigateToSongRequest {
+        crate::proto::player::v1::NavigateToSongRequest {
+            position,
+            song_name: name.to_string(),
+        }
+    }
+
+    /// Navigating to an entry makes it current and does not play it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_navigate_to_song_stopped() -> Result<(), Box<dyn Error>> {
+        let (player, mut client, device) = setup_grpc().await?;
+
+        let names: Vec<String> = player.get_playlist().songs().clone();
+        let last = names.len() - 1;
+        assert_ne!(player.get_playlist().entry(), Some(last));
+
+        let result = client
+            .navigate_to_song(navigate_request(last as u32, &names[last]))
+            .await?
+            .into_inner();
+        assert_eq!(result.song.unwrap().name, names[last]);
+        assert_eq!(player.get_playlist().entry(), Some(last));
+        assert!(!device.is_playing());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_navigate_to_song_refusals() -> Result<(), Box<dyn Error>> {
+        let (player, mut client, _device) = setup_grpc().await?;
+        let before = player.get_playlist().entry();
+        let first = player.get_playlist().songs()[0].clone();
+
+        // Past the end: OUT_OF_RANGE, as nothing else in the service has a
+        // position to be out of.
+        let status = client
+            .navigate_to_song(navigate_request(999, ""))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::OutOfRange);
+
+        // A name that is not the entry's: the playlist changed.
+        let status = client
+            .navigate_to_song(navigate_request(1, "no such song"))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("playlist has changed"));
+        assert_ne!(player.get_playlist().songs()[1], first);
+        assert_eq!(player.get_playlist().entry(), before);
+        Ok(())
+    }
+
+    /// While a song plays the player stays on it, as for Next.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_navigate_to_song_while_playing() -> Result<(), Box<dyn Error>> {
+        let (player, mut client, device) = setup_grpc().await?;
+
+        client.play(PlayRequest {}).await?;
+        eventually(|| device.is_playing(), "Song never started playing");
+
+        let current = player.get_playlist().current().unwrap().name().to_string();
+        let other = player.get_playlist().songs()[1].clone();
+        let result = client
+            .navigate_to_song(navigate_request(1, &other))
+            .await?
+            .into_inner();
+        assert_eq!(result.song.unwrap().name, current);
+        assert_eq!(player.get_playlist().current().unwrap().name(), current);
 
         client.stop(StopRequest {}).await?;
         eventually(|| !device.is_playing(), "Song never stopped");
@@ -1241,7 +1996,7 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_grpc_previous_while_playing() -> Result<(), Box<dyn Error>> {
-        let (_player, mut client, device) = setup_grpc().await?;
+        let (player, mut client, device) = setup_grpc().await?;
 
         // Move to Song 3 first so previous has somewhere to go.
         client.next(NextRequest {}).await?;
@@ -1249,10 +2004,10 @@ mod test {
         client.play(PlayRequest {}).await?;
         eventually(|| device.is_playing(), "Song never started playing");
 
-        // previous while playing should fail.
-        let result = client.previous(PreviousRequest {}).await;
-        assert!(result.is_err(), "previous() while playing should fail");
-        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        let current = player.get_playlist().current().unwrap().name().to_string();
+        let result = client.previous(PreviousRequest {}).await?.into_inner();
+        assert_eq!(result.song.unwrap().name, current);
+        assert_eq!(player.get_playlist().current().unwrap().name(), current);
 
         client.stop(StopRequest {}).await?;
         eventually(|| !device.is_playing(), "Song never stopped");
@@ -1298,7 +2053,7 @@ mod test {
 
         // play_start_time is set asynchronously after clock.start(), so
         // elapsed may briefly be None even though playing is true. Poll.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + crate::testutil::PATIENCE;
         loop {
             let resp = client.status(StatusRequest {}).await?;
             let status = resp.into_inner();
@@ -1346,6 +2101,76 @@ mod test {
         Ok(())
     }
 
+    /// What the web UI's playlist activation did, now that it is this call:
+    /// an unknown playlist is not found, a song playing refuses the switch
+    /// (told apart from not found by its code, as the web UI's was by its
+    /// status), and the lock does not stand in its way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_playlists_answers_as_the_web_ui_did() -> Result<(), Box<dyn Error>> {
+        let (player, mut client, device) = setup_grpc().await?;
+        let err = client
+            .switch_to_playlist(SwitchToPlaylistRequest {
+                playlist_name: "nonexistent".to_string(),
+            })
+            .await
+            .expect_err("an unknown playlist is not found");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // A playback control: open while locked.
+        player.set_locked(true);
+        client
+            .switch_to_playlist(SwitchToPlaylistRequest {
+                playlist_name: "all_songs".to_string(),
+            })
+            .await?;
+        assert_eq!(player.get_playlist().name(), "all_songs");
+        player.set_locked(false);
+
+        client.play(PlayRequest {}).await?;
+        eventually(|| device.is_playing(), "Song never started playing");
+        let err = client
+            .switch_to_playlist(SwitchToPlaylistRequest {
+                playlist_name: "playlist".to_string(),
+            })
+            .await
+            .expect_err("a song is playing");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(player.get_playlist().name(), "all_songs");
+        client.stop(StopRequest {}).await?;
+        eventually(|| !device.is_playing(), "Song never stopped");
+        Ok(())
+    }
+
+    /// The lock toggle, which the web UI uses: it answers
+    /// the lock as it now stands, and it is open while locked (the way to
+    /// unlock), as the lock policy lists it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_lock_answers_the_lock_and_is_open_while_locked() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::SetLockRequest;
+        let (player, mut client, _device) = setup_grpc().await?;
+        let locked = client
+            .set_lock(SetLockRequest { locked: true })
+            .await?
+            .into_inner();
+        assert!(locked.locked);
+        assert!(player.is_locked());
+        // Locking again, and unlocking, while locked.
+        assert!(
+            client
+                .set_lock(SetLockRequest { locked: true })
+                .await?
+                .into_inner()
+                .locked
+        );
+        let unlocked = client
+            .set_lock(SetLockRequest { locked: false })
+            .await?
+            .into_inner();
+        assert!(!unlocked.locked);
+        assert!(!player.is_locked());
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_grpc_get_config_no_store() -> Result<(), Box<dyn Error>> {
         use crate::proto::player::v1::GetConfigRequest;
@@ -1367,6 +2192,416 @@ mod test {
         );
         assert!(status.message().contains("config store not available"));
 
+        Ok(())
+    }
+
+    /// A server over a config store made from `songs: assets/songs`, and
+    /// the store.
+    async fn served_config_store() -> Result<
+        (
+            super::PlayerServer,
+            Arc<config::ConfigStore>,
+            tempfile::TempDir,
+        ),
+        Box<dyn Error>,
+    > {
+        let (player, _client, _device) = setup_grpc().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "songs: assets/songs\n")?;
+        let store = Arc::new(config::ConfigStore::new(
+            config::Player::deserialize(&path)?,
+            path,
+        ));
+        player.set_config_store(store.clone());
+        let server = super::PlayerServer::with_config_store(player, store.clone());
+        Ok((server, store, dir))
+    }
+
+    /// The config as written and its checksum: the checksum a save presents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_config_answers_the_yaml_and_its_checksum() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{player_service_server::PlayerService, GetConfigRequest};
+
+        let (server, store, _dir) = served_config_store().await?;
+        let reply = server
+            .get_config(tonic::Request::new(GetConfigRequest {}))
+            .await?
+            .into_inner();
+        assert!(reply.yaml.contains("songs"), "{}", reply.yaml);
+        assert!(!reply.checksum.is_empty());
+        assert_eq!((reply.yaml, reply.checksum), store.read_yaml().await?);
+        Ok(())
+    }
+
+    /// A profile is added, updated and removed by index, each against the
+    /// checksum the last answer gave, and each answer is the config after it
+    /// with what became of the hardware reload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_profile_is_added_updated_and_removed_by_index() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{
+            player_service_server::PlayerService, AddProfileRequest, RemoveProfileRequest,
+            UpdateProfileRequest,
+        };
+
+        let (server, store, _dir) = served_config_store().await?;
+        let (_, checksum) = store.read_yaml().await?;
+
+        let added = server
+            .add_profile(tonic::Request::new(AddProfileRequest {
+                profile_json: r#"{"hostname": "original"}"#.to_string(),
+                expected_checksum: checksum.clone(),
+            }))
+            .await?
+            .into_inner();
+        assert!(added.yaml.contains("original"), "{}", added.yaml);
+        assert_ne!(added.checksum, checksum);
+        assert_eq!(
+            (added.yaml.clone(), added.checksum.clone()),
+            store.read_yaml().await?
+        );
+        assert!(added.applied);
+        assert_eq!(added.reload, "applied");
+        assert_eq!(added.awaits_reload, None);
+        assert_eq!(added.songs_error, None);
+
+        let updated = server
+            .update_profile(tonic::Request::new(UpdateProfileRequest {
+                index: 0,
+                profile_json: r#"{"hostname": "updated"}"#.to_string(),
+                expected_checksum: added.checksum.clone(),
+            }))
+            .await?
+            .into_inner();
+        assert!(updated.yaml.contains("updated"), "{}", updated.yaml);
+        assert!(!updated.yaml.contains("original"), "{}", updated.yaml);
+        assert_eq!(updated.yaml, store.read_yaml().await?.0);
+
+        let removed = server
+            .remove_profile(tonic::Request::new(RemoveProfileRequest {
+                index: 0,
+                expected_checksum: updated.checksum.clone(),
+            }))
+            .await?
+            .into_inner();
+        assert!(!removed.yaml.contains("updated"), "{}", removed.yaml);
+        assert!(!removed.checksum.is_empty());
+        assert_eq!(removed.checksum, store.read_yaml().await?.1);
+        Ok(())
+    }
+
+    /// A profile write against a checksum that is not the config's is
+    /// refused, and the config is left as it was: someone else changed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_profile_write_against_a_stale_checksum_is_refused() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{
+            player_service_server::PlayerService, AddProfileRequest, RemoveProfileRequest,
+            UpdateProfileRequest,
+        };
+
+        let (server, store, _dir) = served_config_store().await?;
+        let (_, checksum) = store.read_yaml().await?;
+        server
+            .add_profile(tonic::Request::new(AddProfileRequest {
+                profile_json: r#"{"hostname": "kept"}"#.to_string(),
+                expected_checksum: checksum.clone(),
+            }))
+            .await?;
+        let before = store.read_yaml().await?;
+
+        let stale = |status: tonic::Status, rpc: &str| {
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{rpc}");
+        };
+        stale(
+            server
+                .add_profile(tonic::Request::new(AddProfileRequest {
+                    profile_json: r#"{"hostname": "other"}"#.to_string(),
+                    expected_checksum: "wrong-checksum".to_string(),
+                }))
+                .await
+                .expect_err("AddProfile"),
+            "AddProfile",
+        );
+        stale(
+            server
+                .update_profile(tonic::Request::new(UpdateProfileRequest {
+                    index: 0,
+                    profile_json: r#"{"hostname": "other"}"#.to_string(),
+                    expected_checksum: "wrong-checksum".to_string(),
+                }))
+                .await
+                .expect_err("UpdateProfile"),
+            "UpdateProfile",
+        );
+        stale(
+            server
+                .remove_profile(tonic::Request::new(RemoveProfileRequest {
+                    index: 0,
+                    expected_checksum: "wrong-checksum".to_string(),
+                }))
+                .await
+                .expect_err("RemoveProfile"),
+            "RemoveProfile",
+        );
+        // An empty checksum, as a caller that sent none, is as stale.
+        stale(
+            server
+                .remove_profile(tonic::Request::new(RemoveProfileRequest {
+                    index: 0,
+                    expected_checksum: String::new(),
+                }))
+                .await
+                .expect_err("RemoveProfile without a checksum"),
+            "RemoveProfile without a checksum",
+        );
+        assert_eq!(store.read_yaml().await?, before);
+        Ok(())
+    }
+
+    /// A profile that is not valid, or an index that is not there, is the
+    /// caller's to fix, and nothing is saved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_profile_write_that_is_not_valid_is_an_invalid_argument() -> Result<(), Box<dyn Error>>
+    {
+        use crate::proto::player::v1::{
+            player_service_server::PlayerService, AddProfileRequest, RemoveProfileRequest,
+            UpdateProfileRequest,
+        };
+
+        let (server, store, _dir) = served_config_store().await?;
+        let before = store.read_yaml().await?;
+
+        let missing = server
+            .update_profile(tonic::Request::new(UpdateProfileRequest {
+                index: 999,
+                profile_json: r#"{"hostname": "test"}"#.to_string(),
+                expected_checksum: before.1.clone(),
+            }))
+            .await
+            .expect_err("a profile that is not there");
+        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+        assert!(missing.message().contains("index"), "{missing}");
+
+        let missing = server
+            .remove_profile(tonic::Request::new(RemoveProfileRequest {
+                index: 999,
+                expected_checksum: before.1.clone(),
+            }))
+            .await
+            .expect_err("a profile that is not there");
+        assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+
+        let not_json = server
+            .add_profile(tonic::Request::new(AddProfileRequest {
+                profile_json: "not json".to_string(),
+                expected_checksum: before.1.clone(),
+            }))
+            .await
+            .expect_err("a profile that is not JSON");
+        assert_eq!(not_json.code(), tonic::Code::InvalidArgument);
+
+        // A mapping to channel 0 (channels count from 1) fails the
+        // profile's own validation.
+        let invalid = server
+            .add_profile(tonic::Request::new(AddProfileRequest {
+                profile_json: r#"{"audio": {"device": "d", "track_mappings": {"kick": [0]}}}"#
+                    .to_string(),
+                expected_checksum: before.1.clone(),
+            }))
+            .await
+            .expect_err("a profile that does not validate");
+        assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+
+        assert_eq!(store.read_yaml().await?, before);
+        Ok(())
+    }
+
+    /// A reply says which reload it was, the generation a deferred one waits
+    /// for and the process that counts it, and a song reload that failed
+    /// beside it: what the web UI's notice is made of.
+    #[test]
+    fn a_config_update_reply_says_which_reload_it_was() {
+        use crate::player::{ConfigApply, ConfigChange};
+        let snapshot = || config::store::ConfigSnapshot {
+            config: config::Player::default(),
+            yaml: "songs: songs\n".to_string(),
+            checksum: "abc".to_string(),
+        };
+        let reply = |change: ConfigChange| {
+            super::snapshot_to_update_response(snapshot(), change)
+                .unwrap()
+                .into_inner()
+        };
+
+        let applied = reply(ConfigApply::Applied.into());
+        assert_eq!(applied.reload, "applied");
+        assert_eq!(applied.songs_error, None);
+        assert_eq!(applied.awaits_reload, None);
+        assert_eq!(applied.awaits_process, None);
+
+        let mut deferred = ConfigChange::from(ConfigApply::Deferred);
+        deferred.awaits = Some(3);
+        deferred.songs_error = Some("no songs".to_string());
+        let deferred = reply(deferred);
+        assert_eq!(deferred.reload, "deferred");
+        assert!(!deferred.applied);
+        assert_eq!(deferred.awaits_reload, Some(3));
+        assert_eq!(
+            deferred.awaits_process,
+            Some(crate::player::process_id().to_string())
+        );
+        assert_eq!(deferred.songs_error.as_deref(), Some("no songs"));
+
+        assert_eq!(
+            reply(ConfigApply::Failed("x".into()).into()).reload,
+            "failed"
+        );
+    }
+
+    /// A config change deferred under a song answered as one applied: the
+    /// reply says whether the hardware reload ran, and why not when not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_update_says_whether_it_was_applied() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{player_service_server::PlayerService, UpdateAudioRequest};
+
+        let (player, _client, device) = setup_grpc().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "songs: assets/songs\n")?;
+        let store = Arc::new(config::ConfigStore::new(
+            config::Player::deserialize(&path)?,
+            path,
+        ));
+        player.set_config_store(store.clone());
+        let server = super::PlayerServer::with_config_store(player.clone(), store.clone());
+        let update = |checksum: String| UpdateAudioRequest {
+            audio_json: String::new(),
+            expected_checksum: checksum,
+        };
+
+        // Held paused, which counts as playing: the test song is half a
+        // second long, and a slow runner reached the update after it had
+        // ended. A pause landing after the end finds nothing; start again.
+        loop {
+            player.play().await?;
+            eventually(|| device.is_playing(), "Song never started playing");
+            if player.pause().await?.is_some() {
+                break;
+            }
+        }
+        let (_, checksum) = store.read_yaml().await?;
+        let deferred = server
+            .update_audio(tonic::Request::new(update(checksum)))
+            .await?
+            .into_inner();
+        assert!(
+            !deferred.applied,
+            "a change under a song said it was applied"
+        );
+        assert!(deferred.message.contains("idle"), "{}", deferred.message);
+        assert_eq!(deferred.reload, "deferred");
+        // The generation the save waits for, for a client to clear its
+        // notice by, and the process that counts it.
+        assert_eq!(deferred.awaits_reload, Some(1), "{deferred:?}");
+        assert_eq!(
+            deferred.awaits_process,
+            Some(crate::player::process_id().to_string())
+        );
+
+        player.stop().await;
+        eventually(|| !device.is_playing(), "Song never stopped playing");
+        player.await_hardware_ready().await;
+        let (_, checksum) = store.read_yaml().await?;
+        let applied = server
+            .update_audio(tonic::Request::new(update(checksum)))
+            .await?
+            .into_inner();
+        assert!(applied.applied);
+        assert_eq!(applied.reload, "applied");
+        assert!(applied.message.is_empty(), "{}", applied.message);
+        Ok(())
+    }
+
+    /// A reload that fails after a save answers with the save, its new
+    /// checksum included, and says it was not applied and why, as the web
+    /// UI's and MCP's replies do. It used to answer failed_precondition,
+    /// leaving the client with the old checksum of a config already saved.
+    #[test]
+    fn a_config_update_whose_reload_fails_says_so_with_the_save() {
+        let snapshot = config::store::ConfigSnapshot {
+            config: config::Player::default(),
+            yaml: "songs: songs\n".to_string(),
+            checksum: "abc".to_string(),
+        };
+        let reply = super::snapshot_to_update_response(
+            snapshot,
+            crate::player::ConfigApply::Failed("no store".into()).into(),
+        )
+        .unwrap()
+        .into_inner();
+        assert_eq!(reply.checksum, "abc");
+        assert!(!reply.applied);
+        assert!(reply.message.contains("no store"), "{}", reply.message);
+    }
+
+    /// A config change the next start would refuse, a second MIDI
+    /// controller, was saved and applied, and mtrack then failed to start.
+    /// It is refused as an invalid argument, and the file is left as it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_update_that_would_not_load_is_an_invalid_argument(
+    ) -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{
+            player_service_server::PlayerService, AddProfileRequest, UpdateControllersRequest,
+        };
+
+        let (player, _client, _device) = setup_grpc().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "songs: assets/songs\n")?;
+        let store = Arc::new(config::ConfigStore::new(
+            config::Player::deserialize(&path)?,
+            path.clone(),
+        ));
+        player.set_config_store(store.clone());
+        let server = super::PlayerServer::with_config_store(player.clone(), store.clone());
+        let midi = config::Controller::Midi(config::MidiController::new(
+            config::midi::note_on(16, 0, 127),
+            config::midi::note_on(16, 1, 127),
+            config::midi::note_on(16, 2, 127),
+            config::midi::note_on(16, 3, 127),
+            config::midi::note_on(16, 4, 127),
+            config::midi::note_on(16, 5, 127),
+        ));
+        let controllers = serde_json::to_string(&[&midi, &midi])?;
+        let before = std::fs::read_to_string(&path)?;
+        let (_, checksum) = store.read_yaml().await?;
+
+        let refused = server
+            .update_controllers(tonic::Request::new(UpdateControllersRequest {
+                controllers_json: controllers.clone(),
+                expected_checksum: checksum.clone(),
+            }))
+            .await
+            .expect_err("two MIDI controllers were accepted");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+        assert!(
+            refused.message().contains("only one can watch"),
+            "{refused}"
+        );
+
+        let profile = format!(r#"{{"hostname": "two-midi", "controllers": {controllers}}}"#);
+        let refused = server
+            .add_profile(tonic::Request::new(AddProfileRequest {
+                profile_json: profile,
+                expected_checksum: checksum.clone(),
+            }))
+            .await
+            .expect_err("a profile with two MIDI controllers was accepted");
+        assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+        assert_eq!(std::fs::read_to_string(&path)?, before);
+        assert_eq!(store.read_yaml().await?.1, checksum);
+        config::Player::deserialize(&path)?;
         Ok(())
     }
 
@@ -1449,6 +2684,956 @@ mod test {
         // Verify state was cleared.
         assert!(player.active_section().is_none());
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_ambient_mode() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::SetAmbientModeRequest;
+
+        // A DMX engine with no ambient show: on says it has none to play.
+        let player = crate::testutil::player::assets_player()
+            .dmx(Some(config::Dmx::new(
+                None,
+                None,
+                Some(9090),
+                vec![config::Universe::new(1, "test".to_string())],
+                None,
+            )))
+            .ready()
+            .await?;
+        let mut client = serve_grpc(player.clone()).await?;
+
+        let ambient = client.status(StatusRequest {}).await?.into_inner().ambient;
+        let ambient = ambient.expect("ambient with a DMX engine");
+        assert_eq!(
+            (ambient.mode.as_str(), ambient.state.as_str()),
+            ("auto", "off")
+        );
+
+        let resp = client
+            .set_ambient_mode(SetAmbientModeRequest {
+                mode: "on".to_string(),
+            })
+            .await?
+            .into_inner();
+        let ambient = resp.ambient.expect("ambient");
+        assert_eq!(
+            (ambient.mode.as_str(), ambient.state.as_str()),
+            ("on", "unavailable")
+        );
+        assert_eq!(player.ambient_mode(), crate::dmx::engine::AmbientMode::On);
+
+        let status = client
+            .set_ambient_mode(SetAmbientModeRequest {
+                mode: "dim".to_string(),
+            })
+            .await
+            .expect_err("an unknown mode");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_grpc_auto_play_status_and_cancel() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::CancelAutoPlayRequest;
+
+        let player = crate::testutil::player::assets_player()
+            .playlist_yaml("songs:\n- Song 1\n- song: Song 3\n  auto_play: 2s\n")
+            .ready()
+            .await?;
+        let mut client = serve_grpc(player.clone()).await?;
+
+        let status = client.status(StatusRequest {}).await?.into_inner();
+        assert!(status.auto_play.is_none(), "nothing waiting");
+        assert!(status.ambient.is_none(), "no DMX engine");
+
+        client.next(NextRequest {}).await?;
+        let auto_play = client
+            .status(StatusRequest {})
+            .await?
+            .into_inner()
+            .auto_play
+            .expect("waiting");
+        assert_eq!(auto_play.song, "Song 3");
+        let starts_in = auto_play.starts_in.expect("starts_in");
+        assert!(starts_in.seconds <= 2, "{starts_in:?}");
+
+        let resp = client.cancel_auto_play(CancelAutoPlayRequest {}).await?;
+        assert!(resp.into_inner().cancelled);
+        let status = client.status(StatusRequest {}).await?.into_inner();
+        assert!(status.auto_play.is_none(), "called off");
+        assert!(!status.playing);
+        assert_eq!(status.current_song.expect("song").name, "Song 3");
+
+        let resp = client.cancel_auto_play(CancelAutoPlayRequest {}).await?;
+        assert!(!resp.into_inner().cancelled, "nothing left to call off");
+        Ok(())
+    }
+
+    /// The RPCs in the proto, each with the service it is in.
+    fn proto_service_rpcs() -> Vec<(&'static str, &'static str)> {
+        let mut service = "";
+        let mut rpcs = Vec::new();
+        for line in include_str!("../proto/player/v1/player.proto")
+            .lines()
+            .map(str::trim)
+        {
+            if let Some(name) = line.strip_prefix("service ") {
+                service = name.trim_end_matches('{').trim();
+            } else if let Some(rpc) = line.strip_prefix("rpc ") {
+                rpcs.push((service, rpc.split('(').next().unwrap().trim()));
+            }
+        }
+        rpcs
+    }
+
+    /// The RPCs in the proto.
+    fn proto_rpcs() -> Vec<&'static str> {
+        proto_service_rpcs()
+            .into_iter()
+            .map(|(_, rpc)| rpc)
+            .collect()
+    }
+
+    /// The lock policy names an RPC by its name alone, so no two services
+    /// may share one: a `ConfigService` RPC named as an open `PlayerService`
+    /// one would be open while locked too.
+    #[test]
+    fn no_two_services_share_an_rpc_name() {
+        let rpcs = proto_rpcs();
+        let unique: std::collections::HashSet<&&str> = rpcs.iter().collect();
+        assert_eq!(unique.len(), rpcs.len(), "an RPC name is in two services");
+        let services: std::collections::HashSet<&str> = proto_service_rpcs()
+            .into_iter()
+            .map(|(service, _)| service)
+            .collect();
+        assert!(
+            services.contains("PlayerService")
+                && services.contains("ConfigService")
+                && services.contains("LightingService")
+        );
+    }
+
+    /// Every RPC the lock policy leaves open is in the proto.
+    #[test]
+    fn every_open_rpc_is_in_the_proto() {
+        let rpcs = proto_rpcs();
+        assert!(!rpcs.is_empty());
+        for rpc in crate::player::lock_policy::open_on(crate::player::lock_policy::Surface::Grpc) {
+            assert!(rpcs.contains(&rpc), "{rpc} is not in the proto");
+        }
+    }
+
+    /// Every RPC in the proto, of either service, the lock policy does not
+    /// leave open is refused by the service's lock guard while the player is
+    /// locked, before its handler runs, so a new RPC is locked out until
+    /// listed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lock_guard_refuses_every_rpc_not_left_open() -> Result<(), Box<dyn Error>> {
+        use tonic::server::NamedService;
+        use tower::ServiceExt;
+        let (player, _client, _device) = setup_grpc().await?;
+        player.set_locked(true);
+        let open: Vec<&str> =
+            crate::player::lock_policy::open_on(crate::player::lock_policy::Surface::Grpc)
+                .collect();
+        let locked: Vec<(&str, &str)> = proto_service_rpcs()
+            .into_iter()
+            .filter(|(_, rpc)| !open.contains(rpc))
+            .collect();
+        assert!(locked.contains(&("PlayerService", "UpdateAudio")));
+        for rpc in ["UpdateSamples", "UpdateMetronome"] {
+            assert!(locked.contains(&("ConfigService", rpc)), "{rpc}");
+        }
+        for rpc in ["SaveProfileFile", "DeleteProfileFile"] {
+            assert!(locked.contains(&("ConfigService", rpc)), "{rpc}");
+        }
+        // The audio probe opens a device, and the calibration calls record
+        // from one.
+        for rpc in [
+            "ProbeAudioDevice",
+            "StartCalibration",
+            "CaptureCalibration",
+            "StopCalibration",
+            "CancelCalibration",
+        ] {
+            assert!(locked.contains(&("ConfigService", rpc)), "{rpc}");
+        }
+        // The song writes are locked out; the song reads are open.
+        for rpc in [
+            "CreateSong",
+            "SaveSongConfig",
+            "DeleteSong",
+            "ImportSongFile",
+            "CreateSongInDirectory",
+            "BulkImportSongs",
+        ] {
+            assert!(locked.contains(&("ConfigService", rpc)), "{rpc}");
+        }
+        // Writing a light show and starting a fixture test are locked out.
+        for rpc in ["SaveLightShow", "DeleteLightShow", "StartFixtureTest"] {
+            assert!(locked.contains(&("LightingService", rpc)), "{rpc}");
+        }
+        // The reads are open, and so is the controller restart, the
+        // lighting validation and evaluation, and the release of a test.
+        for rpc in [
+            "GetLightShow",
+            "ValidateLightShow",
+            "GetLightingReadiness",
+            "GetLightingFit",
+            "EvaluateSongLighting",
+            "ListLightingGroups",
+            "StopFixtureTest",
+            "GetFixtureTestOptions",
+        ] {
+            assert!(open.contains(&rpc), "{rpc}");
+        }
+        for rpc in [
+            "GetSongConfig",
+            "GetSongWaveform",
+            "GuessSongTempo",
+            "ListSongFiles",
+            "BrowseDirectory",
+            "ListProfileFiles",
+            "GetProfileFile",
+            "ListAudioDevices",
+            "ListMidiDevices",
+            "RestartControllers",
+        ] {
+            assert!(open.contains(&rpc), "{rpc}");
+        }
+        for (service, rpc) in locked {
+            let path = |name: &str| format!("/{name}/{rpc}");
+            let request = |name: &str| {
+                http::Request::post(path(name))
+                    .header("content-type", "application/grpc")
+                    .body(tonic::body::Body::empty())
+            };
+            let response = match service {
+                "PlayerService" => {
+                    let name =
+                        <super::PlayerServiceServer<super::PlayerServer> as NamedService>::NAME;
+                    super::player_service(player.clone())
+                        .oneshot(request(name)?)
+                        .await?
+                }
+                "ConfigService" => {
+                    let name = <super::ConfigServiceServer<super::config_service::ConfigServer> as NamedService>::NAME;
+                    super::config_service(player.clone())
+                        .oneshot(request(name)?)
+                        .await?
+                }
+                "LightingService" => {
+                    let name = <super::LightingServiceServer<
+                        super::lighting_service::LightingServer,
+                    > as NamedService>::NAME;
+                    super::lighting_service(player.clone())
+                        .oneshot(request(name)?)
+                        .await?
+                }
+                other => panic!("{other} is served by no lock guard in this test"),
+            };
+            let status = tonic::Status::from_header_map(response.headers()).expect(rpc);
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{rpc}");
+            assert_eq!(
+                status.message(),
+                crate::player::LockedError.to_string(),
+                "{rpc}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reflection lists the health service beside the player's, which is
+    /// what lets `grpcurl` call it with no proto file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reflection_lists_the_health_service() -> Result<(), Box<dyn Error>> {
+        use tonic_reflection::pb::v1::{
+            server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+            ServerReflectionRequest,
+        };
+        let (player, _client, _device) = setup_grpc().await?;
+        let driver = Driver::new(config::GrpcController::new(0), player.clone())?;
+        drop(driver.monitor_events());
+        let port = driver.bound.port().await;
+        let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))?
+            .connect()
+            .await?;
+        let mut reflection = ServerReflectionClient::new(channel);
+
+        let request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut answers = reflection
+            .server_reflection_info(futures_util::stream::iter([request]))
+            .await?
+            .into_inner();
+        let Some(MessageResponse::ListServicesResponse(list)) = answers
+            .message()
+            .await?
+            .and_then(|answer| answer.message_response)
+        else {
+            panic!("a list of services");
+        };
+        let names: Vec<&str> = list.service.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"grpc.health.v1.Health"), "{names:?}");
+        assert!(names.contains(&"player.v1.PlayerService"), "{names:?}");
+        assert!(names.contains(&"player.v1.ConfigService"), "{names:?}");
+        assert!(names.contains(&"player.v1.LightingService"), "{names:?}");
+        Ok(())
+    }
+
+    /// The standard health service answers on the gRPC port while the
+    /// player is locked, for the server and for the player service.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_health_service_is_serving_while_locked() -> Result<(), Box<dyn Error>> {
+        use tonic_health::pb::{
+            health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
+        };
+        let (player, _client, _device) = setup_grpc().await?;
+        player.set_locked(true);
+        let driver = Driver::new(config::GrpcController::new(0), player.clone())?;
+        drop(driver.monitor_events());
+        let port = driver.bound.port().await;
+        let channel = Channel::from_shared(format!("http://127.0.0.1:{port}"))?
+            .connect()
+            .await?;
+        let mut health = HealthClient::new(channel);
+
+        for service in [
+            "",
+            "player.v1.PlayerService",
+            "player.v1.ConfigService",
+            "player.v1.LightingService",
+        ] {
+            let status = health
+                .check(HealthCheckRequest {
+                    service: service.to_string(),
+                })
+                .await?
+                .into_inner()
+                .status;
+            assert_eq!(status, ServingStatus::Serving as i32, "{service:?}");
+        }
+        let unknown = health
+            .check(HealthCheckRequest {
+                service: "no.such.Service".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code(), tonic::Code::NotFound);
+        Ok(())
+    }
+
+    /// A locked player, served over gRPC, refuses every config write as
+    /// FAILED_PRECONDITION and leaves the file alone, while reads and
+    /// playback controls still work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_locked_player_refuses_config_writes() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{
+            AddProfileRequest, GetConfigRequest, RemoveProfileRequest, StopSamplesRequest,
+            UpdateAudioRequest, UpdateControllersRequest, UpdateDmxRequest, UpdateMidiRequest,
+            UpdateProfileRequest,
+        };
+        use tonic::Status;
+
+        let (player, _client, device) = setup_grpc().await?;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "songs: assets/songs\n")?;
+        let store = Arc::new(config::ConfigStore::new(
+            config::Player::deserialize(&path)?,
+            path.clone(),
+        ));
+        player.set_config_store(store.clone());
+        // Served after the store is set, so the service has it.
+        let mut client = serve_grpc(player.clone()).await?;
+        let before = std::fs::read_to_string(&path)?;
+        let (_, checksum) = store.read_yaml().await?;
+        player.set_locked(true);
+
+        let r = |c: &str| c.to_string();
+        let results: Vec<(&str, Result<(), Status>)> = vec![
+            (
+                "UpdateAudio",
+                client
+                    .update_audio(UpdateAudioRequest {
+                        audio_json: String::new(),
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "UpdateMidi",
+                client
+                    .update_midi(UpdateMidiRequest {
+                        midi_json: String::new(),
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "UpdateDmx",
+                client
+                    .update_dmx(UpdateDmxRequest {
+                        dmx_json: String::new(),
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "UpdateControllers",
+                client
+                    .update_controllers(UpdateControllersRequest {
+                        controllers_json: "[]".to_string(),
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "AddProfile",
+                client
+                    .add_profile(AddProfileRequest {
+                        profile_json: r#"{"hostname": "x"}"#.to_string(),
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "UpdateProfile",
+                client
+                    .update_profile(UpdateProfileRequest {
+                        index: 0,
+                        profile_json: "{}".to_string(),
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "RemoveProfile",
+                client
+                    .remove_profile(RemoveProfileRequest {
+                        index: 0,
+                        expected_checksum: r(&checksum),
+                    })
+                    .await
+                    .map(|_| ()),
+            ),
+        ];
+        for (rpc, result) in results {
+            let status = result.expect_err(rpc);
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{rpc}");
+            assert!(status.message().contains("locked"), "{rpc}: {status}");
+        }
+        assert_eq!(std::fs::read_to_string(&path)?, before);
+
+        // Reads and playback controls stay open.
+        client.get_config(GetConfigRequest {}).await?;
+        client.status(StatusRequest {}).await?;
+        client.play(PlayRequest {}).await?;
+        eventually(|| device.is_playing(), "Song never started playing");
+        client.stop(StopRequest {}).await?;
+        eventually(|| !device.is_playing(), "Song never stopped playing");
+        client.next(NextRequest {}).await?;
+        client.stop_samples(StopSamplesRequest {}).await?;
+        client.stop_section_loop(StopSectionLoopRequest {}).await?;
+        assert!(player.is_locked());
+        Ok(())
+    }
+
+    type StageStream = <super::PlayerServer as super::PlayerService>::WatchStageStream;
+    type StateTx = Arc<tokio::sync::watch::Sender<Arc<crate::state::StateSnapshot>>>;
+
+    /// A snapshot of fixtures, each with channels and their values.
+    fn stage_of(fixtures: &[(&str, &[(&str, u8)])]) -> Arc<crate::state::StateSnapshot> {
+        Arc::new(crate::state::StateSnapshot {
+            fixtures: fixtures
+                .iter()
+                .map(|(name, channels)| crate::state::FixtureSnapshot {
+                    name: name.to_string(),
+                    channels: channels.iter().map(|(c, v)| (c.to_string(), *v)).collect(),
+                    cells: Default::default(),
+                    strobe_hz: None,
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    /// A player whose stage is `first`, its stage stream at `max_rate`, and
+    /// the sender the sampler would push snapshots through.
+    async fn watch_stage(
+        first: Arc<crate::state::StateSnapshot>,
+        max_rate: u32,
+    ) -> (Arc<Player>, StateTx, StageStream) {
+        let player = crate::testutil::player::memory_player(&["Song A"]).build();
+        let (state_tx, _state_rx) = tokio::sync::watch::channel(first);
+        player.set_state_tx(state_tx);
+        let state_tx = player.state_tx().expect("the sender just set");
+        let stream = open_stage(&player, max_rate).await;
+        (player, state_tx, stream)
+    }
+
+    async fn open_stage(player: &Arc<Player>, max_rate: u32) -> StageStream {
+        use crate::proto::player::v1::WatchStageRequest;
+        let server = super::PlayerServer::new(player.clone());
+        super::PlayerService::watch_stage(
+            &server,
+            tonic::Request::new(WatchStageRequest { max_rate }),
+        )
+        .await
+        .expect("the stream opens")
+        .into_inner()
+    }
+
+    async fn next_update(
+        stream: &mut StageStream,
+    ) -> crate::proto::player::v1::stage_update::Update {
+        use futures_util::StreamExt;
+        tokio::time::timeout(crate::testutil::PATIENCE, stream.next())
+            .await
+            .expect("the stream said nothing")
+            .expect("the stream ended")
+            .expect("the stream failed")
+            .update
+            .expect("an update")
+    }
+
+    async fn next_layout(stream: &mut StageStream) -> crate::proto::player::v1::StageLayout {
+        match next_update(stream).await {
+            crate::proto::player::v1::stage_update::Update::Layout(layout) => layout,
+            other => panic!("expected a layout, got {other:?}"),
+        }
+    }
+
+    async fn next_frame(stream: &mut StageStream) -> crate::proto::player::v1::StageFrame {
+        match next_update(stream).await {
+            crate::proto::player::v1::stage_update::Update::Frame(frame) => frame,
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    /// A client joining an idle rig sees it at once: nothing has to change
+    /// first.
+    #[tokio::test]
+    async fn the_stage_stream_opens_with_the_layout_and_then_a_frame() {
+        let first = stage_of(&[
+            ("par", &[("red", 9), ("dimmer", 200)]),
+            ("bar", &[("dimmer", 7)]),
+        ]);
+        let (_player, _state_tx, mut stream) = watch_stage(first, 0).await;
+
+        let layout = next_layout(&mut stream).await;
+        let names: Vec<&str> = layout.fixtures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["bar", "par"]);
+        assert_eq!(layout.fixtures[1].channels, ["dimmer", "red"]);
+        assert_eq!(layout.venue, None, "no lighting system, no venue");
+        assert_eq!(layout.id, 1, "the stream's first layout");
+        let frame = next_frame(&mut stream).await;
+        assert_eq!(frame.channels, [7, 200, 9]);
+        assert_eq!(frame.layout, 1);
+    }
+
+    /// A snapshot that changes something is a frame; one that says what the
+    /// last frame said is nothing, though the sampler published it.
+    #[tokio::test]
+    async fn the_stage_stream_sends_a_frame_for_a_change_and_nothing_for_none() {
+        let (_player, state_tx, mut stream) =
+            watch_stage(stage_of(&[("par", &[("red", 1)])]), 0).await;
+        next_layout(&mut stream).await;
+        assert_eq!(next_frame(&mut stream).await.channels, [1]);
+
+        state_tx.send(stage_of(&[("par", &[("red", 2)])])).unwrap();
+        let frame = next_frame(&mut stream).await;
+        assert_eq!(
+            (frame.channels.as_slice(), frame.layout),
+            ([2].as_slice(), 1)
+        );
+
+        // The same again, then a change: the next message is the change, so
+        // the repeat was never sent.
+        state_tx.send(stage_of(&[("par", &[("red", 2)])])).unwrap();
+        let waited = tokio::time::timeout(Duration::from_millis(50), next_update(&mut stream));
+        assert!(waited.await.is_err(), "a repeat is not a frame");
+        state_tx.send(stage_of(&[("par", &[("red", 3)])])).unwrap();
+        assert_eq!(next_frame(&mut stream).await.channels, [3]);
+    }
+
+    /// A frame is bytes in the layout's order, so a fixture or a channel the
+    /// layout does not name is a new layout first.
+    #[tokio::test]
+    async fn the_stage_stream_sends_a_layout_before_a_frame_that_no_longer_fits() {
+        let (_player, state_tx, mut stream) =
+            watch_stage(stage_of(&[("par", &[("red", 1)])]), 0).await;
+        next_layout(&mut stream).await;
+        next_frame(&mut stream).await;
+
+        // A new fixture.
+        state_tx
+            .send(stage_of(&[
+                ("par", &[("red", 1)]),
+                ("bar", &[("dimmer", 5)]),
+            ]))
+            .unwrap();
+        let layout = next_layout(&mut stream).await;
+        let names: Vec<&str> = layout.fixtures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["bar", "par"]);
+        assert_eq!(next_frame(&mut stream).await.channels, [5, 1]);
+
+        // A new channel.
+        state_tx
+            .send(stage_of(&[
+                ("par", &[("red", 1), ("green", 2)]),
+                ("bar", &[("dimmer", 5)]),
+            ]))
+            .unwrap();
+        let layout = next_layout(&mut stream).await;
+        assert_eq!(layout.fixtures[1].channels, ["green", "red"]);
+        assert_eq!(next_frame(&mut stream).await.channels, [5, 2, 1]);
+
+        // A fixture gone.
+        state_tx
+            .send(stage_of(&[("bar", &[("dimmer", 6)])]))
+            .unwrap();
+        assert_eq!(next_layout(&mut stream).await.fixtures.len(), 1);
+        assert_eq!(next_frame(&mut stream).await.channels, [6]);
+    }
+
+    /// The venue changing under the player (a venue or fixture type reload,
+    /// a hardware reload) is a layout, and the frame that is read against
+    /// it, though no value moved.
+    #[tokio::test]
+    async fn the_stage_stream_sends_the_layout_again_when_its_revision_moves() {
+        let (player, state_tx, mut stream) =
+            watch_stage(stage_of(&[("par", &[("red", 1)])]), 0).await;
+        let first = next_layout(&mut stream).await;
+        next_frame(&mut stream).await;
+
+        player.bump_stage_layout();
+        let second = next_layout(&mut stream).await;
+        assert_eq!((first.id, second.id), (1, 2));
+        assert_eq!(second.fixtures, first.fixtures);
+        // The frame after it is read against the new layout, and says so,
+        // as every frame does until the next layout.
+        let frame = next_frame(&mut stream).await;
+        assert_eq!(
+            (frame.channels.as_slice(), frame.layout),
+            ([1].as_slice(), 2)
+        );
+        state_tx.send(stage_of(&[("par", &[("red", 9)])])).unwrap();
+        let frame = next_frame(&mut stream).await;
+        assert_eq!(
+            (frame.channels.as_slice(), frame.layout),
+            ([9].as_slice(), 2)
+        );
+
+        // A layout the snapshot forces is numbered the same way.
+        state_tx
+            .send(stage_of(&[("bar", &[("dimmer", 3)])]))
+            .unwrap();
+        assert_eq!(next_layout(&mut stream).await.id, 3);
+        assert_eq!(next_frame(&mut stream).await.layout, 3);
+    }
+
+    /// Frames come no closer together than the caller asked, and the one
+    /// sent after the wait is the newest: the ones between are dropped.
+    #[tokio::test]
+    async fn the_stage_stream_keeps_to_the_callers_rate_and_sends_the_newest() {
+        let interval = Duration::from_millis(250);
+        let opened = tokio::time::Instant::now();
+        let (_player, state_tx, mut stream) =
+            watch_stage(stage_of(&[("par", &[("red", 0)])]), 4).await;
+        next_layout(&mut stream).await;
+        next_frame(&mut stream).await;
+
+        for value in 1..=3 {
+            state_tx
+                .send(stage_of(&[("par", &[("red", value)])]))
+                .unwrap();
+        }
+        assert_eq!(next_frame(&mut stream).await.channels, [3]);
+        assert!(
+            opened.elapsed() >= interval,
+            "sent before the interval was over"
+        );
+
+        // And again: the stream is not left a frame behind.
+        let sent = tokio::time::Instant::now();
+        for value in 4..=6 {
+            state_tx
+                .send(stage_of(&[("par", &[("red", value)])]))
+                .unwrap();
+        }
+        assert_eq!(next_frame(&mut stream).await.channels, [6]);
+        assert!(sent.elapsed() >= interval - Duration::from_millis(5));
+    }
+
+    /// No sampler wired is not an error, as no DMX engine is not for
+    /// GetActiveEffects: an empty stage, which fills in if lighting comes up.
+    #[tokio::test]
+    async fn the_stage_stream_of_a_player_with_no_lighting_is_an_empty_stage() {
+        let player = crate::testutil::player::memory_player(&["Song A"]).build();
+        let mut stream = open_stage(&player, 0).await;
+        let layout = next_layout(&mut stream).await;
+        assert_eq!(
+            (layout.id, layout.fixtures.len(), layout.venue),
+            (1, 0, None)
+        );
+        let frame = next_frame(&mut stream).await;
+        assert_eq!(
+            frame,
+            crate::proto::player::v1::StageFrame {
+                layout: 1,
+                ..Default::default()
+            }
+        );
+
+        // Lighting comes up: a state sender, and the engine's install bumps
+        // the layout.
+        let (state_tx, _state_rx) =
+            tokio::sync::watch::channel(stage_of(&[("par", &[("red", 4)])]));
+        player.set_state_tx(state_tx);
+        player.bump_stage_layout();
+        assert_eq!(next_layout(&mut stream).await.fixtures[0].name, "par");
+        assert_eq!(next_frame(&mut stream).await.channels, [4]);
+    }
+
+    /// Over the wire: the stream is a read, open while the player is locked,
+    /// and a client that goes away takes its watch with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_stage_stream_is_open_while_locked_and_ends_with_its_client(
+    ) -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{stage_update::Update, WatchStageRequest};
+        let (player, mut client, _device) = setup_grpc().await?;
+        let (state_tx, state_rx) = tokio::sync::watch::channel(stage_of(&[("par", &[("red", 1)])]));
+        player.set_state_tx(state_tx);
+        drop(state_rx);
+        let state_tx = player.state_tx().expect("the sender just set");
+        player.set_locked(true);
+
+        let mut stream = client
+            .watch_stage(WatchStageRequest { max_rate: 0 })
+            .await?
+            .into_inner();
+        let Some(Update::Layout(layout)) = stream.message().await?.and_then(|u| u.update) else {
+            panic!("expected a layout first");
+        };
+        assert_eq!(layout.fixtures[0].name, "par");
+        let Some(Update::Frame(frame)) = stream.message().await?.and_then(|u| u.update) else {
+            panic!("expected a frame second");
+        };
+        assert_eq!(frame.channels, [1]);
+        assert_eq!(state_tx.receiver_count(), 1, "the stream's own");
+
+        drop(stream);
+        eventually(
+            || state_tx.receiver_count() == 0,
+            "the stream outlived its client",
+        );
+        Ok(())
+    }
+
+    /// Over the wire, native: `Watch` is a read, open while the player is
+    /// locked (the lock layer lets it through), sends the hardware status at
+    /// once and the hub's news after it, and a client that goes away takes
+    /// its watch with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watch_is_open_while_locked_and_ends_with_its_client() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::{watch_event::Event, WatchRequest, WatchTopic};
+        use crate::webui::wire::messages::{ShowReload, SocketMessage};
+        let (player, mut client, _device) = setup_grpc().await?;
+        player.set_locked(true);
+        let sender = player.watch_hub().sender();
+
+        let mut stream = client
+            .watch(WatchRequest {
+                topics: vec![WatchTopic::Hardware as i32, WatchTopic::Reload as i32],
+            })
+            .await?
+            .into_inner();
+        let Some(Event::Hardware(hardware)) = stream.message().await?.and_then(|e| e.event) else {
+            panic!("the hardware status comes first");
+        };
+        assert!(hardware.locked);
+        assert_eq!(sender.receiver_count(), 1, "the stream's own");
+
+        sender.send(SocketMessage::Reload(ShowReload::Ok))?;
+        let Some(Event::Reload(reload)) = stream.message().await?.and_then(|e| e.event) else {
+            panic!("a reload");
+        };
+        assert_eq!(reload.error, None);
+
+        drop(stream);
+        eventually(
+            || sender.receiver_count() == 0,
+            "the stream outlived its client",
+        );
+        Ok(())
+    }
+
+    /// A project with an asset store holding `files` (path under the store,
+    /// bytes), and a service over its config.
+    async fn asset_project(
+        files: &[(&str, Vec<u8>)],
+    ) -> (
+        crate::testutil::player::PlaylistProject,
+        super::PlayerServer,
+    ) {
+        let project = crate::testutil::player::playlist_project()
+            .await
+            .expect("a project");
+        let store = project.dir.path().join("lighting/.cache/assets");
+        for (path, bytes) in files {
+            let file = store.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+        let server =
+            super::PlayerServer::with_config_store(project.player.clone(), project.store.clone());
+        (project, server)
+    }
+
+    /// Asks for an asset and reads the stream to its end.
+    async fn asset_chunks(
+        server: &super::PlayerServer,
+        path: &str,
+        gzip: bool,
+    ) -> Result<Vec<crate::proto::player::v1::AssetChunk>, tonic::Status> {
+        use futures_util::StreamExt;
+        let request = crate::proto::player::v1::GetLightingAssetRequest {
+            path: path.to_string(),
+            gzip,
+        };
+        let stream = super::PlayerService::get_lighting_asset(server, tonic::Request::new(request))
+            .await?
+            .into_inner();
+        stream.collect::<Vec<_>>().await.into_iter().collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_asset_streams_in_chunks_that_rejoin_to_the_file() {
+        let file: Vec<u8> = (0..20_000u32).map(|n| (n % 251) as u8).collect();
+        let (_project, server) = asset_project(&[("abc/models/yoke.glb", file.clone())]).await;
+
+        let chunks = asset_chunks(&server, "abc/models/yoke.glb", false)
+            .await
+            .expect("the asset");
+        assert_eq!(chunks.len(), 3, "20,000 bytes in 8 KiB chunks");
+        assert!(chunks
+            .iter()
+            .all(|c| c.data.len() <= super::asset::CHUNK_SIZE));
+        assert_eq!(chunks[0].total_size, 20_000);
+        assert!(chunks[1..].iter().all(|c| c.total_size == 0));
+        let joined: Vec<u8> = chunks.into_iter().flat_map(|c| c.data).collect();
+        assert_eq!(joined, file);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gzipped_asset_joins_into_a_gzip_stream_of_the_file() {
+        use std::io::Read;
+        let file = "{\"rig\":\"par\"}".repeat(5_000).into_bytes();
+        let (_project, server) = asset_project(&[("abc/rig.json", file.clone())]).await;
+
+        let chunks = asset_chunks(&server, "abc/rig.json", true)
+            .await
+            .expect("the asset");
+        let joined: Vec<u8> = chunks.iter().flat_map(|c| c.data.clone()).collect();
+        // total_size is what is sent: the compressed size.
+        assert_eq!(chunks[0].total_size, joined.len() as u64);
+        assert!(joined.len() < file.len() / 10);
+        let mut unzipped = Vec::new();
+        flate2::read::GzDecoder::new(joined.as_slice())
+            .read_to_end(&mut unzipped)
+            .expect("gzip");
+        assert_eq!(unzipped, file);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_asset_is_one_empty_chunk() {
+        let (_project, server) = asset_project(&[("abc/empty.json", Vec::new())]).await;
+        let chunks = asset_chunks(&server, "abc/empty.json", false)
+            .await
+            .expect("the asset");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].data.is_empty());
+        assert_eq!(chunks[0].total_size, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_asset_the_store_does_not_serve_is_refused() {
+        use tonic::Code;
+        let (project, server) = asset_project(&[
+            ("abc/rig.json", b"{}".to_vec()),
+            ("abc/notes.txt", b"no".to_vec()),
+        ])
+        .await;
+        std::fs::write(project.dir.path().join("lighting/secret.json"), "{}").unwrap();
+        let big = project
+            .dir
+            .path()
+            .join("lighting/.cache/assets/abc/big.glb");
+        std::fs::File::create(big)
+            .unwrap()
+            .set_len(crate::lighting::asset_store::MAX_ASSET_BYTES + 1)
+            .unwrap();
+
+        for (path, why, code) in [
+            ("abc/missing.json", "missing", Code::NotFound),
+            ("abc/notes.txt", "not an asset type", Code::NotFound),
+            ("abc", "a directory, and no type", Code::NotFound),
+            ("abc/big.glb", "over the size cap", Code::NotFound),
+            ("../secret.json", "traversal", Code::InvalidArgument),
+            ("abc/../../secret.json", "traversal", Code::InvalidArgument),
+        ] {
+            let status = asset_chunks(&server, path, false)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{path} ({why}) was served"));
+            assert_eq!(status.code(), code, "{path} ({why}): {status}");
+        }
+
+        // No store at all, and no config to find one by.
+        let empty = tempfile::tempdir().unwrap();
+        let config_path = empty.path().join("mtrack.yaml");
+        std::fs::write(&config_path, "songs: songs\n").unwrap();
+        let config = crate::config::Player::deserialize(&config_path).unwrap();
+        let store = Arc::new(crate::config::ConfigStore::new(config, config_path));
+        let server = super::PlayerServer::with_config_store(project.player.clone(), store);
+        let status = asset_chunks(&server, "abc/rig.json", false).await.err();
+        assert_eq!(status.map(|s| s.code()), Some(Code::NotFound));
+        let server = super::PlayerServer::new(project.player.clone());
+        let status = asset_chunks(&server, "abc/rig.json", false).await.err();
+        assert_eq!(status.map(|s| s.code()), Some(Code::NotFound));
+    }
+
+    /// Over the wire: assets are reads, open while the player is locked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_asset_is_open_while_locked() -> Result<(), Box<dyn Error>> {
+        use crate::proto::player::v1::GetLightingAssetRequest;
+        let (project, _server) = asset_project(&[("abc/rig.json", b"{\"v\":1}".to_vec())]).await;
+        project.player.set_locked(true);
+        let mut client = serve_grpc(project.player.clone()).await?;
+
+        let mut stream = client
+            .get_lighting_asset(GetLightingAssetRequest {
+                path: "abc/rig.json".to_string(),
+                gzip: false,
+            })
+            .await?
+            .into_inner();
+        let chunk = stream.message().await?.expect("a chunk");
+        assert_eq!(chunk.data, b"{\"v\":1}");
+        assert_eq!(chunk.total_size, 7);
+        assert!(stream.message().await?.is_none());
         Ok(())
     }
 }

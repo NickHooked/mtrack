@@ -34,6 +34,7 @@ mod checks;
 mod client;
 mod discovery;
 mod dmx_sink;
+mod grpc_web;
 mod midi;
 mod outcome;
 mod plan;
@@ -43,6 +44,7 @@ mod runner;
 mod sabotage;
 mod server;
 mod songs;
+mod watch;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

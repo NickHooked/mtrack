@@ -12,15 +12,395 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use std::{error::Error, time::Duration};
+use std::{collections::HashMap, error::Error, time::Duration};
 
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
+use crate::lighting::effects::Color;
+use crate::lighting::engine::StopScope;
 use crate::songs::Song;
 
+use super::pass::{OutgoingPass, PassClock};
 use super::Engine;
 
+/// What a timeline fired in a tick, by the arming of the timeline it came
+/// from (its epoch): the one key every engine's cues go back to it by.
+/// Taken from a timeline under its lock, its groups resolved with no lock
+/// held, it is applied under the engine's lock, and a seek, a section
+/// loop's restart or a hand-over of the timeline to a pass can come in
+/// between: a cue taken before a restart then landed on top of the state
+/// the restart put in, and one taken before a pass swap on the fresh
+/// engine rather than its own. So it goes to whichever engine that arming
+/// drives by then -- the main one, a pass's, ambient's -- and nowhere if
+/// it is gone.
+pub(super) struct Fired {
+    epoch: u64,
+    /// A history going in first: ambient's show starting over at its end.
+    restart: Option<Restart>,
+    update: crate::lighting::timeline::TimelineUpdate,
+}
+
+/// A restart's history, before and after it is replayed: taken with its
+/// scratch engine under the timeline's lock, replayed with none held (in
+/// [`Engine::resolve_fired`]), put in under the engine's.
+pub(super) enum Restart {
+    Due(
+        crate::lighting::timeline::SeekHistory,
+        Box<crate::lighting::EffectEngine>,
+    ),
+    Ready(Box<crate::lighting::engine::Prepared>),
+}
+
+impl Fired {
+    /// What the timeline armed as `epoch` fired.
+    pub(super) fn new(epoch: u64, update: crate::lighting::timeline::TimelineUpdate) -> Fired {
+        Fired {
+            epoch,
+            restart: None,
+            update,
+        }
+    }
+
+    /// The same, after `restart` -- the state the timeline restarted from.
+    pub(super) fn restarted(
+        epoch: u64,
+        restart: Restart,
+        update: crate::lighting::timeline::TimelineUpdate,
+    ) -> Fired {
+        Fired {
+            epoch,
+            restart: Some(restart),
+            update,
+        }
+    }
+
+    /// The arming of the timeline it came from.
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Nothing to apply.
+    fn is_empty(&self) -> bool {
+        self.restart.is_none() && self.update.is_empty()
+    }
+
+    /// Applies it to `engine`, the one its timeline drives.
+    pub(super) fn apply(self, engine: &mut crate::lighting::EffectEngine) {
+        // Its own show only: the MIDI DMX store is every engine's.
+        let mut errors = match self.restart {
+            Some(Restart::Ready(prepared)) => engine.install(*prepared),
+            Some(Restart::Due(history, scratch)) => engine.install(scratch.prepare(history)),
+            None => Vec::new(),
+        };
+        errors.extend(engine.apply_timeline_update(self.update));
+        for e in errors {
+            error!("Failed to start lighting effect: {}", e);
+        }
+    }
+}
+
+/// The engine's show rebuild lock held (see [`Engine::rebuilding`]): what a
+/// rebuild, and whatever would cut across one, runs under.
+pub(super) struct Rebuilding<'a>(#[allow(dead_code)] parking_lot::MutexGuard<'a, ()>);
+
+/// The main engine's frame held while a rebuild runs (see
+/// [`Engine::rebuild_at`]), let go however the rebuild ends -- unwinding
+/// included.
+struct FrameHold<'a>(&'a Engine);
+
+impl<'a> FrameHold<'a> {
+    fn new(engine: &'a Engine, _rebuilding: &Rebuilding) -> FrameHold<'a> {
+        engine
+            .rebuild_hold
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        FrameHold(engine)
+    }
+}
+
+impl Drop for FrameHold<'_> {
+    fn drop(&mut self) {
+        self.0
+            .rebuild_hold
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What a lighting start does with the MIDI DMX playbacks, as it clears the
+/// store: put in under the engine's lock with the clear, they can neither
+/// dispatch an event ahead of it, which it would wipe, nor leave a frame
+/// rendering the store empty.
+pub(super) enum MidiDmxStart {
+    /// Leaves them as they are.
+    Leave,
+    /// Installs a playback's, from the start point.
+    Install(Vec<super::MidiDmxPlayback>),
+    /// Moves the ones there to the start point (a section loop's restart).
+    Seek,
+    /// Moves the ones there to where a crossfading loop's pass starts,
+    /// leaving the store as the outgoing pass had it: from the beginning,
+    /// or for a pass begun late from where it joins, the channels the
+    /// events before it set put back but one they set only later kept as
+    /// the store carries it into the crossfade -- rather than sending
+    /// everything before that in one frame.
+    Join,
+}
+
+/// The lighting timeline `shows` make, ready to start; `None` for none.
+/// With audio of `audio_length`, the audio ends the song as it always has;
+/// without (zero), the last effect does rather than the last cue.
+///
+/// `palette` recolours slots the shows declare (a slot to its colour); any
+/// slot it does not name plays in its show's default.
+pub(crate) fn lighting_timeline(
+    shows: Vec<crate::lighting::parser::LightShow>,
+    audio_length: Duration,
+    palette: &HashMap<String, Color>,
+) -> Option<crate::lighting::timeline::LightingTimeline> {
+    if shows.is_empty() {
+        return None;
+    }
+    let mut timeline = crate::lighting::timeline::LightingTimeline::with_palette(shows, palette);
+    timeline.set_end_cap((!audio_length.is_zero()).then_some(audio_length));
+    Some(timeline)
+}
+
+/// The lighting timeline for a song's DSL shows (see [`lighting_timeline`]);
+/// `None` for a song without any.
+pub(crate) fn song_lighting_timeline(
+    song: &Song,
+    palette: &HashMap<String, Color>,
+) -> Option<crate::lighting::timeline::LightingTimeline> {
+    lighting_timeline(
+        crate::lighting::evaluate::registered_shows(song),
+        song.duration(),
+        palette,
+    )
+}
+
 impl Engine {
+    /// Begins the next pass of a song looping with a crossfade of `overlap`,
+    /// the jump going back from song time `from` to `to`: the running effects
+    /// engine and timeline become the outgoing pass, `from - to` ahead in
+    /// song time, and a fresh engine for the same rig starts `next` (the
+    /// song's timeline, from [`song_lighting_timeline`]) at `to`. That is the
+    /// top, or part way in for a pass begun late (a start, seek or section
+    /// break inside the crossfade), which the audio starts there too.
+    /// [`Engine::update_effects`] crosses the two over the overlap.
+    pub fn begin_loop_crossfade(
+        &self,
+        next: Option<crate::lighting::timeline::LightingTimeline>,
+        from: Duration,
+        to: Duration,
+        overlap: Duration,
+    ) {
+        self.begin_loop_crossfade_with(next, from, to, overlap, MidiDmxStart::Leave);
+    }
+
+    /// [`Self::begin_loop_crossfade`], moving the MIDI DMX playbacks to the
+    /// new pass's start as its history goes in (see [`MidiDmxStart`]).
+    pub(super) fn begin_loop_crossfade_with(
+        &self,
+        mut next: Option<crate::lighting::timeline::LightingTimeline>,
+        from: Duration,
+        to: Duration,
+        overlap: Duration,
+        midi: MidiDmxStart,
+    ) {
+        // A rebuild going on would go into the engine swapped out.
+        let _rebuilding = self.rebuilding();
+        let lead = from.saturating_sub(to);
+        // The timeline starts at `to` in the lights' delayed time base; the
+        // crossfade counts from `to` against that time, so it begins
+        // `dmx.playback_delay` after the audio's, as an on-time pass's does.
+        let start = self.to_delayed_song_time(to);
+        // A pass begun late starts from the state its cues before `to` leave,
+        // as a seek does, rather than firing them all in its first frame.
+        // Groups are resolved and the history replayed here, with no lock
+        // held but the engine's for a moment, to take its rig and pose
+        // memory; the install into the fresh engine below takes the pose
+        // memory as of the swap.
+        let prepared = next.as_mut().map(|timeline| {
+            let mut history = timeline.start_at(start);
+            history.map_effects(|effect| self.resolve_effect_groups(effect));
+            let scratch = self.effect_engine.lock().scratch(StopScope::Nothing);
+            scratch.prepare(history)
+        });
+        // Song time first: a frame rendered between the swap and the reset
+        // would read the old pass's time as the new one's, and end the
+        // crossfade before it began.
+        self.update_song_time(to);
+        // The engines swap, the timelines with them, and the outgoing pass
+        // is put aside, all under the engine's lock (taken in the effects
+        // loop's order: engine, timeline, pass), so no frame renders the
+        // fresh engine alone and a loop break begun meanwhile cannot take
+        // one pass's engine with the other's timeline.
+        let mut effect_engine = self.effect_engine.lock();
+        let fresh = Self::fresh_engine_showing(&effect_engine);
+        let outgoing_engine = std::mem::replace(&mut *effect_engine, fresh);
+        if let Some(prepared) = prepared {
+            for e in effect_engine.install(prepared) {
+                error!("Failed to start lighting effect: {}", e);
+            }
+        }
+        self.start_midi_dmx(midi, start);
+        let timeline = std::mem::replace(&mut *self.current_song_timeline.lock(), next);
+        let mut outgoing = self.outgoing_pass.lock();
+        if let Some(pass) = outgoing.take() {
+            self.break_fades.lock().retire(pass);
+        }
+        // What it drove the rig with until now held as it is, should it go
+        // before its first frame as a pass.
+        *outgoing = Some(OutgoingPass::crossing(
+            outgoing_engine,
+            timeline,
+            PassClock::Song { lead, start: to },
+            overlap,
+            None,
+            Vec::new(),
+        ));
+    }
+
+    /// Begins fading a looping song's lights out after a loop break, over
+    /// `fade` (its playlist `fade_out`): the running effects engine and timeline
+    /// play on as the outgoing pass, on the wall clock from now, while a fresh
+    /// engine for the same rig waits for the next song's show. That pass
+    /// outlives this playback -- its cleanup and the next song's timeline
+    /// start leave it be -- and ends when the fade does, sooner for a stop,
+    /// pause or seek ([`Engine::hurry_break_fade`]). A crossfade between
+    /// passes in progress carries on inside it, crossing into the engine it
+    /// crossed into before (#560); an earlier break's fade goes on over it,
+    /// at its own length.
+    pub fn begin_break_fade(&self, fade: Duration) {
+        let rebuilding = self.rebuilding();
+        self.begin_break_fade_over(&rebuilding, fade, Vec::new());
+    }
+
+    /// [`Self::begin_break_fade`], fading `floor` -- channels the rig holds
+    /// lit that nothing writes any more -- out with it. Under the rebuild
+    /// lock: a rebuild going on would go into the engine swapped in.
+    pub(super) fn begin_break_fade_over(
+        &self,
+        _rebuilding: &Rebuilding,
+        fade: Duration,
+        floor: Vec<crate::lighting::effects::DmxCommand>,
+    ) {
+        let from = self.to_delayed_song_time(self.get_song_time());
+        {
+            let mut effect_engine = self.effect_engine.lock();
+            let fresh = Self::fresh_engine_showing(&effect_engine);
+            let outgoing_engine = std::mem::replace(&mut *effect_engine, fresh);
+            // The timeline goes with its engine, taken under the same lock
+            // (engine, then timeline, as nothing takes them the other way).
+            let timeline = self.current_song_timeline.lock().take();
+            let inner = self.outgoing_pass.lock().take();
+            self.break_fades.lock().begin(OutgoingPass::crossing(
+                outgoing_engine,
+                timeline,
+                PassClock::Wall {
+                    started: crate::clock::wall_now(),
+                    from,
+                },
+                fade,
+                inner,
+                floor,
+            ));
+        }
+    }
+
+    /// A fresh engine for the same rig to swap in at a loop pass or break,
+    /// showing what `current` shows until its first blended frame replaces
+    /// it: with nothing to show, a snapshot taken between the swap and that
+    /// frame -- the web UI's, `get_fixture_state`'s -- read black (#555).
+    fn fresh_engine_showing(
+        current: &crate::lighting::EffectEngine,
+    ) -> crate::lighting::EffectEngine {
+        let mut fresh = current.sibling();
+        fresh.set_shown(Some((
+            current.shown_fixture_states().clone(),
+            current.shown_poses().clone(),
+        )));
+        fresh
+    }
+
+    /// Ends every loop break's fade at once.
+    #[cfg(test)]
+    pub fn end_break_fade(&self) {
+        self.break_fades.lock().clear();
+    }
+
+    /// Hurries every loop break's fade out, for a stop, pause or seek that
+    /// cuts it: rather than ending it, which would hold the frame it had
+    /// reached (#572), it goes the rest of the way over `fade` from now --
+    /// sooner, never later, than it would have.
+    pub fn hurry_break_fade(&self, fade: Duration) {
+        self.break_fades.lock().hurry(fade);
+    }
+
+    /// Drops a crossfade between passes of the playback being replaced or
+    /// stopped. A loop break's fade outlives it.
+    fn drop_pass_crossfade(&self) {
+        let pass = self.outgoing_pass.lock().take();
+        if let Some(pass) = pass {
+            self.break_fades.lock().retire(pass);
+        }
+    }
+
+    /// What `fired` holds that is not empty, its effects' groups resolved:
+    /// against the lighting system, with no engine's lock held.
+    pub(super) fn resolve_fired(&self, fired: Vec<Fired>) -> Vec<Fired> {
+        fired
+            .into_iter()
+            .filter(|fired| !fired.is_empty())
+            .map(|mut fired| {
+                // A restart's history replayed here too, with no lock held.
+                if let Some(Restart::Due(mut history, scratch)) = fired.restart.take() {
+                    history.map_effects(|effect| self.resolve_effect_groups(effect));
+                    fired.restart = Some(Restart::Ready(Box::new(scratch.prepare(history))));
+                }
+                fired
+                    .update
+                    .map_effects(|effect| self.resolve_effect_groups(effect));
+                fired
+            })
+            .collect()
+    }
+
+    /// Applies what the show's timelines fired, each to the engine its
+    /// arming drives now (see [`Fired`]): the main one, or a pass's,
+    /// wherever it has gone in between -- inside a fade begun since, say.
+    fn apply_fired(&self, fired: Vec<Fired>) {
+        if fired.is_empty() {
+            return;
+        }
+        // The engine's lock, then the timeline's, as everything takes them:
+        // a swap, which moves both under the engine's, cannot come between
+        // the check and the apply.
+        let mut effect_engine = self.effect_engine.lock();
+        let current = self
+            .current_song_timeline
+            .lock()
+            .as_ref()
+            .map(|timeline| timeline.epoch());
+        let mut outgoing = self.outgoing_pass.lock();
+        let mut fades = self.break_fades.lock();
+        for fired in fired {
+            let engine = if current == Some(fired.epoch) {
+                Some(&mut *effect_engine)
+            } else {
+                outgoing
+                    .iter_mut()
+                    .chain(fades.iter_mut())
+                    .find_map(|pass| pass.engine_of(fired.epoch))
+            };
+            match engine {
+                Some(engine) => fired.apply(engine),
+                None => {
+                    debug!("Dropping lighting cues from a timeline since restarted or replaced")
+                }
+            }
+        }
+    }
+
     /// Validates a song's lighting shows against the engine's lighting config.
     /// Returns an error if any lighting show references invalid groups or fixtures.
     pub fn validate_song_lighting(&self, song: &Song) -> Result<(), Box<dyn Error>> {
@@ -34,7 +414,7 @@ impl Engine {
         if let Some(ref lighting_config) = self.lighting_config {
             for dsl_show in dsl_lighting_shows {
                 crate::lighting::validation::validate_light_shows(
-                    dsl_show.shows(),
+                    &dsl_show.shows(),
                     Some(lighting_config),
                 )
                 .map_err(|e| {
@@ -55,16 +435,27 @@ impl Engine {
         &self,
         song_time: std::time::Duration,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let timeline_update = {
-            let mut current_timeline = self.current_song_timeline.lock();
-            if let Some(timeline) = current_timeline.as_mut() {
-                timeline.update(song_time)
-            } else {
-                crate::lighting::timeline::TimelineUpdate::default()
+        let mut fired: Vec<Fired> = self
+            .current_song_timeline
+            .lock()
+            .as_mut()
+            .map(|timeline| Fired::new(timeline.epoch(), timeline.update(song_time)))
+            .into_iter()
+            .collect();
+        // The outgoing pass's timeline, at its own time a pass ahead of the
+        // incoming one's; a pass inside it, on its own; each loop break's
+        // fade, on its own.
+        {
+            let mut outgoing = self.outgoing_pass.lock();
+            let mut fades = self.break_fades.lock();
+            // A loop break's fade that is over fires nothing more.
+            fades.sweep(song_time);
+            for pass in outgoing.iter_mut().chain(fades.iter_mut()) {
+                pass.advance_timelines(song_time, &mut fired);
             }
-        };
-
-        self.apply_timeline_update(timeline_update)
+        }
+        self.apply_fired(self.resolve_fired(fired));
+        Ok(())
     }
 
     /// Starts the lighting timeline at a specific time
@@ -72,114 +463,285 @@ impl Engine {
     /// `start_time` is song-absolute; it is shifted into the delayed lighting time
     /// base so the reconstructed state matches what the live loop advances from.
     pub fn start_lighting_timeline_at(&self, start_time: Duration) {
-        let start_time = self.to_delayed_song_time(start_time);
-        // Clear effects from previous song before starting new timeline
-        {
-            let mut effect_engine = self.effect_engine.lock();
-            effect_engine.stop_all_effects();
-        }
-        // Clear effect deduplication caches so the new song's first frame is applied
-        for universe in self.universes.values() {
-            universe.clear_effect_cache();
-        }
+        self.start_lighting_timeline_with(start_time, MidiDmxStart::Leave);
+    }
 
-        let timeline_update = {
-            let mut current_timeline = self.current_song_timeline.lock();
-            if let Some(timeline) = current_timeline.as_mut() {
-                if start_time == Duration::ZERO {
-                    timeline.start();
-                    crate::lighting::timeline::TimelineUpdate::default()
-                } else {
-                    // Process historical cues to ensure deterministic state
-                    timeline.start_at(start_time)
+    /// [`Self::start_lighting_timeline_at`], starting the MIDI DMX
+    /// playbacks at the same point as it clears the store (#583).
+    pub(super) fn start_lighting_timeline_with(&self, start_time: Duration, midi: MidiDmxStart) {
+        self.start_song_lighting(start_time, midi, &|| {});
+    }
+
+    /// A playback's start at `start_time`: the song time goes there inside
+    /// the rebuild's hold on the frame (see [`Self::rebuild_at`]), so no
+    /// frame renders the last show at the new time.
+    pub(super) fn start_playback_lighting(&self, start_time: Duration, midi: MidiDmxStart) {
+        self.start_song_lighting(start_time, midi, &|| self.update_song_time(start_time));
+    }
+
+    fn start_song_lighting(&self, start_time: Duration, midi: MidiDmxStart, before_arm: &dyn Fn()) {
+        // A crossfade in progress belongs to the playback being replaced; a
+        // loop break's fade carries on over this song's start.
+        self.drop_pass_crossfade();
+        self.restart_lighting_timeline(start_time, midi, before_arm);
+    }
+
+    /// Before a section's jump with no overlap: a crossfade between passes
+    /// still in progress plays out on its own time, as the audio's and
+    /// MIDI's do, rather than going back with the song time.
+    pub(super) fn keep_crossfade_on_own_time(&self) {
+        let song_time = self.to_delayed_song_time(self.get_song_time());
+        if let Some(pass) = self.outgoing_pass.lock().as_mut() {
+            pass.keep_own_time(song_time);
+        }
+    }
+
+    /// A section's jump with no overlap, back to `start_time`: the timeline
+    /// restarts there as for a seek, keeping a crossfade in progress (see
+    /// [`Self::keep_crossfade_on_own_time`]).
+    #[cfg(test)]
+    pub(super) fn restart_section_at(&self, start_time: Duration) {
+        self.restart_section_rewinding(start_time, &|| {});
+    }
+
+    /// [`Self::restart_section_at`], `rewind` moving the song time back
+    /// inside the rebuild's hold on the frame (see [`Self::rebuild_at`]):
+    /// a frame between the two rendered the end of the section's effects
+    /// at its start's time, a move snapping to where it began.
+    pub(super) fn restart_section_rewinding(&self, start_time: Duration, rewind: &dyn Fn()) {
+        self.restart_lighting_timeline(start_time, MidiDmxStart::Seek, rewind);
+    }
+
+    fn restart_lighting_timeline(
+        &self,
+        start_time: Duration,
+        midi: MidiDmxStart,
+        before_arm: &dyn Fn(),
+    ) {
+        // Waits for a rebuild under way: a section's jump that meets a live
+        // edit's reload goes once the reload's replay is in, the lights that
+        // much behind the audio's jump. Only while editing a show live over
+        // a loop -- a rehearsal, not a show -- and the price of one rebuild
+        // at a time.
+        let rebuilding = self.rebuilding();
+        self.rebuild_at(
+            &rebuilding,
+            self.to_delayed_song_time(start_time),
+            None,
+            StopScope::All,
+            midi,
+            before_arm,
+        );
+    }
+
+    /// A show file edited live: `timeline`, its shows parsed again, takes
+    /// the current one's place, rebuilt where the lights are now, its
+    /// effects on `tempo_map`. Only the show's effects stop: the MIDI DMX
+    /// store goes on as MIDI set it, which nothing would put back mid-song
+    /// (#583).
+    ///
+    /// It waits for a rebuild under way to finish, then goes in where the
+    /// lights are by then. Only from the watcher started for the song now
+    /// playing, as `generation` says (see `Engine::retire_watcher`): one let
+    /// go since -- the song changed while an edit was in its debounce --
+    /// would put the last song's show into this one. Returns false for
+    /// that, and only for that: the watcher is done with.
+    pub(crate) fn reload_show(
+        &self,
+        timeline: crate::lighting::timeline::LightingTimeline,
+        tempo_map: Option<crate::lighting::tempo::TempoMap>,
+        generation: u64,
+    ) -> bool {
+        let rebuilding = self.rebuilding();
+        if generation
+            != self
+                .watcher_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        // Where the lights are, not the transport: rebuilding at the
+        // undelayed time put the show the delay ahead of the rig, skipping
+        // the cues in between (#593).
+        self.rebuild_at(
+            &rebuilding,
+            self.to_delayed_song_time(self.get_song_time()),
+            Some((timeline, tempo_map)),
+            StopScope::Show,
+            MidiDmxStart::Leave,
+            &|| {},
+        );
+        true
+    }
+
+    /// The show rebuild lock: every rebuild runs under it whole, from its
+    /// arming through its replay to its install, and so does whatever would
+    /// cut across one -- a song let go, its watcher, a loop's pass or break
+    /// swapping the main engine. Rebuilds are rare (a seek, a section's
+    /// jump, a song's start, a live edit) and wait their turn; the effects
+    /// loop never takes it, only seeing the frame held (see
+    /// [`Self::rebuild_holding`]). Taken before the timeline's lock and the
+    /// engine's, never under them.
+    pub(super) fn rebuilding(&self) -> Rebuilding<'_> {
+        Rebuilding(self.rebuild_lock.lock())
+    }
+
+    /// [`Self::rebuilding`] if no rebuild is under way: for the effects
+    /// loop, which must not wait on one.
+    pub(super) fn try_rebuilding(&self) -> Option<Rebuilding<'_>> {
+        self.rebuild_lock.try_lock().map(Rebuilding)
+    }
+
+    /// Rebuilds the main show at `at` (delayed song time): the current
+    /// timeline armed there -- or `reload`'s, with its tempo, swapped in for
+    /// it -- and the state its cues before `at` leave put into the main
+    /// engine in place of what `scope` stops, `midi` done with the MIDI DMX
+    /// playbacks as it goes in. The one way a seek, a section's restart, a
+    /// song's start and a live reload rebuild the show, each under the
+    /// rebuild lock, one at a time (see [`Self::rebuilding`]).
+    ///
+    /// What goes and what comes in do so under the one lock, groups
+    /// resolved and the history replayed first (scratch, then prepare), the
+    /// engine's lock held only to take the scratch and to install: a frame
+    /// between the two would find the channels unwritten and send them 0 --
+    /// a black flash at every seek and section loop (#581). The timeline
+    /// fires nothing until the state is in; then its cues -- one at the
+    /// start point too -- fire over it.
+    ///
+    /// Meanwhile the main engine's frame holds its last: rendered, the old
+    /// effects at the time the rebuild goes to would snap a move to its
+    /// start, a fade to its first frame, as the song time goes back under
+    /// them. `before_arm` moves the song time (a section's jump, a song's
+    /// start) inside the hold.
+    fn rebuild_at(
+        &self,
+        rebuilding: &Rebuilding,
+        at: Duration,
+        reload: Option<(
+            crate::lighting::timeline::LightingTimeline,
+            Option<crate::lighting::tempo::TempoMap>,
+        )>,
+        scope: StopScope,
+        midi: MidiDmxStart,
+        before_arm: &dyn Fn(),
+    ) {
+        let _hold = FrameHold::new(self, rebuilding);
+        before_arm();
+        // A reloaded timeline is armed before it goes in, with no lock held.
+        let reload = reload.map(|(mut timeline, tempo_map)| {
+            let history = timeline.start_at(at);
+            (timeline, tempo_map, history)
+        });
+        let (mut history, tempo_map) = {
+            let mut current = self.current_song_timeline.lock();
+            let (history, tempo_map) = match reload {
+                Some((mut timeline, tempo_map, history)) => {
+                    // The song's end bound belongs to the song, not the
+                    // show text.
+                    timeline.set_end_cap(current.as_ref().and_then(|t| t.end_cap()));
+                    timeline.hold(true);
+                    *current = Some(timeline);
+                    (history, Some(tempo_map))
                 }
-            } else {
-                crate::lighting::timeline::TimelineUpdate::default()
-            }
-        };
-
-        // A show that is loaded but exhausted the moment it is armed will not
-        // fire anything for the whole playback, and says nothing about it. That
-        // is the shape of #332, so it is worth a line in the log.
-        {
-            let timeline = self.current_song_timeline.lock();
-            if let Some(tl) = timeline.as_ref() {
+                None => {
+                    let history = match current.as_mut() {
+                        Some(timeline) => {
+                            timeline.hold(true);
+                            timeline.start_at(at)
+                        }
+                        None => crate::lighting::timeline::SeekHistory {
+                            at,
+                            ..Default::default()
+                        },
+                    };
+                    (history, None)
+                }
+            };
+            // A show that is loaded but exhausted the moment it is armed
+            // will not fire anything for the whole playback, and says
+            // nothing about it. That is the shape of #332, so it is worth a
+            // line in the log.
+            if let Some(tl) = current.as_ref() {
                 if tl.cue_count() > 0 && tl.cues_remaining() == 0 {
                     warn!(
                         cues = tl.cue_count(),
-                        start_time_ms = start_time.as_millis(),
+                        start_time_ms = at.as_millis(),
                         "lighting timeline armed with no cues ahead of the pointer — \
                          no cues will fire for this playback"
                     );
                 }
             }
+            (history, tempo_map)
+        };
+        history.map_effects(|effect| self.resolve_effect_groups(effect));
+        // Replayed with the engine's lock released but for a moment to take
+        // its rig; a reload's on the tempo it brings.
+        let mut scratch = self.effect_engine.lock().scratch(scope);
+        if let Some(tempo_map) = tempo_map.as_ref() {
+            scratch.set_tempo_map(tempo_map.clone());
         }
-
-        // Apply the historical timeline update to ensure deterministic state
-        // This must happen before the effects loop can process new cues to avoid conflicts
-        if start_time > Duration::ZERO {
-            if let Err(e) = self.apply_timeline_update(timeline_update) {
-                error!("Failed to apply historical timeline state: {}", e);
+        let prepared = scratch.prepare(history);
+        #[cfg(test)]
+        {
+            let hook = self.rebuild_hook.lock().take();
+            if let Some(hook) = hook {
+                hook(self);
             }
+        }
+        let mut effect_engine = self.effect_engine.lock();
+        if let Some(tempo_map) = tempo_map {
+            effect_engine.set_tempo_map(tempo_map);
+        }
+        for e in effect_engine.install(prepared) {
+            error!("Failed to start lighting effect: {}", e);
+        }
+        self.start_midi_dmx(midi, at);
+        // The next frame renders what went in.
+        drop(_hold);
+        drop(effect_engine);
+        if let Some(timeline) = self.current_song_timeline.lock().as_mut() {
+            timeline.hold(false);
         }
     }
 
-    /// Applies a timeline update (effects and layer commands)
+    /// Whether a show rebuild is under way, the main engine's frame held
+    /// for it.
+    pub(super) fn rebuild_holding(&self) -> bool {
+        self.rebuild_hold.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Does what `midi` says with the MIDI DMX playbacks for a show
+    /// starting at `at` (delayed song time). Called under the engine's
+    /// lock, with the show's start state going in.
+    fn start_midi_dmx(&self, midi: MidiDmxStart, at: Duration) {
+        match midi {
+            MidiDmxStart::Leave => {}
+            MidiDmxStart::Install(playbacks) => {
+                *self.midi_dmx_playbacks.lock() = playbacks;
+                self.seek_midi_dmx_playbacks(at);
+            }
+            MidiDmxStart::Seek => self.seek_midi_dmx_playbacks(at),
+            MidiDmxStart::Join if at.is_zero() => self.rewind_midi_dmx_playbacks(),
+            MidiDmxStart::Join => self.join_midi_dmx_playbacks(at),
+        }
+    }
+
+    /// Applies what the timeline armed as `epoch` fired (effects and layer
+    /// commands) to the engine that arming drives (see [`Fired`]).
+    #[cfg(test)]
     pub(super) fn apply_timeline_update(
         &self,
         timeline_update: crate::lighting::timeline::TimelineUpdate,
+        epoch: u64,
     ) -> Result<(), Box<dyn Error>> {
-        // Process layer commands first (they affect subsequent effects)
-        if !timeline_update.layer_commands.is_empty() {
-            let mut effects_engine = self.effect_engine.lock();
-            for cmd in &timeline_update.layer_commands {
-                effects_engine.apply_layer_command(cmd);
-            }
-        }
-
-        // Process stop sequence commands
-        if !timeline_update.stop_sequences.is_empty() {
-            let mut effects_engine = self.effect_engine.lock();
-            for sequence_name in &timeline_update.stop_sequences {
-                effects_engine.stop_sequence(sequence_name);
-            }
-        }
-
-        // Start effects with pre-calculated elapsed time (from seeking)
-        // Sort by cue_time to ensure chronological order — later effects properly
-        // conflict with and stop earlier ones
-        let mut effects_sorted: Vec<_> = timeline_update.effects_with_elapsed.values().collect();
-        effects_sorted.sort_by_key(|(effect, _)| effect.cue_time.unwrap_or(Duration::ZERO));
-
-        for (effect, elapsed_time) in effects_sorted {
-            let resolved = self.resolve_effect_groups(effect.clone());
-            let mut effect_engine = self.effect_engine.lock();
-            if let Err(e) = effect_engine.start_effect_with_elapsed(resolved, *elapsed_time) {
-                error!("Failed to start lighting effect with elapsed time: {}", e);
-            }
-        }
-
-        // Handle regular effects (from normal timeline updates).
-        // Sort so sequence effects start before song effects. When a sequence's
-        // last cue (timing anchor) fires at the same time as the next show cue,
-        // starting sequence effects first ensures show-level effects win any
-        // Replace-blend conflicts via the conflict resolution in start_effect().
-        let mut effects = timeline_update.effects;
-        effects.sort_by_key(|e| if e.id.starts_with("seq_") { 0 } else { 1 });
-        for effect in effects {
-            let resolved = self.resolve_effect_groups(effect);
-            if let Err(e) = self.start_effect(resolved) {
-                error!("Failed to start lighting effect: {}", e);
-            }
-        }
-
+        self.apply_fired(self.resolve_fired(vec![Fired::new(epoch, timeline_update)]));
         Ok(())
     }
 
     /// Resolves group names in an effect's target_fixtures to actual fixture names
     /// using the lighting system. If no lighting system is available, returns the
     /// effect unchanged (groups are passed through as-is).
-    pub(super) fn resolve_effect_groups(
+    pub(in crate::dmx) fn resolve_effect_groups(
         &self,
         effect: crate::lighting::EffectInstance,
     ) -> crate::lighting::EffectInstance {
@@ -193,6 +755,10 @@ impl Engine {
 
     /// Stops the lighting timeline
     pub fn stop_lighting_timeline(&self) {
+        // A pass being faded out stops with the playback; the song time that
+        // drives the fade does too. A loop break's fade, on its own clock,
+        // outlives the playback it came from.
+        self.drop_pass_crossfade();
         let mut current_timeline = self.current_song_timeline.lock();
         if let Some(timeline) = current_timeline.as_mut() {
             timeline.stop();
@@ -289,6 +855,15 @@ impl Engine {
                 tl.next_cue_time(),
             )
         })
+    }
+
+    /// Reads the playing song's timeline, for a test of what it settled to.
+    #[cfg(test)]
+    pub(crate) fn with_song_timeline<R>(
+        &self,
+        read: impl FnOnce(Option<&crate::lighting::timeline::LightingTimeline>) -> R,
+    ) -> R {
+        read(self.current_song_timeline.lock().as_ref())
     }
 
     /// Gets all cues from the current timeline with their times and indices

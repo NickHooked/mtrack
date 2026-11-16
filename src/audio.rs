@@ -20,22 +20,20 @@ use crate::playsync::PlaybackSync;
 use crate::songs::Song;
 use std::collections::HashMap;
 
-pub mod click_analysis;
+pub use mtrack_core::audio::{
+    beat_grid, click_analysis, context, crossfade, duration_to_samples, format, metronome,
+    monoclip, pilot, sample_source, track_gains,
+};
+
 pub mod confirmation;
-pub mod context;
 pub mod cpal;
-pub mod crossfade;
-pub mod format;
+pub mod guessed_tempo;
 pub mod health;
-pub mod metronome;
 pub mod midi_tempo;
 pub mod mixer;
 pub mod mock;
-pub mod monoclip;
-pub mod pilot;
-pub mod sample_source;
-pub mod tempo_guess;
-pub mod track_gains;
+pub mod output_status;
+pub(crate) mod song_loop;
 
 // Re-export the format types for backward compatibility
 pub use context::PlaybackContext;
@@ -198,41 +196,43 @@ pub trait Device: Any + fmt::Display + std::marker::Send + std::marker::Sync {
         health::LIVENESS_WINDOW
     }
 
+    /// The device's real channel count, where it is known: `None` for a device
+    /// that cannot say, or whose figure is a plugin's or cpal's clamp rather
+    /// than the hardware's. Used at startup to say a profile maps tracks past
+    /// the device; playback still checks against the width it opened at.
+    fn channels(&self) -> Option<u16> {
+        None
+    }
+
     #[cfg(test)]
     fn to_mock(&self) -> Result<Arc<mock::Device>, AudioError>;
 }
 
 /// Finds a cpal input device by name, searching all available hosts.
-pub(crate) fn find_input_device(name: &str) -> Result<::cpal::Device, AudioError> {
-    use ::cpal::traits::{DeviceTrait, HostTrait};
+///
+/// Walks under [`cpal::silence_enumeration`], like the output walks, so it
+/// takes turns with them and ALSA's chatter about the devices it passes stays
+/// off stderr. So it must not be called with that guard already held.
+pub fn find_input_device(name: &str) -> Result<::cpal::Device, AudioError> {
+    cpal::find_input_device(name)
+        .map_err(|e| AudioError::Playback(e.to_string()))?
+        .ok_or_else(|| AudioError::DeviceNotFound(name.to_string()))
+}
 
-    for host_id in ::cpal::available_hosts() {
-        let host =
-            ::cpal::host_from_id(host_id).map_err(|e| AudioError::Playback(e.to_string()))?;
-        let devices = match host.input_devices() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(
-                    host = host_id.name(),
-                    error = %e,
-                    "Failed to list input devices for host"
-                );
-                continue;
-            }
-        };
+/// Lists the devices that capture audio, input-only ones included.
+pub fn list_input_device_info() -> Result<Vec<cpal::InputDeviceInfo>, AudioError> {
+    cpal::list_input_device_info().map_err(|e| AudioError::Playback(e.to_string()))
+}
 
-        for device in devices {
-            let device_id = match device.id() {
-                Ok(id) => id.to_string(),
-                Err(_) => continue,
-            };
-            if device_id.trim() == name.trim() {
-                return Ok(device);
-            }
-        }
-    }
-
-    Err(AudioError::DeviceNotFound(name.to_string()))
+/// Finds a cpal output device by name, searching all available hosts.
+///
+/// The same scan the player uses to open its output, holding no other device
+/// open. Takes [`cpal::silence_enumeration`] itself, so it must not be called
+/// with that guard already held.
+pub fn find_output_device(name: &str) -> Result<::cpal::Device, AudioError> {
+    cpal::find_output_device(name)
+        .map_err(|e| AudioError::Playback(e.to_string()))?
+        .ok_or_else(|| AudioError::DeviceNotFound(name.to_string()))
 }
 
 /// Lists audio devices as simple info structs for the web UI.
@@ -307,20 +307,6 @@ impl fmt::Display for ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// Stable wire name for this outcome.
-    ///
-    /// The single source for the strings the web UI switches on, so a renamed
-    /// variant cannot quietly change the API. `Display` is prose for a human
-    /// and is free to be reworded.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            ProbeOutcome::Streaming { .. } => "streaming",
-            ProbeOutcome::OpenedButSilent => "opened_but_silent",
-            ProbeOutcome::CouldNotOpen(_) => "could_not_open",
-            ProbeOutcome::OpenedCannotReport => "opened_cannot_report",
-        }
-    }
-
     /// Whether the device proved it can stream.
     pub fn is_ok(&self) -> bool {
         matches!(
@@ -403,6 +389,24 @@ pub fn get_device(config: Option<config::Audio>) -> Result<Arc<dyn Device>, Audi
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Times convert to the nearest sample, half a sample rounding up, at
+    /// any rate, including ones a time does not divide evenly.
+    #[test]
+    fn durations_convert_to_the_nearest_sample() {
+        use std::time::Duration;
+        assert_eq!(duration_to_samples(Duration::ZERO, 48_000), 0);
+        assert_eq!(duration_to_samples(Duration::from_secs(1), 48_000), 48_000);
+        assert_eq!(duration_to_samples(Duration::from_millis(10), 44_100), 441);
+        // 220.5 samples: rounds up.
+        assert_eq!(duration_to_samples(Duration::from_millis(10), 22_050), 221);
+        // 165.375 and 661.5 samples.
+        assert_eq!(duration_to_samples(Duration::from_millis(15), 11_025), 165);
+        assert_eq!(duration_to_samples(Duration::from_millis(15), 44_100), 662);
+        // Just under half a sample at 48kHz rounds down.
+        assert_eq!(duration_to_samples(Duration::from_nanos(10_416), 48_000), 0);
+        assert_eq!(duration_to_samples(Duration::from_nanos(10_417), 48_000), 1);
+    }
 
     /// A device that has not turned up may still turn up, so init must keep
     /// waiting for it. This is the case the perpetual retry exists for.

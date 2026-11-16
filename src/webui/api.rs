@@ -12,299 +12,25 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+pub(crate) mod bluetooth;
 pub(crate) mod browse;
-pub(crate) mod config_api;
 pub(crate) mod devices;
+pub(crate) mod fixture_settings;
+pub(crate) mod fixture_test;
 pub(crate) mod helpers;
 pub(crate) mod lighting_api;
+pub(crate) mod lighting_writes;
+pub(crate) mod mvr_api;
 pub(crate) mod playlists;
 pub(crate) mod profiles;
+pub(crate) mod sample_files;
 pub(crate) mod songs_api;
 pub(crate) mod status;
-
-use axum::{
-    body::Bytes,
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::{delete, get, post, put},
-    Json, Router,
-};
-use serde_json::json;
-
-use super::server::WebUiState;
-use crate::songs as songs_crate;
-
-/// Middleware that rejects mutating requests (non-GET) when the player is locked.
-/// Applied at the server layer where the state is available.
-pub(crate) async fn lock_guard(
-    State(state): State<WebUiState>,
-    request: axum::http::Request<axum::body::Body>,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
-
-    // Allow all reads, the lock toggle, validation, and playlist activation
-    // (activation is a playback control, not a state-altering edit).
-    if method == axum::http::Method::GET
-        || path.ends_with("/lock")
-        || path.ends_with("/validate")
-        || path.ends_with("/activate")
-        || path.ends_with("/controllers/restart")
-    {
-        return next.run(request).await;
-    }
-
-    if state.player.is_locked() {
-        return (
-            StatusCode::LOCKED,
-            Json(json!({"error": "Player is locked. Unlock to make changes."})),
-        )
-            .into_response();
-    }
-
-    next.run(request).await
-}
-
-/// Builds the API router for config read/write endpoints.
-///
-/// Playback control is handled via gRPC-Web (PlayerService), not REST.
-pub fn router() -> Router<WebUiState> {
-    // Upload routes get unlimited body size for large audio/MIDI files.
-    let upload_routes = Router::new()
-        .route(
-            "/songs/{name}/tracks/{filename}",
-            put(songs_api::upload_track_single),
-        )
-        .route(
-            "/songs/{name}/tracks",
-            post(songs_api::upload_tracks_multipart),
-        )
-        .route("/samples/upload/{filename}", put(upload_sample_file))
-        .layer(axum::extract::DefaultBodyLimit::disable());
-
-    // GDTF uploads get a bounded raise instead of a disable: the archive
-    // layer refuses anything past 256MB anyway, so the transport should too.
-    let gdtf_routes = Router::new()
-        .route("/lighting/gdtf/inspect", post(lighting_api::inspect_gdtf))
-        .route("/lighting/gdtf/import", post(lighting_api::import_gdtf))
-        .layer(axum::extract::DefaultBodyLimit::max(272 * 1024 * 1024));
-
-    // All other routes use the default body limit.
-    Router::new()
-        .route(
-            "/config",
-            get(config_api::get_config_raw).put(config_api::put_config),
-        )
-        .route("/config/parsed", get(config_api::get_config_parsed))
-        .route("/config/validate", post(config_api::validate_config))
-        .route("/songs", get(songs_api::get_songs))
-        .route(
-            "/songs/{name}",
-            get(songs_api::get_song)
-                .post(songs_api::post_song)
-                .put(songs_api::put_song)
-                .delete(songs_api::delete_song),
-        )
-        .route("/songs/{name}/waveform", get(songs_api::get_song_waveform))
-        .route(
-            "/songs/{name}/video-preview/ws",
-            get(super::video_preview::ws_handler),
-        )
-        .route(
-            "/songs/{name}/tempo-guess",
-            get(songs_api::get_song_tempo_guess),
-        )
-        .route("/songs/{name}/files", get(songs_api::get_song_files))
-        .route("/songs/{name}/import", post(songs_api::import_file_to_song))
-        .route("/browse", get(browse::browse_directory))
-        .route(
-            "/browse/create-song",
-            post(browse::create_song_in_directory),
-        )
-        .route("/browse/bulk-import", post(browse::bulk_import))
-        .route("/playlists", get(playlists::get_playlists))
-        .route(
-            "/playlists/{name}",
-            get(playlists::get_playlist_by_name)
-                .put(playlists::put_playlist_by_name)
-                .delete(playlists::delete_playlist_by_name),
-        )
-        .route(
-            "/playlists/{name}/activate",
-            post(playlists::activate_playlist),
-        )
-        .route("/lighting", get(lighting_api::get_lighting_files))
-        .route(
-            "/lighting/{name}",
-            get(lighting_api::get_lighting_file)
-                .put(lighting_api::put_lighting_file)
-                .delete(lighting_api::delete_lighting_file),
-        )
-        .route("/lighting/validate", post(lighting_api::validate_lighting))
-        .route("/config/store", get(config_api::get_config_store))
-        .route("/config/audio", put(config_api::put_config_audio))
-        .route("/config/midi", put(config_api::put_config_midi))
-        .route("/config/dmx", put(config_api::put_config_dmx))
-        .route(
-            "/config/controllers",
-            put(config_api::put_config_controllers),
-        )
-        .route("/config/samples", put(config_api::put_config_samples))
-        .route("/config/metronome", put(config_api::put_config_metronome))
-        .route("/config/profiles", post(config_api::post_config_profile))
-        .route(
-            "/config/profiles/{index}",
-            put(config_api::put_config_profile).delete(config_api::delete_config_profile),
-        )
-        .route("/profiles", get(profiles::get_profiles))
-        .route(
-            "/profiles/{filename}",
-            get(profiles::get_profile)
-                .put(profiles::put_profile)
-                .delete(profiles::delete_profile_file),
-        )
-        .route("/status", get(status::get_status))
-        .route("/controllers/restart", post(status::restart_controllers))
-        .route("/lock", get(status::get_lock).put(status::put_lock))
-        .route("/devices/audio", get(devices::get_audio_devices))
-        .route(
-            "/devices/audio/probe",
-            post(devices::post_probe_audio_device),
-        )
-        .route("/devices/midi", get(devices::get_midi_devices))
-        .route("/calibrate/start", post(devices::post_calibrate_start))
-        .route("/calibrate/capture", post(devices::post_calibrate_capture))
-        .route("/calibrate/stop", post(devices::post_calibrate_stop))
-        .route("/calibrate", delete(devices::delete_calibrate))
-        .route(
-            "/lighting/fixture-types",
-            get(lighting_api::get_fixture_types),
-        )
-        .route(
-            "/lighting/fixture-types/{name}",
-            get(lighting_api::get_fixture_type)
-                .put(lighting_api::put_fixture_type)
-                .delete(lighting_api::delete_fixture_type),
-        )
-        .route("/lighting/groups", get(lighting_api::get_lighting_groups))
-        .route(
-            "/lighting/assets/{*path}",
-            get(lighting_api::get_lighting_asset),
-        )
-        .route("/lighting/venues", get(lighting_api::get_venues))
-        .route(
-            "/lighting/venues/{name}",
-            get(lighting_api::get_venue)
-                .put(lighting_api::put_venue)
-                .delete(lighting_api::delete_venue),
-        )
-        .merge(upload_routes)
-        .merge(gdtf_routes)
-}
-
-/// Validates that a filename has a supported audio extension (for sample uploads).
-fn validate_sample_filename(filename: &str) -> Result<(), Box<axum::response::Response>> {
-    use super::safe_path::SafePath;
-    if SafePath::validate_name(filename).is_err() {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Invalid filename"})),
-            )
-                .into_response(),
-        ));
-    }
-
-    let ext = std::path::Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    if !songs_crate::is_supported_audio_extension(ext) {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Unsupported audio file type: .{}", ext)})),
-            )
-                .into_response(),
-        ));
-    }
-
-    Ok(())
-}
-
-/// PUT /api/samples/upload/:filename — uploads a sample audio file.
-///
-/// The file is stored in a `samples/` directory next to the config file.
-/// Returns the relative path `samples/{filename}` for use in sample definitions.
-async fn upload_sample_file(
-    State(state): State<WebUiState>,
-    Path(filename): Path<String>,
-    body: Bytes,
-) -> impl IntoResponse {
-    validate_sample_filename(&filename).map_err(|e| *e)?;
-
-    // Canonicalize the project root first, then build the samples path from
-    // the canonical root so that all filesystem operations use a verified base.
-    // `project_dir_of`, not `parent()`: the latter answers Some("") for a bare
-    // filename, so the fallback never fires and the empty path fails to
-    // canonicalize -- a 500 for every sample upload whenever mtrack was started
-    // as `mtrack start mtrack.yaml`.
-    let project_root = crate::util::project_dir_of(&state.config_path);
-    let root_canonical = project_root.canonicalize().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to resolve project root: {}", e)})),
-        )
-            .into_response()
-    })?;
-    let samples_dir = root_canonical.join("samples");
-
-    if !samples_dir.exists() {
-        std::fs::create_dir_all(&samples_dir).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to create samples directory: {}", e)})),
-            )
-                .into_response()
-        })?;
-    }
-
-    let file_path = samples_dir.join(&filename);
-    if !file_path.starts_with(&root_canonical) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid filename"})),
-        )
-            .into_response());
-    }
-
-    std::fs::write(&file_path, &body).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to write file: {}", e)})),
-        )
-            .into_response()
-    })?;
-
-    let relative_path = format!("samples/{}", filename);
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({
-                "status": "uploaded",
-                "file": filename,
-                "path": relative_path,
-            })),
-        )
-            .into_response(),
-    )
-}
+pub(crate) mod write_lock;
 
 #[cfg(test)]
-pub(super) mod test_helpers {
-    use super::*;
+pub(crate) mod test_helpers {
+    use crate::webui::server::WebUiState;
     use http_body_util::BodyExt;
 
     /// Creates a WebUiState with a test player and temp directories.
@@ -333,7 +59,13 @@ pub(super) mod test_helpers {
         let mut map = HashMap::new();
         map.insert(
             "Song A".to_string(),
-            std::sync::Arc::new(Song::new_for_test("Song A", &["kick", "snare"])),
+            // An hour long: the tests that play it look while it plays, and a
+            // zero-length song has often ended by then on a loaded machine.
+            std::sync::Arc::new(Song::new_for_test_lasting(
+                "Song A",
+                &["kick", "snare"],
+                std::time::Duration::from_secs(3600),
+            )),
         );
         test_state_inner(
             std::sync::Arc::new(Songs::new(map)),
@@ -348,13 +80,54 @@ pub(super) mod test_helpers {
         test_state_inner(songs, None)
     }
 
+    /// Creates a WebUiState whose player runs the given DMX engine.
+    pub fn test_state_with_dmx(
+        songs: std::sync::Arc<crate::songs::Songs>,
+        dmx_engine: std::sync::Arc<crate::dmx::engine::Engine>,
+    ) -> (WebUiState, tempfile::TempDir) {
+        test_state_with_hardware(songs, None, Some(dmx_engine))
+    }
+
     fn test_state_inner(
         songs: std::sync::Arc<crate::songs::Songs>,
         audio: Option<std::sync::Arc<dyn crate::audio::Device>>,
     ) -> (WebUiState, tempfile::TempDir) {
+        test_state_with_hardware(songs, audio, None)
+    }
+
+    fn test_state_with_hardware(
+        songs: std::sync::Arc<crate::songs::Songs>,
+        audio: Option<std::sync::Arc<dyn crate::audio::Device>>,
+        dmx_engine: Option<std::sync::Arc<crate::dmx::engine::Engine>>,
+    ) -> (WebUiState, tempfile::TempDir) {
+        let all_songs_playlist = crate::playlist::from_songs(songs).unwrap();
+        let mut playlists = std::collections::HashMap::new();
+        playlists.insert("all_songs".to_string(), all_songs_playlist);
+        test_state_with_playlists(playlists, "all_songs", audio, dmx_engine)
+    }
+
+    fn test_state_with_playlists(
+        playlists: std::collections::HashMap<String, std::sync::Arc<crate::playlist::Playlist>>,
+        active: &str,
+        audio: Option<std::sync::Arc<dyn crate::audio::Device>>,
+        dmx_engine: Option<std::sync::Arc<crate::dmx::engine::Engine>>,
+    ) -> (WebUiState, tempfile::TempDir) {
+        test_state_on_disk(playlists, active, audio, dmx_engine, "songs: []\n", true)
+    }
+
+    /// A WebUiState whose player has `playlists`, `active` playing, in a
+    /// temporary directory holding `mtrack.yaml`, an empty `songs/`, and
+    /// the legacy `playlist.yaml` holding `legacy_playlist`; the directory
+    /// the player's playlists directory too if `playlists_dir`.
+    pub(in crate::webui) fn test_state_on_disk(
+        playlists: std::collections::HashMap<String, std::sync::Arc<crate::playlist::Playlist>>,
+        active: &str,
+        audio: Option<std::sync::Arc<dyn crate::audio::Device>>,
+        dmx_engine: Option<std::sync::Arc<crate::dmx::engine::Engine>>,
+        legacy_playlist: &str,
+        playlists_dir: bool,
+    ) -> (WebUiState, tempfile::TempDir) {
         use crate::player::PlayerDevices;
-        use crate::playlist;
-        use tokio::sync::{broadcast, watch};
 
         let dir = tempfile::tempdir().unwrap();
 
@@ -364,48 +137,36 @@ pub(super) mod test_helpers {
 
         // Create a minimal playlist file
         let playlist_path = dir.path().join("playlist.yaml");
-        std::fs::write(&playlist_path, "songs: []\n").unwrap();
+        std::fs::write(&playlist_path, legacy_playlist).unwrap();
 
         // Create songs directory
         let songs_path = dir.path().join("songs");
         std::fs::create_dir(&songs_path).unwrap();
 
-        let all_songs_playlist = playlist::from_songs(songs.clone()).unwrap();
-
+        // Mappings with the device, or the player counts no audio to play
+        // and a song finishes the moment it starts, whatever its length.
+        let mappings = audio
+            .as_ref()
+            .map(|_| std::sync::Arc::new(std::collections::HashMap::new()));
         let devices = PlayerDevices {
             audio,
-            mappings: None,
-            midi: None,
-            dmx_engine: None,
-            sample_engine: None,
-            trigger_engine: None,
+            mappings,
+            dmx_engine,
+            ..crate::testutil::player::no_devices()
         };
-        let mut playlists = std::collections::HashMap::new();
-        playlists.insert("all_songs".to_string(), all_songs_playlist);
         let player = std::sync::Arc::new(
-            crate::player::Player::new_with_devices(
-                devices,
-                playlists,
-                "all_songs".to_string(),
-                None,
-            )
-            .unwrap(),
+            crate::player::Player::new_with_devices(devices, playlists, active.to_string(), None)
+                .unwrap(),
         );
 
-        let (broadcast_tx, _) = broadcast::channel(16);
-        let (_state_tx, state_rx) =
-            watch::channel(std::sync::Arc::new(crate::state::StateSnapshot::default()));
-
+        player.set_song_sources(crate::player::SongSources {
+            songs: songs_path,
+            playlists_dir: playlists_dir.then(|| dir.path().to_path_buf()),
+            legacy_playlist: Some(playlist_path),
+        });
         let state = WebUiState::new(super::super::server::WebUiStateParams {
             player,
-            state_rx,
-            broadcast_tx,
             config_path,
-            songs_path,
-            playlists_dir: Some(dir.path().to_path_buf()),
-            legacy_playlist_path: Some(playlist_path),
-            profiles_dir: None,
-            waveform_cache: super::super::state::new_waveform_cache(),
         });
 
         (state, dir)
@@ -423,92 +184,5 @@ pub(super) mod test_helpers {
         let path = dir.path().join("test.wav");
         crate::testutil::write_wav(path.clone(), vec![vec![0_i32; 4410]], 44100).unwrap();
         std::fs::read(&path).unwrap()
-    }
-
-    /// Helper: create a test state with a config store for mutation tests.
-    pub fn test_state_with_store() -> (WebUiState, tempfile::TempDir) {
-        let (state, dir) = test_state();
-        let path = state.config_path.clone();
-        let cfg = crate::config::Player::deserialize(&path).unwrap();
-        let store = std::sync::Arc::new(crate::config::ConfigStore::new(cfg, path));
-        state.player.set_config_store(store);
-        (state, dir)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::test_helpers::*;
-    use super::*;
-    use axum::body::Body;
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn upload_sample_file_creates_samples_dir() {
-        let (state, _dir) = test_state();
-        let wav_bytes = create_test_wav();
-        let app = router().with_state(state.clone());
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/samples/upload/kick.wav")
-                    .body(Body::from(wav_bytes))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "uploaded");
-        assert_eq!(parsed["file"], "kick.wav");
-        assert_eq!(parsed["path"], "samples/kick.wav");
-
-        // Verify file was created in samples/ directory next to config.
-        let samples_dir = state.config_path.parent().unwrap().join("samples");
-        assert!(samples_dir.join("kick.wav").exists());
-    }
-
-    #[tokio::test]
-    async fn upload_sample_file_path_traversal_rejected() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/samples/upload/..%2F..%2Fetc%2Fpasswd")
-                    .body(Body::from("bad"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn upload_sample_file_unsupported_extension() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/samples/upload/readme.txt")
-                    .body(Body::from("data"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(response).await;
-        assert!(body.contains("Unsupported audio file type"));
     }
 }

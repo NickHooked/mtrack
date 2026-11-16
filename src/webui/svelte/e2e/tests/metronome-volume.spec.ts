@@ -22,6 +22,13 @@
 
 import { test, expect, type Page } from "@playwright/test";
 import { parse } from "yaml";
+import {
+  ConfigService,
+  PlayerService,
+} from "../../src/gen/player/v1/player_pb";
+import { CONFIG_STORE } from "../mock-server/test-data";
+import { getConfigReply, serveSongConfig } from "../support/config-rpc";
+import { mockRpc, type RpcMock } from "../support/rpc";
 
 const CONFIG_YAML = `songs: songs
 profiles:
@@ -55,53 +62,47 @@ interface MetronomeDefaults {
   sounds?: Record<string, unknown>;
 }
 
-async function openConfig(page: Page) {
-  await page.route("**/api/config/store", async (route) => {
-    const res = await route.fetch();
-    const data = await res.json();
-    await route.fulfill({
-      response: res,
-      json: { ...data, yaml: CONFIG_YAML },
-    });
-  });
+async function openConfig(page: Page): Promise<RpcMock> {
+  const rpc = await mockRpc(page);
+  rpc.unary(
+    PlayerService.method.getConfig,
+    getConfigReply({ ...CONFIG_STORE, yaml: CONFIG_YAML }),
+  );
   await page.goto("/#/config");
   await expect(page.locator(".metronome-defaults")).toBeVisible();
+  return rpc;
 }
 
-async function openSong(page: Page) {
-  await page.route(`**/api/songs/${ENC}`, async (route) => {
-    if (route.request().method() !== "GET") {
-      await route.fulfill({ status: 200, body: "{}" });
-      return;
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: "text/yaml",
-      body: SONG_YAML,
-    });
-  });
+async function openSong(page: Page): Promise<RpcMock> {
+  const rpc = await mockRpc(page);
+  serveSongConfig(rpc, SONG, SONG_YAML);
+  rpc.unary(ConfigService.method.saveSongConfig, {});
   // The panel lives under the timeline, with the rest of the click editing.
   await page.goto(`/#/songs/${ENC}/sections`);
   await expect(page.locator(".metronome-editor")).toBeVisible();
+  return rpc;
 }
 
-/** The `metronome` block of the song YAML the UI PUTs when Save is clicked. */
+/** The `metronome` block of the song YAML the UI saves when Save is clicked. */
 async function saveAndReadMetronome(
   page: Page,
+  rpc: RpcMock,
 ): Promise<Record<string, unknown> | undefined> {
-  const request = page.waitForRequest(
-    (req) => req.url().includes(`/api/songs/${ENC}`) && req.method() === "PUT",
-  );
+  const saves = () => rpc.calls(ConfigService.method.saveSongConfig);
+  const before = saves().length;
   await page.getByRole("button", { name: "Save" }).first().click();
-  const body = (await request).postData() ?? "";
-  return (parse(body) as { metronome?: Record<string, unknown> }).metronome;
+  await expect.poll(() => saves().length).toBe(before + 1);
+  const saved = saves()[before];
+  expect(saved.name).toBe(SONG);
+  return (parse(saved.yaml) as { metronome?: Record<string, unknown> })
+    .metronome;
 }
 
 test.describe("Master click volume", () => {
   test("the Config page loads and saves the player-wide volume", async ({
     page,
   }) => {
-    await openConfig(page);
+    const rpc = await openConfig(page);
     const master = page
       .locator(".metronome-defaults .master-volume")
       .getByRole("textbox");
@@ -110,21 +111,22 @@ test.describe("Master click volume", () => {
     await master.fill("0.5");
     await master.dispatchEvent("change");
 
-    const request = page.waitForRequest(
-      (req) =>
-        req.url().includes("/api/config/metronome") && req.method() === "PUT",
-    );
     await page.getByRole("button", { name: /Save Metronome/i }).click();
-    const body = JSON.parse((await request).postData() ?? "{}") as {
-      metronome: MetronomeDefaults | null;
-    };
-    expect(body.metronome?.volume).toBe(0.5);
+    await expect
+      .poll(() => rpc.calls(ConfigService.method.updateMetronome).length)
+      .toBe(1);
+    const [call] = rpc.calls(ConfigService.method.updateMetronome);
+    expect(call.expectedChecksum).toBe(CONFIG_STORE.checksum);
+    const metronome = JSON.parse(
+      call.metronomeJson,
+    ) as MetronomeDefaults | null;
+    expect(metronome?.volume).toBe(0.5);
     // Still default-on: the volume rides along with the rest of the block.
-    expect(body.metronome?.enabled).toBe(true);
+    expect(metronome?.enabled).toBe(true);
   });
 
   test("a song inherits the volume until it overrides it", async ({ page }) => {
-    await openSong(page);
+    const rpc = await openSong(page);
     const level = page.locator(".metronome-editor .level-field");
     // Nothing to show but the note: the song has no volume of its own.
     await expect(level.locator(".inherited-note")).toBeVisible();
@@ -134,11 +136,11 @@ test.describe("Master click volume", () => {
     // player is at 0.8 and this song wants full.
     await level.getByRole("checkbox").check();
     await expect(level.locator(".slider-stepper")).toBeVisible();
-    expect(await saveAndReadMetronome(page)).toMatchObject({ volume: 1 });
+    expect(await saveAndReadMetronome(page, rpc)).toMatchObject({ volume: 1 });
 
     // And going back to inherited drops the key rather than pinning 1x.
     await level.getByRole("checkbox").uncheck();
     await expect(level.locator(".inherited-note")).toBeVisible();
-    expect(await saveAndReadMetronome(page)).not.toHaveProperty("volume");
+    expect(await saveAndReadMetronome(page, rpc)).not.toHaveProperty("volume");
   });
 });

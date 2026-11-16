@@ -6,6 +6,7 @@ on:
   pull_request:
     branches:
     - main
+    - 'release/**'
 
 permissions:
   contents: read
@@ -17,6 +18,32 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Says which slow jobs a pull request's changes call for. A push to main
+  # runs everything.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      ui: ${{ steps.classify.outputs.ui }}
+    steps:
+    - uses: actions/checkout@v7
+    - id: classify
+      env:
+        GH_TOKEN: ${{ github.token }}
+        EVENT: ${{ github.event_name }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        if [ "$EVENT" != "pull_request" ]; then
+          echo "ui=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" \
+          --jq '.[] | .filename, (.previous_filename // empty)' |
+          scripts/ci-changes.sh | tee -a "$GITHUB_OUTPUT"
+
   # Build the code and verify that Cargo.lock is up to date.
   build:
     name: Build mtrack
@@ -24,8 +51,15 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler
     - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "cargo"
@@ -40,7 +74,18 @@ jobs:
     - name: Build frontend
       run: make build-ui
     - name: Build mtrack
-      run: cargo build --all-targets
+      run: cargo build --all-targets --features ble,hub,tsify
+    # The Lighting journeys run this binary in their own job. A debug build
+    # serves the web UI from src/webui/svelte/dist on disk, so that job builds
+    # the UI itself and needs only the binary; stripped, it is ~20MB to hand
+    # over instead of ~100MB.
+    - name: Hand the binary to the Lighting journeys
+      run: strip -o mtrack-journeys target/debug/mtrack
+    - uses: actions/upload-artifact@v7
+      with:
+        name: mtrack-debug-binary
+        path: mtrack-journeys
+        retention-days: 1
     - name: Check if Cargo.lock is up to date
       run: |
         if git diff --exit-code Cargo.lock; then
@@ -57,10 +102,16 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "cargo"
@@ -75,7 +126,7 @@ jobs:
     - name: Build frontend
       run: make build-ui
     - name: Run audio-only clippy
-      run: cargo clippy --all --all-targets --no-default-features
+      run: cargo clippy --all --all-targets --features ble,hub,tsify
 
   # Make sure the code is properly formatted.
   rustfmt-check:
@@ -88,6 +139,22 @@ jobs:
         components: rustfmt
     - name: Run rustfmt
       run: make fmt-rust-check
+
+  # mtrack-core is what the player reads and checks with no hardware. It is
+  # built and tested here by itself, with only its own features, and its
+  # dependencies are read (for every target and feature) for the audio, MIDI,
+  # DMX and Bluetooth libraries the player links: one of them reaching the
+  # crate would build everywhere those are installed.
+  core:
+    name: Build mtrack-core without hardware
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Build and test mtrack-core alone
+      run: cargo test -p mtrack-core --locked
+    - name: Check mtrack-core links no hardware library
+      run: scripts/check-core-deps.sh
 
   # Lints every shell script in the repo, the Debian maintainer scripts
   # included. Those run as root on a user's machine at install time, which is
@@ -114,8 +181,15 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler
     - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "cargo-tarpaulin"
@@ -133,7 +207,7 @@ jobs:
       with:
         tool: cargo-tarpaulin
     - name: Test mtrack
-      run: cargo tarpaulin --skip-clean --timeout 120 --out xml
+      run: cargo tarpaulin --workspace --skip-clean --features ble,hub,tsify --timeout 120 --out xml
     - name: Upload coverage reports to Codecov
       uses: codecov/codecov-action@v7
       with:
@@ -148,7 +222,7 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install system and GStreamer dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
@@ -161,6 +235,7 @@ jobs:
       run: cargo clippy --all --all-targets --features video
     - name: Test video diagnostics and engine
       run: |
+        cargo test -p mtrack-core video
         cargo test --features video video
         cargo test --features video --test video_engine
 
@@ -179,8 +254,15 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler
     - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "cargo"
@@ -217,16 +299,37 @@ jobs:
         path: src/webui/svelte/node_modules
         key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
         restore-keys: node-modules-${{ runner.os }}-
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - name: Install and generate
-      run: make install-ui gen-proto
+      run: make install-ui gen-proto gen-wasm
     - name: Lint
       run: make lint-ui
     - name: Format check
       run: cd src/webui/svelte && npm run format:check
+    # Vitest: the stage stream's reader and its page-wide lease, in under a
+    # second.
+    - name: Unit tests
+      run: cd src/webui/svelte && npm run test:unit
+    # The phone app's stage page is a second build of the same sources, and
+    # nothing else in CI builds it: a few seconds here, with everything it
+    # needs already generated.
+    - name: Build the stage-only page
+      run: cd src/webui/svelte && npm run build:stage
 
-  # Run Playwright E2E tests against mock backend.
+  # Run Playwright E2E tests against mock backend. Skipped on a pull request
+  # that changes nothing the web UI is built from (scripts/ci-changes.sh).
   playwright:
     name: Playwright E2E tests
+    needs: changes
+    # Runs too when the detection itself failed: a skip must be a decision.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.ui == 'true') }}
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
@@ -238,8 +341,16 @@ jobs:
         path: src/webui/svelte/node_modules
         key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
         restore-keys: node-modules-${{ runner.os }}-
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - name: Install and generate
-      run: make install-ui gen-proto
+      run: make install-ui gen-proto gen-wasm
     - name: Install Playwright browsers
       run: cd src/webui/svelte && npx playwright install chromium
     - name: Install Playwright system deps
@@ -251,6 +362,56 @@ jobs:
       with:
         name: playwright-report
         path: src/webui/svelte/playwright-report/
+        retention-days: 14
+
+  # The Lighting area against the real binary: each test starts its own mtrack
+  # on a throwaway project (no hardware; the DMX engine on the null client)
+  # and checks what persisted on disk and through the API. Uses the build
+  # job's binary rather than building a second one.
+  lighting-journeys:
+    name: Lighting journeys (real server)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+    - uses: actions/cache@v6
+      with:
+        path: src/webui/svelte/node_modules
+        key: node-modules-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+        restore-keys: node-modules-${{ runner.os }}-
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
+    - name: Install, generate and build the UI
+      run: make build-ui
+    - uses: actions/download-artifact@v8
+      with:
+        name: mtrack-debug-binary
+    - name: Install the binary's runtime libraries
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libdbus-1-3
+    - name: Make the binary runnable
+      run: chmod +x mtrack-journeys
+    - name: Install Playwright browsers
+      run: cd src/webui/svelte && npx playwright install --with-deps chromium
+    - name: Run the Lighting journeys
+      env:
+        MTRACK_BIN: ${{ github.workspace }}/mtrack-journeys
+      run: cd src/webui/svelte && npm run test:journeys
+    - uses: actions/upload-artifact@v7
+      if: ${{ !cancelled() }}
+      with:
+        name: lighting-journeys-report
+        path: |
+          src/webui/svelte/playwright-report/
+          src/webui/svelte/test-results/
         retention-days: 14
 
   # Make sure all code has an appropriate license header.
@@ -283,6 +444,10 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - name: Verify crate packaging file list
       run: cargo package --list --allow-dirty > /dev/null
+    - name: Verify mtrack-core packages
+      run: cargo package -p mtrack-core --locked --allow-dirty
+    - name: Verify mtrack and mtrack-core share a version
+      run: scripts/check-versions.sh
 
   # Verify changelog is in keep-a-changelog format.
   verify-changelog:

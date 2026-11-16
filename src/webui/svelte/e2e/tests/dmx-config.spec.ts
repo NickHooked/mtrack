@@ -13,6 +13,8 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { profileWrite } from "../support/profile-writes";
+import { mockRpc } from "../support/rpc";
 
 test.describe("DMX Configuration", () => {
   test.beforeEach(async ({ page }) => {
@@ -64,6 +66,17 @@ test.describe("DMX Configuration", () => {
     // Remove one.
     await page.locator(".universe-row").first().locator(".btn-danger").click();
     await expect(page.locator(".universe-row")).toHaveCount(1);
+  });
+
+  test("removing the last universe saves an empty list", async ({ page }) => {
+    await page.getByRole("button", { name: "Add" }).first().click();
+    await page.locator(".universe-row").first().locator(".btn-danger").click();
+    await expect(page.locator(".universe-row")).toHaveCount(0);
+
+    const rpc = await mockRpc(page);
+    await page.getByRole("button", { name: "Save" }).click();
+    expect((await profileWrite(rpc)).profile.dmx.universes).toEqual([]);
+    await expect(page.locator(".save-msg")).toContainText("Saved");
   });
 
   test("OLA port accepts numeric input", async ({ page }) => {

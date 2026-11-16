@@ -16,28 +16,88 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::distill::DistillCache;
+use super::files;
 use super::gdtf;
-use super::parser::{parse_fixture_types, parse_venues};
+
+use super::patch;
 use super::types::{Fixture, FixtureType, Venue};
 use crate::config::lighting::{GroupConstraint, LogicalGroup};
 use crate::config::Lighting;
 
+/// Why the current venue's fixtures do not load
+/// ([`LightingSystem::load_current_venue_fixtures`]): the first fixture that
+/// cannot be driven and why, when the venue has one, else the load error.
+#[derive(Debug)]
+pub struct VenueFault {
+    /// The current venue; `None` when none is selected.
+    pub venue: Option<String>,
+    /// The first fixture (in patch order) that fails the venue, when one does.
+    pub fixture: Option<String>,
+    /// That fixture's problem, else the load error's text.
+    pub reason: String,
+    /// The load error itself.
+    pub error: Box<dyn Error>,
+}
+
 /// The lighting system configuration.
 pub struct LightingSystem {
-    /// Global fixture types.
+    /// The native fixture types, as declared. A GDTF-sourced type is not
+    /// here: it has no channels until a fixture names a mode.
     fixture_types: HashMap<String, FixtureType>,
+
+    /// Every GDTF-sourced type as declared (unexpanded): what a venue
+    /// fixture's own mode expands from (venue-exchange design §21).
+    referential: HashMap<String, FixtureType>,
+
+    /// The file each fixture type was declared in, for errors that must say
+    /// where to look.
+    fixture_type_files: HashMap<String, PathBuf>,
+
+    /// Expansions of the modes venue fixtures name, by (type, mode as the
+    /// fixture line writes it). Filled at load and on every venue reload
+    /// (a user's venue edit, which can arrive during playback), for every
+    /// loaded venue — venues can be switched — and never at a cue.
+    mode_expansions: HashMap<(String, String), FixtureType>,
+
+    /// Why a (type, mode) a venue fixture names did not expand. Retried on
+    /// every expansion pass: the cause (an archive briefly unreadable, a
+    /// fixed typo in the type file) may have gone.
+    mode_errors: HashMap<(String, String), String>,
+
+    /// Notes on modes that matched only after normalization, by (type, mode
+    /// as written): the fixture loads, and the file should be corrected.
+    mode_warnings: HashMap<(String, String), String>,
+
+    /// Every venue file read and what it declared: which file each venue
+    /// was read from, and its [`files::Owner`].
+    venue_record: files::Record,
+
+    /// Every fixture type file read and what it declared, for each type's
+    /// [`files::Owner`]. The library's unrecorded archives are not in it.
+    fixture_type_record: files::Record,
+
+    /// Why a fixture type named in a file did not load (a GDTF archive that
+    /// would not expand, rich syntax in a `.light` file), by type name.
+    /// Recorded where the loader already knows, so a caller can say why
+    /// instead of only that the type is missing.
+    fixture_type_errors: HashMap<String, String>,
+
+    /// Fixture type files that did not parse at all, as `file: error`. The
+    /// types inside are unnamed, so these explain any type that is missing.
+    fixture_type_file_errors: Vec<String>,
+
+    /// Venue files that did not parse, and venues two files declare, as
+    /// `file: error`, kept as the fixture type files' are.
+    venue_file_errors: Vec<String>,
 
     /// Venues.
     venues: HashMap<String, Venue>,
 
     /// Current venue.
     current_venue: Option<String>,
-
-    /// Inline fixtures.
-    inline_fixtures: HashMap<String, String>,
 
     /// Logical groups with role-based constraints.
     logical_groups: HashMap<String, LogicalGroup>,
@@ -56,7 +116,7 @@ pub struct LightingSystem {
     /// The MVR file each venue's scenery was distilled from, as (path,
     /// modified time, length): a reload whose archive is unchanged reuses
     /// the entry without reading or hashing the file again.
-    scenery_sources: HashMap<String, (PathBuf, Option<std::time::SystemTime>, u64)>,
+    scenery_sources: HashMap<String, (PathBuf, crate::util::FileStamp)>,
 
     /// The project directory the system loaded from, for the asset store.
     project_root: Option<PathBuf>,
@@ -64,12 +124,29 @@ pub struct LightingSystem {
     /// Where the venues were loaded from, so an edited venue can be re-read
     /// without rebuilding the whole system.
     venues_source: Option<VenuesSource>,
+
+    /// Where the fixture types were loaded from, so an edit to a type (its
+    /// name, its movement limits) can be re-read the same way.
+    fixture_types_path: Option<PathBuf>,
+
+    /// The current venue's problems as last logged, so a reload (every
+    /// stage-view drag is one) logs them again only when they change.
+    logged_venue_report: Option<Vec<String>>,
+
+    /// What the GDTF library holds that a person should know (two archives
+    /// stating one name, a file that is not a GDTF), venue-independent.
+    library_findings: Vec<super::library::LibraryFinding>,
+
+    /// A GDTF type's mode names, read at load for a type some venue fixture
+    /// uses without a mode — the load error lists them.
+    type_modes: HashMap<String, Vec<String>>,
 }
 
-/// The venues directory a system loaded, as configured and as resolved.
+/// The venues directory a system loaded, as the config names it (or the
+/// default) and as resolved.
 #[derive(Clone, Debug)]
 struct VenuesSource {
-    /// The configured directory, relative to the project.
+    /// The directory, relative to the project: configured, or the default.
     configured: String,
     /// The resolved directory.
     path: PathBuf,
@@ -81,14 +158,94 @@ impl Default for LightingSystem {
     }
 }
 
+/// A configured directory that is a file is a configuration mistake, and
+/// fails the load; one that does not exist yet simply holds nothing.
+fn not_a_file(dir: &Path) -> Result<(), Box<dyn Error>> {
+    if dir.exists() && !dir.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()).into());
+    }
+    Ok(())
+}
+
+/// Says which files declare a name twice: the parse keeps the last block,
+/// as it always has, and the file is read-only to the web UI.
+fn warn_of_repeats(record: &files::Record, noun: &str) {
+    for (file, name) in record.repeats() {
+        warn!(
+            file = %file.display(),
+            name,
+            "The file declares this {noun} more than once; the last one loads"
+        );
+    }
+}
+
+/// Why [`LightingSystem::type_in_mode`] has no type to drive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeInModeError {
+    /// No fixture type of that name.
+    Unknown(String),
+    /// The mode is missing, not wanted, or does not distil.
+    Mode(String),
+}
+
+impl std::fmt::Display for TypeInModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeInModeError::Unknown(name) => write!(f, "no fixture type named \"{name}\""),
+            TypeInModeError::Mode(why) => f.write_str(why),
+        }
+    }
+}
+
+/// The effects engine's view of one fixture of `fixture_type` (a native
+/// type, or a GDTF type's expansion in a mode) patched at `universe` /
+/// `address`: its channels, their definitions (fine bytes, ranges,
+/// functions), strobe range, movement limits, rig and cells. A venue
+/// fixture is registered through this, and so is the fixture test's
+/// temporary one, so the two resolve values to DMX alike.
+pub fn fixture_info_for(
+    name: &str,
+    universe: u16,
+    address: u16,
+    type_name: &str,
+    fixture_type: &FixtureType,
+) -> crate::lighting::effects::FixtureInfo {
+    let mut fixture_info = crate::lighting::effects::FixtureInfo::new(
+        name.to_string(),
+        universe,
+        address,
+        type_name.to_string(),
+        fixture_type.channels().clone(),
+        fixture_type.max_strobe_frequency(),
+    );
+    fixture_info.min_strobe_frequency = fixture_type.min_strobe_frequency();
+    fixture_info.strobe_dmx_offset = fixture_type.strobe_dmx_offset();
+    fixture_info.channel_defs = fixture_type.channel_defs().clone();
+    fixture_info.movement = *fixture_type.movement();
+    fixture_info.strobe_curve = fixture_type.effective_strobe_curve();
+    fixture_info.rig = fixture_type.rig().map(str::to_string);
+    fixture_info.aim = fixture_type.aim();
+    fixture_info.cells = fixture_type.cells().to_vec();
+    fixture_info
+}
+
 impl LightingSystem {
     /// Creates a new lighting system.
     pub fn new() -> LightingSystem {
         LightingSystem {
             fixture_types: HashMap::new(),
+            referential: HashMap::new(),
+            fixture_type_files: HashMap::new(),
+            mode_expansions: HashMap::new(),
+            mode_errors: HashMap::new(),
+            mode_warnings: HashMap::new(),
+            venue_record: files::Record::default(),
+            fixture_type_record: files::Record::default(),
+            fixture_type_errors: HashMap::new(),
+            fixture_type_file_errors: Vec::new(),
+            venue_file_errors: Vec::new(),
             venues: HashMap::new(),
             current_venue: None,
-            inline_fixtures: HashMap::new(),
             logical_groups: HashMap::new(),
             group_cache: HashMap::new(),
             scenery: HashMap::new(),
@@ -96,11 +253,15 @@ impl LightingSystem {
             scenery_sources: HashMap::new(),
             project_root: None,
             venues_source: None,
+            fixture_types_path: None,
+            logged_venue_report: None,
+            library_findings: Vec::new(),
+            type_modes: HashMap::new(),
         }
     }
 
-    /// The configured venues directory, relative to the project, when the
-    /// system loaded one.
+    /// The venues directory, relative to the project (configured, or the
+    /// default), once the system has loaded.
     pub fn venues_dir(&self) -> Option<&str> {
         self.venues_source.as_ref().map(|s| s.configured.as_str())
     }
@@ -109,7 +270,10 @@ impl LightingSystem {
     /// so an edit to the current venue (positions, focus points) reaches the
     /// running engine without a hardware reload. Fixture types are not
     /// re-read: a venue edit does not change them, and re-expanding
-    /// referential types is the expensive part of a load.
+    /// referential types is the expensive part of a load. A mode the edited
+    /// venues name that no venue named before is expanded here — a venue
+    /// edit is a user's act, never a cue, though it can come during
+    /// playback — and the expansions already made are kept.
     pub fn reload_venues(&mut self) -> Result<(), Box<dyn Error>> {
         let Some(source) = self.venues_source.clone() else {
             return Err("no venues directory was loaded".into());
@@ -117,11 +281,44 @@ impl LightingSystem {
         let mut fresh = LightingSystem::new();
         fresh.load_venues_directory(&source.path)?;
         self.venues = fresh.venues;
+        self.venue_record = fresh.venue_record;
+        self.venue_file_errors = fresh.venue_file_errors;
         self.group_cache.clear();
         if let Some(root) = self.project_root.clone() {
+            self.expand_venue_modes(&root);
             self.refresh_scenery(&root);
         }
         Ok(())
+    }
+
+    /// Re-reads the fixture types and then the venues from the directories
+    /// the system was loaded from: an edit to a type's settings (its name or
+    /// movement limits — and a rename rewrites the venue
+    /// lines that use it) reaches the running engine without a hardware
+    /// reload. A user's act, never a cue: expansions come through the
+    /// distill cache, and the modes venues name are expanded afresh.
+    pub fn reload_fixture_types(&mut self) -> Result<(), Box<dyn Error>> {
+        let (Some(path), Some(root)) = (self.fixture_types_path.clone(), self.project_root.clone())
+        else {
+            return Err("no fixture types directory was loaded".into());
+        };
+        let mut fresh = LightingSystem::new();
+        fresh.load_fixture_types_directory(&path)?;
+        fresh.load_library(&root, Some(&path));
+        self.fixture_types = fresh.fixture_types;
+        self.referential = fresh.referential;
+        self.fixture_type_files = fresh.fixture_type_files;
+        self.fixture_type_record = fresh.fixture_type_record;
+        self.fixture_type_errors = fresh.fixture_type_errors;
+        self.fixture_type_file_errors = fresh.fixture_type_file_errors;
+        self.mode_warnings = fresh.mode_warnings;
+        self.library_findings = fresh.library_findings;
+        // A type's archive or name may have changed: no expansion of the
+        // old one stands.
+        self.mode_expansions.clear();
+        self.mode_errors.clear();
+        self.type_modes.clear();
+        self.reload_venues()
     }
 
     /// The store-relative path of a venue's scenery file, when the venue
@@ -157,9 +354,8 @@ impl LightingSystem {
             // store entry still there: nothing to read or hash again. A
             // venue edit that saves the file must not cost a pass over a
             // hundred-megabyte MVR.
-            let stamp = std::fs::metadata(&archive_path)
-                .ok()
-                .map(|m| (archive_path.clone(), m.modified().ok(), m.len()));
+            let stamp = crate::util::FileStamp::of(&archive_path)
+                .map(|stamp| (archive_path.clone(), stamp));
             if let (Some(stamp), Some(prev), Some(rel)) =
                 (&stamp, previous_sources.get(name), previous.get(name))
             {
@@ -178,7 +374,7 @@ impl LightingSystem {
                         format!("MVR path {} escapes the project directory", source.mvr).into(),
                     );
                 }
-                let bytes = std::fs::read(&canonical)?;
+                let bytes = crate::util::read_file(&canonical)?;
                 let parsed: std::cell::OnceCell<crate::lighting::mvr::Scene> =
                     std::cell::OnceCell::new();
                 cache.ensure_scenery(&bytes, &source.origin, || {
@@ -206,14 +402,81 @@ impl LightingSystem {
         }
     }
 
+    /// The file a venue or fixture type was read from, and whether it can
+    /// be edited there, from what the load recorded; nothing is read again.
+    /// `None` for a name no file declares (a library-only GDTF type, say).
+    pub fn owner(&self, kind: files::Kind, name: &str) -> Option<files::Owner> {
+        self.record(kind).owner(name)
+    }
+
+    /// Every venue or fixture type name the load read from a file, with
+    /// its owner, and every file of that kind that did not parse, in file
+    /// order.
+    pub fn owners(&self, kind: files::Kind) -> Vec<files::Listed> {
+        self.record(kind).listing()
+    }
+
+    fn record(&self, kind: files::Kind) -> &files::Record {
+        match kind {
+            files::Kind::Venue => &self.venue_record,
+            files::Kind::FixtureType => &self.fixture_type_record,
+        }
+    }
+
+    /// Venue files that did not parse and venues two files declare, as
+    /// `file: error`, from the last load or venue reload.
+    pub fn venue_file_errors(&self) -> &[String] {
+        &self.venue_file_errors
+    }
+
+    /// Fixture type files that did not parse and types two files declare,
+    /// as `file: error`.
+    pub fn fixture_type_file_errors(&self) -> &[String] {
+        &self.fixture_type_file_errors
+    }
+
     /// Returns an iterator over the (name, venue) pairs known to the system.
     pub fn venues_iter(&self) -> impl Iterator<Item = (&String, &Venue)> {
         self.venues.iter()
     }
 
-    /// Returns an iterator over the (name, fixture type) pairs known to the system.
+    /// The native (hand-written) fixture types: these have channels of
+    /// their own. A GDTF type has channels only in a mode, so it is in
+    /// [`Self::gdtf_types_iter`] instead.
     pub fn fixture_types_iter(&self) -> impl Iterator<Item = (&String, &FixtureType)> {
         self.fixture_types.iter()
+    }
+
+    /// The GDTF types, as declared (their archive and, from a record, their
+    /// name and movement limits). Each venue fixture of one states its mode;
+    /// the channels, footprint and capabilities are that mode's.
+    pub fn gdtf_types_iter(&self) -> impl Iterator<Item = (&String, &FixtureType)> {
+        self.referential.iter()
+    }
+
+    /// Why a fixture of type `name` cannot be patched, or `None` when the type
+    /// loaded. The loader's own reason when it recorded one, otherwise that no
+    /// type by that name exists (with any file that failed to parse, since the
+    /// missing type may have been inside it).
+    pub fn fixture_type_problem(&self, name: &str) -> Option<String> {
+        if self.fixture_types.contains_key(name) {
+            return None;
+        }
+        if let Some(reason) = self.fixture_type_errors.get(name) {
+            return Some(reason.clone());
+        }
+        // A GDTF type loaded as a declaration; its fixtures name their
+        // modes, and [`Self::fixture_problem`] is where one that cannot be
+        // driven says so.
+        if self.referential.contains_key(name) {
+            return None;
+        }
+        let mut reason = format!("no fixture type named '{name}' is defined");
+        if !self.fixture_type_file_errors.is_empty() {
+            reason.push_str("; fixture type files that failed to parse: ");
+            reason.push_str(&self.fixture_type_file_errors.join("; "));
+        }
+        Some(reason)
     }
 
     /// Returns an iterator over the (name, logical group) pairs known to the
@@ -235,26 +498,36 @@ impl LightingSystem {
             self.current_venue = Some(venue.to_string());
         }
 
-        // Load inline fixtures and groups
-        self.inline_fixtures = config.fixtures().clone();
+        // Load groups
         self.logical_groups = config.groups().clone();
 
-        // Load directories if configured
-        if let Some(dirs) = config.directories() {
-            if let Some(fixture_types_dir) = dirs.fixture_types() {
-                let path = base_path.join(fixture_types_dir);
-                self.load_fixture_types_directory(&path, base_path)?;
-            }
+        // The project's fixture types and venues, from the configured
+        // directories or the defaults (`config::lighting`), each on its own:
+        // the web UI saves to the same places, so what a user makes there
+        // is what loads. A directory that is not there (any project without
+        // lighting) is simply empty.
+        let fixture_types_dir = config.fixture_types_dir();
+        let path = base_path.join(fixture_types_dir);
+        self.load_fixture_types_directory(&path)?;
+        self.fixture_types_path = Some(path);
 
-            if let Some(venues_dir) = dirs.venues() {
-                let path = base_path.join(venues_dir);
-                self.load_venues_directory(&path)?;
-                self.venues_source = Some(VenuesSource {
-                    configured: venues_dir.to_string(),
-                    path,
-                });
-            }
-        }
+        let venues_dir = config.venues_dir();
+        let path = base_path.join(venues_dir);
+        self.load_venues_directory(&path)?;
+        self.venues_source = Some(VenuesSource {
+            configured: venues_dir.to_string(),
+            path,
+        });
+
+        // Every GDTF in the library no type file points at is a fixture too
+        // (design §22.2).
+        let types_path = self.fixture_types_path.clone();
+        self.load_library(base_path, types_path.as_deref());
+
+        // Types load before venues, so the modes the venues' fixtures name
+        // are expanded once both are in — every venue, not only the
+        // current one, since a venue switch must not parse an archive.
+        self.expand_venue_modes(base_path);
 
         // Scenery for the 3D view, from each MVR-seeded venue's archive.
         self.project_root = Some(base_path.to_path_buf());
@@ -262,134 +535,155 @@ impl LightingSystem {
         Ok(())
     }
 
-    /// Loads fixture types from a directory.
-    fn load_fixture_types_directory(
-        &mut self,
-        dir: &Path,
-        base_path: &Path,
-    ) -> Result<(), Box<dyn Error>> {
-        if !dir.exists() {
-            return Ok(()); // Directory doesn't exist, skip
-        }
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // Recursively load subdirectories
-                self.load_fixture_types_directory(&path, base_path)?;
-            } else if path
-                .extension()
-                .is_some_and(|ext| ext == "fixture" || ext == "light")
+    /// Registers the library's unrecorded archives as fixture types (nothing
+    /// to expand until a venue fixture names a mode), from the one function
+    /// every enumerator asks. A name a type
+    /// file already declared is never replaced: the library takes the
+    /// archive's file stem instead, so this cannot shadow anything.
+    fn load_library(&mut self, base_path: &Path, types_dir: Option<&Path>) {
+        let library = super::library::unrecorded_types(base_path, types_dir);
+        for library_type in &library.types {
+            if self.referential.contains_key(&library_type.name)
+                || self.fixture_types.contains_key(&library_type.name)
             {
-                // .fixture files carry GDTF-referential definitions; .light
-                // files are the existing DSL. Peers, not a migration.
-                self.load_fixture_types_file(&path, base_path)?;
+                continue;
             }
+            info!(
+                fixture_type = library_type.name.as_str(),
+                archive = library_type.file_name.as_str(),
+                "Loaded a GDTF from the library as a fixture type; its fixtures name their modes"
+            );
+            self.referential.insert(
+                library_type.name.clone(),
+                super::library::declared(library_type),
+            );
+            self.fixture_type_files.insert(
+                library_type.name.clone(),
+                base_path.join(&library_type.archive),
+            );
+        }
+        self.library_findings = library.findings;
+    }
+
+    /// What the GDTF library holds that a person should know: two archives
+    /// stating one fixture name, or a file that is not a readable GDTF.
+    pub fn library_findings(&self) -> &[super::library::LibraryFinding] {
+        &self.library_findings
+    }
+
+    /// Loads fixture types from a directory and its subdirectories, through
+    /// the project's one reader of type files ([`project_files::type_files`]),
+    /// so the web API lists exactly what loads here. When two files declare
+    /// one name, the first in path order keeps it and the clash is logged
+    /// and reported as a file error.
+    fn load_fixture_types_directory(&mut self, dir: &Path) -> Result<(), Box<dyn Error>> {
+        not_a_file(dir)?;
+        let read = super::project_files::type_files(dir);
+        warn_of_repeats(&read.record, "fixture type");
+        self.fixture_type_record = read.record;
+        for declared in read.items {
+            self.load_fixture_type(declared.name, declared.item, &declared.file);
+        }
+        for problem in read.problems {
+            warn!(
+                file = %problem.file.display(),
+                error = %problem.error,
+                "Failed to load fixture type file"
+            );
+            self.fixture_type_file_errors.push(format!(
+                "{}: {}",
+                super::project_files::display_in(dir, &problem.file),
+                problem.error
+            ));
         }
         Ok(())
     }
 
-    /// Loads venues from a directory.
+    /// Loads venues from a directory and its subdirectories, through the
+    /// project's one reader of venue files ([`project_files::venues`]). One
+    /// bad file never stops the rest, and never vanishes either: the
+    /// venue-group migration advice is raised as a parse error, and
+    /// swallowing it turns a fixable file into "Venue 'x' not found" later.
     fn load_venues_directory(&mut self, dir: &Path) -> Result<(), Box<dyn Error>> {
-        if !dir.exists() {
-            return Ok(()); // Directory doesn't exist, skip
+        not_a_file(dir)?;
+        let read = super::project_files::venues(dir);
+        warn_of_repeats(&read.record, "venue");
+        self.venue_record = read.record;
+        for declared in read.items {
+            info!(venue = declared.name.as_str(), "Loading venue");
+            self.venues.insert(declared.name, declared.item);
         }
-
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                // Recursively load subdirectories
-                self.load_venues_directory(&path)?;
-            } else if path
-                .extension()
-                .is_some_and(|ext| ext == "venue" || ext == "light")
-            {
-                // .venue files carry positions, focus points and MVR
-                // provenance; .light files are the existing DSL. Peers, not
-                // a migration.
-                self.load_venue_file(&path)?;
-            }
+        for problem in read.problems {
+            warn!(
+                file = %problem.file.display(),
+                error = %problem.error,
+                "Failed to load venue file"
+            );
+            self.venue_file_errors.push(format!(
+                "{}: {}",
+                super::project_files::display_in(dir, &problem.file),
+                problem.error
+            ));
         }
         Ok(())
     }
 
-    /// Loads fixture types from a file.
-    fn load_fixture_types_file(
-        &mut self,
-        path: &Path,
-        base_path: &Path,
-    ) -> Result<(), Box<dyn Error>> {
-        let content = std::fs::read_to_string(path)?;
-
-        // Parse fixture types from DSL content
-        match parse_fixture_types(&content) {
-            Ok(types) => {
-                for (name, fixture_type) in types {
-                    let fixture_type = if fixture_type.source().is_some() {
-                        // Referential: expand through the distill cache. A
-                        // failure skips the type loudly — registering an
-                        // empty shell would patch fixtures that emit nothing.
-                        match Self::expand_referential(&name, &fixture_type, base_path) {
-                            Ok(expanded) => {
-                                info!(
-                                    fixture_type = name,
-                                    channels = expanded.channels().len(),
-                                    "Loaded GDTF-referential fixture type"
-                                );
-                                expanded
-                            }
-                            Err(e) => {
-                                warn!(
-                                    fixture_type = name,
-                                    file = %path.display(),
-                                    error = %e,
-                                    "Failed to expand GDTF-referential fixture type; \
-                                     skipping — fixtures of this type will not light"
-                                );
-                                continue;
-                            }
-                        }
-                    } else if fixture_type.uses_rich_channels()
-                        && path.extension().is_some_and(|ext| ext == "light")
-                    {
-                        // The extension is the version marker: rich channel
-                        // syntax is the v2 DSL and lives in .fixture files.
-                        warn!(
-                            fixture_type = name,
-                            file = %path.display(),
-                            "Rich channel syntax (fine, range, functions) belongs in a \
-                             .fixture file; rename the file — skipping this type"
-                        );
-                        continue;
-                    } else {
-                        info!(fixture_type = name, "Loading fixture type");
-                        fixture_type
-                    };
-                    self.fixture_types.insert(name, fixture_type);
-                }
-            }
-            Err(e) => {
-                warn!(file = %path.display(), error = %e, "Failed to parse fixture type file");
-            }
+    /// Registers one declared fixture type from `path`.
+    fn load_fixture_type(&mut self, name: String, fixture_type: FixtureType, path: &Path) {
+        self.fixture_type_files
+            .insert(name.clone(), path.to_path_buf());
+        if fixture_type.source().is_some() {
+            // A GDTF type is the whole archive: nothing to expand until a
+            // venue fixture names a mode (design §22).
+            info!(fixture_type = name, "Loaded a GDTF fixture type");
+            self.referential.insert(name, fixture_type);
+            return;
         }
-
-        Ok(())
+        if fixture_type.uses_rich_channels() && path.extension().is_some_and(|ext| ext == "light") {
+            // The extension is the version marker: rich channel syntax is
+            // the v2 DSL and lives in .fixture files.
+            warn!(
+                fixture_type = name,
+                file = %path.display(),
+                "Rich channel syntax (fine, range, functions) belongs in a \
+                 .fixture file; rename the file — skipping this type"
+            );
+            self.fixture_type_errors.insert(
+                name,
+                "rich channel syntax belongs in a .fixture file, not a .light file".to_string(),
+            );
+            return;
+        }
+        info!(fixture_type = name, "Loading fixture type");
+        self.fixture_types.insert(name, fixture_type);
     }
 
-    /// Expands a GDTF-referential fixture type through the per-project
-    /// distill cache (`lighting/.cache/`, hash-keyed, rebuildable). Parsing
-    /// the archive happens only on a cold cache — at load time, never
-    /// mid-show — and the fill is logged loudly.
-    pub(crate) fn expand_referential(
+    /// Expands a GDTF fixture type in `mode` — a mode a venue fixture names
+    /// — through the per-project distill cache (`lighting/.cache/`,
+    /// hash-keyed, rebuildable). Parsing the archive happens only on a cold
+    /// cache — at load time or on a user's venue edit, never at a cue — and
+    /// the fill is logged loudly. The type's
+    /// body (movement limits) applies to every mode. Both cache keys already
+    /// carry the mode, so each mode is its own entry.
+    ///
+    /// The second value is a note when `mode` matched the archive's mode
+    /// only after normalization (case, whitespace, punctuation), as
+    /// [`gdtf::match_mode`] allows: the fixture loads, and the file should
+    /// be corrected. Read from the rig, which records the mode it matched,
+    /// so it is said on every load, not only a cold one.
+    pub(crate) fn expand_mode(
         name: &str,
         fixture_type: &FixtureType,
+        mode: &str,
         base_path: &Path,
-    ) -> Result<FixtureType, Box<dyn Error>> {
-        let source = fixture_type.source().expect("caller checked source");
+    ) -> Result<(FixtureType, Option<String>), Box<dyn Error>> {
+        let declared = fixture_type
+            .source()
+            .ok_or_else(|| format!("fixture type \"{name}\" is not GDTF-sourced"))?;
+        let source = super::types::GdtfSource {
+            path: declared.path.clone(),
+        };
+        let mut note = None;
 
         // A bare-filename config path can yield an empty base_path; plain
         // joins tolerate it but canonicalize() does not. Defense in depth —
@@ -417,12 +711,12 @@ impl LightingSystem {
             .into());
         }
 
-        let bytes = std::fs::read(&canonical)
+        let bytes = crate::util::read_file(&canonical)
             .map_err(|e| format!("cannot read GDTF archive {}: {e}", canonical.display()))?;
         // Everything that can change the expansion participates in the key;
         // movement is the only override today, so it is the fingerprint.
         let fingerprint = format!("{:?}", fixture_type.movement());
-        let key = DistillCache::key(name, &bytes, &source.mode, &fingerprint);
+        let key = DistillCache::key(name, &bytes, mode, &fingerprint);
         let cache = DistillCache::new(base_path.join("lighting").join(".cache"));
         // The archive is parsed at most once per call, whichever of the
         // expansion and the rig is missing.
@@ -437,11 +731,11 @@ impl LightingSystem {
             info!(
                 fixture_type = name,
                 gdtf = %source.path,
-                mode = %source.mode,
+                mode = %mode,
                 "Expansion cache is cold — distilling GDTF"
             );
             let description = describe()?;
-            let distilled = gdtf::distill(description, &source.mode, name)?;
+            let distilled = gdtf::distill(description, mode, name)?;
             // Distillation warnings surface on the cold fill; the import
             // command is the place they're reported interactively.
             for warning in &distilled.warnings {
@@ -452,9 +746,12 @@ impl LightingSystem {
             expanded.set_movement(*fixture_type.movement());
             Ok(expanded)
         })?;
+        // The strobe curve changes no channel, so it is not part of the
+        // expansion (or its cache key): it rides on the record's type.
+        expanded.set_strobe_curve(fixture_type.strobe_curve());
         // The rig (design §16.2) is the 3D view's, not the show's: a rig
         // that cannot be written is logged, and the type loads without one.
-        match cache.ensure_rig(&bytes, &source.mode, describe) {
+        match cache.ensure_rig(&bytes, mode, describe) {
             Ok((rig, warnings)) => {
                 for warning in warnings {
                     warn!(fixture_type = name, "Rig model: {warning}");
@@ -462,7 +759,22 @@ impl LightingSystem {
                 // The show aims through the rig's joints (design §18.6);
                 // a geometry the closed form cannot follow is said so and
                 // the plain convention stands in.
-                match cache.load_rig(&rig).map(|model| gdtf::aim_calibration(&model)) {
+                let model = cache.load_rig(&rig);
+                // The rig names the mode it matched; a different spelling
+                // here means the match needed normalizing. The archive's
+                // spelling stays out of the message (it is archive text).
+                if let Ok(model) = &model {
+                    if model.mode != mode {
+                        let text = format!(
+                            "mode \"{mode}\" matches a mode of {} only after normalizing case, \
+                             whitespace or punctuation; write it exactly as the GDTF names it",
+                            source.path
+                        );
+                        warn!(fixture_type = name, "{text}");
+                        note = Some(text);
+                    }
+                }
+                match model.map(|model| gdtf::aim_calibration(&model)) {
                     Ok(Ok(calibration)) => {
                         if !calibration.frame_is_identity() {
                             info!(
@@ -484,30 +796,347 @@ impl LightingSystem {
             }
             Err(e) => warn!(fixture_type = name, error = %e, "No rig model for the 3D view"),
         }
-        Ok(expanded)
+        Ok((expanded, note))
     }
 
-    /// Loads venues from a file.
-    fn load_venue_file(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
-        let content = std::fs::read_to_string(path)?;
-
-        match parse_venues(&content) {
-            Ok(venues) => {
-                for (name, venue) in venues {
-                    info!(fixture_type = name, "Loading venue");
-                    self.venues.insert(name, venue);
+    /// Expands every mode a fixture of any loaded venue names (design §21),
+    /// reusing what is already expanded and retrying what failed, then
+    /// reports the current venue's problems (see
+    /// [`Self::report_current_venue`]). Runs at load and on every venue
+    /// reload — a user's edit, possibly during playback — never at a cue.
+    fn expand_venue_modes(&mut self, base_path: &Path) {
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        let mut modeless: Vec<String> = Vec::new();
+        for venue in self.venues.values() {
+            for fixture in venue.fixtures().values() {
+                if !self.referential.contains_key(fixture.fixture_type()) {
+                    continue;
+                }
+                let Some(mode) = fixture.mode() else {
+                    // A load error; its message lists the modes to choose
+                    // from, read now, at load.
+                    if !modeless.iter().any(|t| t == fixture.fixture_type()) {
+                        modeless.push(fixture.fixture_type().to_string());
+                    }
+                    continue;
+                };
+                let key = (fixture.fixture_type().to_string(), mode.to_string());
+                if !wanted.contains(&key) {
+                    wanted.push(key);
                 }
             }
-            Err(e) => {
-                // One bad file must not stop the rest from loading, but it
-                // must not vanish either: the venue-group migration advice
-                // is raised as a parse error, and swallowing it turns a
-                // fixable file into "Venue 'x' not found" much later.
-                warn!(file = %path.display(), error = %e, "Failed to parse venue file");
+        }
+        wanted.sort();
+        for type_name in modeless {
+            if self.type_modes.contains_key(&type_name) {
+                continue;
+            }
+            let modes = self.referential[&type_name]
+                .source()
+                .map(|source| base_path.join(&source.path))
+                .and_then(|path| crate::util::read_file(&path).ok())
+                .and_then(|bytes| gdtf::parse_archive(&bytes).ok())
+                .map(|description| description.modes.into_iter().map(|m| m.name).collect())
+                .unwrap_or_default();
+            self.type_modes.insert(type_name, modes);
+        }
+        // Modes no venue names any more go; the ones still named are kept
+        // without touching the archive again.
+        self.mode_expansions.retain(|key, _| wanted.contains(key));
+        self.mode_errors.retain(|key, _| wanted.contains(key));
+        for key in wanted {
+            // A success is kept; a failure is tried again, since its cause
+            // may have gone (an archive that was briefly unreadable).
+            if self.mode_expansions.contains_key(&key) {
+                continue;
+            }
+            let (type_name, mode) = &key;
+            let declared = &self.referential[type_name];
+            match Self::expand_mode(type_name, declared, mode, base_path) {
+                Ok((expanded, note)) => {
+                    info!(
+                        fixture_type = type_name,
+                        mode = mode,
+                        channels = expanded.channels().len(),
+                        "Loaded a venue fixture's GDTF mode"
+                    );
+                    if let Some(note) = note {
+                        self.mode_warnings.insert(key.clone(), note);
+                    }
+                    self.mode_errors.remove(&key);
+                    self.mode_expansions.insert(key, expanded);
+                }
+                Err(e) => {
+                    // Said per fixture, aggregated, for the current venue
+                    // (`report_current_venue`); other venues' failures are
+                    // there for whoever asks (`fixture_problem`, readiness).
+                    debug!(
+                        fixture_type = type_name,
+                        mode = mode,
+                        file = %self
+                            .fixture_type_files
+                            .get(type_name)
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        error = %e,
+                        "A mode venue fixtures name did not expand; those fixtures will not light"
+                    );
+                    self.mode_errors.insert(key, e.to_string());
+                }
             }
         }
 
-        Ok(())
+        self.report_current_venue();
+    }
+
+    /// Logs the current venue's problems — fixtures that cannot be driven
+    /// (which fail the venue), patch overlaps and overruns — one aggregated
+    /// line per kind, and only when they differ from what was last logged:
+    /// a reload runs on every stage-view drag, and an unchanged problem is
+    /// not news. Other venues are not logged; their problems are a
+    /// `fixture_problem` or readiness call away.
+    fn report_current_venue(&mut self) {
+        let lines = self.current_venue_report();
+        if self.logged_venue_report.as_ref() == Some(&lines) {
+            return;
+        }
+        let venue = self.current_venue.clone().unwrap_or_default();
+        let file = self.venue_file_display(&venue);
+        for line in &lines {
+            warn!(venue = venue.as_str(), file = %file, "{line}");
+        }
+        if lines.is_empty()
+            && self
+                .logged_venue_report
+                .as_ref()
+                .is_some_and(|l| !l.is_empty())
+        {
+            info!(
+                venue = venue.as_str(),
+                "The venue's earlier problems are resolved"
+            );
+        }
+        self.logged_venue_report = Some(lines);
+    }
+
+    /// The current venue's problems as log lines, one per kind.
+    fn current_venue_report(&self) -> Vec<String> {
+        let Some(venue_name) = self.current_venue.as_deref() else {
+            return Vec::new();
+        };
+        let Some(venue) = self.venues.get(venue_name) else {
+            return Vec::new();
+        };
+        fn names(names: &[&str]) -> String {
+            const SHOWN: usize = 3;
+            let quoted: Vec<String> = names
+                .iter()
+                .take(SHOWN)
+                .map(|n| format!("\"{n}\""))
+                .collect();
+            if names.len() > SHOWN {
+                format!("{} and {} more", quoted.join(", "), names.len() - SHOWN)
+            } else {
+                quoted.join(", ")
+            }
+        }
+        let mut lines = Vec::new();
+        let problems = self.venue_problems(venue_name);
+        if let Some((_, first)) = problems.first() {
+            let who: Vec<&str> = problems.iter().map(|(f, _)| f.as_str()).collect();
+            lines.push(format!(
+                "{} fixture(s) cannot be driven, so the venue will not light: {}; first: {first}",
+                problems.len(),
+                names(&who)
+            ));
+        }
+        let spans = self.patch_spans(venue);
+        let overlaps = patch::venue_overlaps(&spans);
+        if let Some(first) = overlaps.first() {
+            lines.push(format!(
+                "{} patch overlap(s); first: {first}",
+                overlaps.len()
+            ));
+        }
+        let overruns = patch::venue_overruns(&spans);
+        if let Some(first) = overruns.first() {
+            let who: Vec<&str> = overruns.iter().map(|o| o.fixture.as_str()).collect();
+            lines.push(format!(
+                "{} fixture(s) run past address 512: {}; first: {first}",
+                overruns.len(),
+                names(&who)
+            ));
+        }
+        lines
+    }
+
+    /// Every fixture of `venue` that cannot be driven, in patch order, with
+    /// its [`Self::fixture_problem`] text. Empty when the venue registers
+    /// (or is not loaded).
+    pub fn venue_problems(&self, venue: &str) -> Vec<(String, String)> {
+        let Some(loaded) = self.venues.get(venue) else {
+            return Vec::new();
+        };
+        loaded
+            .fixtures_by_patch()
+            .into_iter()
+            .filter_map(|fixture| {
+                self.fixture_problem(venue, fixture)
+                    .map(|problem| (fixture.name().to_string(), problem))
+            })
+            .collect()
+    }
+
+    /// The first fixture of `venue` (in patch order) that cannot be driven
+    /// and why — what fails the venue's registration — or `None` when the
+    /// venue registers.
+    pub fn venue_problem(&self, venue: &str) -> Option<(String, String)> {
+        self.venue_problems(venue).into_iter().next()
+    }
+
+    /// A venue's file, for messages; empty when the venue was not read
+    /// from one.
+    fn venue_file_display(&self, venue: &str) -> String {
+        self.venue_record
+            .file_of(venue)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    }
+
+    /// A fixture type's file name, for messages.
+    fn type_file_display(&self, fixture_type: &str) -> String {
+        self.fixture_type_files
+            .get(fixture_type)
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "an unknown file".to_string())
+    }
+
+    /// The expansion a venue fixture is driven by: a native type's own, or a
+    /// GDTF type's in the mode the line names. The error says why not,
+    /// naming the fixture and the type (and the type's file where that is
+    /// where the fix goes).
+    pub fn resolve_fixture_type(&self, fixture: &Fixture) -> Result<&FixtureType, String> {
+        let type_name = fixture.fixture_type();
+        let declared = self.referential.get(type_name);
+        match (fixture.mode(), declared) {
+            // Said in the user's terms: this reaches the web UI's banner and
+            // readiness view, where a GDTF fixture has no file to point at.
+            (None, Some(_)) => Err(format!(
+                "fixture \"{}\" of \"{type_name}\" names no mode; every fixture of a GDTF \
+                 fixture states its mode — add `mode \"...\"` to its venue line{}",
+                fixture.name(),
+                self.mode_choices(type_name),
+            )),
+            (Some(mode), Some(_)) => {
+                let key = (type_name.to_string(), mode.to_string());
+                if let Some(expanded) = self.mode_expansions.get(&key) {
+                    return Ok(expanded);
+                }
+                Err(match self.mode_errors.get(&key) {
+                    Some(reason) => format!(
+                        "fixture \"{}\": mode \"{mode}\" of fixture type \"{type_name}\" did \
+                         not load: {reason}",
+                        fixture.name()
+                    ),
+                    None => format!(
+                        "fixture \"{}\": mode \"{mode}\" of fixture type \"{type_name}\" was \
+                         never expanded (the venue did not load through the lighting system)",
+                        fixture.name()
+                    ),
+                })
+            }
+            (Some(mode), None) if self.fixture_types.contains_key(type_name) => Err(format!(
+                "fixture \"{}\" names mode \"{mode}\", but fixture type \"{type_name}\" (in {}) \
+                 is not GDTF-sourced and has no modes; remove the mode, or source the type \
+                 from a GDTF with `from gdtf(...)`",
+                fixture.name(),
+                self.type_file_display(type_name)
+            )),
+            // A native type: its own channels.
+            _ => match self.fixture_types.get(type_name) {
+                Some(fixture_type) => Ok(fixture_type),
+                None => Err(format!(
+                    "Fixture type '{type_name}' not found for fixture \"{}\": {}",
+                    fixture.name(),
+                    self.fixture_type_problem(type_name)
+                        .unwrap_or_else(|| "it did not load".to_string())
+                )),
+            },
+        }
+    }
+
+    /// ", one of: \"8: RGBS\", \"9: RGBWS\" and N more" for a GDTF type's
+    /// modes as read at load; empty when they are not known.
+    fn mode_choices(&self, type_name: &str) -> String {
+        const SHOWN: usize = 8;
+        let Some(modes) = self.type_modes.get(type_name).filter(|m| !m.is_empty()) else {
+            return String::new();
+        };
+        let listed: Vec<String> = modes
+            .iter()
+            .take(SHOWN)
+            .map(|m| format!("\"{m}\""))
+            .collect();
+        let more = match modes.len().saturating_sub(SHOWN) {
+            0 => String::new(),
+            n => format!(" and {n} more"),
+        };
+        format!(", one of: {}{more}", listed.join(", "))
+    }
+
+    /// Why a venue fixture cannot be driven, or `None` when it can: what
+    /// [`Self::resolve_fixture_type`] says, with the venue and its file.
+    pub fn fixture_problem(&self, venue: &str, fixture: &Fixture) -> Option<String> {
+        self.resolve_fixture_type(fixture).err().map(|reason| {
+            let file = self.venue_file_display(venue);
+            if file.is_empty() {
+                format!("{reason} (venue \"{venue}\")")
+            } else {
+                format!("{reason} (venue \"{venue}\", {file})")
+            }
+        })
+    }
+
+    /// The note for a mode that matched its GDTF only after normalization.
+    pub fn mode_warning(&self, fixture_type: &str, mode: &str) -> Option<&str> {
+        self.mode_warnings
+            .get(&(fixture_type.to_string(), mode.to_string()))
+            .map(String::as_str)
+    }
+
+    /// Each fixture of `venue` as the addresses it occupies, from its own
+    /// mode's expansion. A fixture whose type or mode did not load has no
+    /// known footprint and is left out rather than guessed at.
+    pub fn patch_spans(&self, venue: &Venue) -> Vec<patch::PatchSpan> {
+        venue
+            .fixtures_by_patch()
+            .into_iter()
+            .filter_map(|fixture| {
+                let fixture_type = self.resolve_fixture_type(fixture).ok()?;
+                Some(patch::PatchSpan {
+                    fixture: fixture.name().to_string(),
+                    universe: fixture.universe(),
+                    address: fixture.start_channel(),
+                    footprint: fixture_type.footprint(),
+                })
+            })
+            .collect()
+    }
+
+    /// Fixtures of the current venue patched over part of each other's
+    /// addresses (a gang at one identical span is not an overlap).
+    pub fn current_venue_overlaps(&self) -> Vec<patch::PatchOverlap> {
+        self.get_current_venue()
+            .map(|venue| patch::venue_overlaps(&self.patch_spans(venue)))
+            .unwrap_or_default()
+    }
+
+    /// Fixtures of the current venue whose footprint runs past address 512.
+    pub fn current_venue_overruns(&self) -> Vec<patch::PatchOverrun> {
+        self.get_current_venue()
+            .map(|venue| patch::venue_overruns(&self.patch_spans(venue)))
+            .unwrap_or_default()
     }
 
     /// Gets the current venue name.
@@ -613,6 +1242,87 @@ impl LightingSystem {
         }
     }
 
+    /// A fixture type as the fixture test drives it: a native type's own
+    /// channels, or a GDTF type's expansion in `mode` (already expanded for
+    /// a venue, else expanded now through the distill cache). A GDTF type
+    /// needs a mode and a native type takes none.
+    pub fn type_in_mode(
+        &self,
+        type_name: &str,
+        mode: Option<&str>,
+        base_path: &Path,
+    ) -> Result<FixtureType, TypeInModeError> {
+        match (self.referential.get(type_name), mode) {
+            (Some(_), None) => Err(TypeInModeError::Mode(format!(
+                "\"{type_name}\" is a GDTF fixture: choose one of its modes"
+            ))),
+            (Some(declared), Some(mode)) => {
+                let key = (type_name.to_string(), mode.to_string());
+                if let Some(expanded) = self.mode_expansions.get(&key) {
+                    return Ok(expanded.clone());
+                }
+                Self::expand_mode(type_name, declared, mode, base_path)
+                    .map(|(expanded, _)| expanded)
+                    .map_err(|e| {
+                        TypeInModeError::Mode(format!(
+                            "mode \"{mode}\" of \"{type_name}\" cannot be driven: {e}"
+                        ))
+                    })
+            }
+            (None, Some(_)) if self.fixture_types.contains_key(type_name) => {
+                Err(TypeInModeError::Mode(format!(
+                    "\"{type_name}\" is written by hand and has no modes"
+                )))
+            }
+            (None, _) => self
+                .fixture_types
+                .get(type_name)
+                .cloned()
+                .ok_or_else(|| TypeInModeError::Unknown(type_name.to_string())),
+        }
+    }
+
+    /// The GDTF types' archives, project-relative, by type name.
+    pub fn gdtf_archive(&self, type_name: &str) -> Option<&str> {
+        self.referential
+            .get(type_name)
+            .and_then(|t| t.source())
+            .map(|s| s.path.as_str())
+    }
+
+    /// The current venue's fixtures for the effects engine, or why they do
+    /// not load; what to make of no venue at all is the caller's.
+    pub fn load_current_venue_fixtures(
+        &self,
+    ) -> Result<Vec<crate::lighting::effects::FixtureInfo>, VenueFault> {
+        self.get_current_venue_fixtures().map_err(|error| {
+            let venue = self.current_venue().map(str::to_string);
+            let (fixture, reason) = match venue.as_deref().and_then(|v| self.venue_problem(v)) {
+                Some((fixture, reason)) => (Some(fixture), reason),
+                None => (None, error.to_string()),
+            };
+            VenueFault {
+                venue,
+                fixture,
+                reason,
+                error,
+            }
+        })
+    }
+
+    /// The current venue's focus points by name; none without a venue.
+    pub fn current_focus_points(&self) -> HashMap<String, crate::lighting::types::Vec3> {
+        self.get_current_venue()
+            .map(|venue| {
+                venue
+                    .focus_points()
+                    .iter()
+                    .map(|(name, point)| (name.clone(), *point))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Gets all fixtures from the current venue for effects engine registration
     pub fn get_current_venue_fixtures(
         &self,
@@ -626,29 +1336,22 @@ impl LightingSystem {
         let mut fixture_infos = Vec::new();
 
         for (name, fixture) in venue.fixtures() {
-            // Get the fixture type to determine channel mapping
-            let fixture_type = self
-                .fixture_types
-                .get(fixture.fixture_type())
-                .ok_or_else(|| format!("Fixture type '{}' not found", fixture.fixture_type()))?;
+            // The fixture's own mode's channels (or its native type's). A
+            // fixture that cannot be driven fails the venue, as a missing
+            // type always has: registering the rest would light a rig with
+            // a hole in it and no error to say so.
+            let fixture_type = self.resolve_fixture_type(fixture)?;
 
-            let mut fixture_info = crate::lighting::effects::FixtureInfo::new(
-                name.clone(),
+            let mut fixture_info = fixture_info_for(
+                name,
                 fixture.universe(),
                 fixture.start_channel(),
-                fixture.fixture_type().to_string(),
-                fixture_type.channels().clone(),
-                fixture_type.max_strobe_frequency(),
+                fixture.fixture_type(),
+                fixture_type,
             );
-            fixture_info.min_strobe_frequency = fixture_type.min_strobe_frequency();
-            fixture_info.strobe_dmx_offset = fixture_type.strobe_dmx_offset();
             fixture_info.position = fixture.position();
             fixture_info.rotation = fixture.rotation();
-            fixture_info.channel_defs = fixture_type.channel_defs().clone();
-            fixture_info.movement = *fixture_type.movement();
-            fixture_info.rig = fixture_type.rig().map(str::to_string);
-            fixture_info.aim = fixture_type.aim();
-            fixture_info.cells = fixture_type.cells().to_vec();
+            fixture_info.beam_angle = fixture.beam_angle();
 
             fixture_infos.push(fixture_info);
         }
@@ -773,6 +1476,7 @@ impl LightingSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::lighting::Directories;
     use std::collections::HashMap;
 
     #[test]
@@ -854,7 +1558,7 @@ mod tests {
         .unwrap();
         let mut system = LightingSystem::new();
         system
-            .load_fixture_types_directory(dir.path(), dir.path())
+            .load_fixture_types_directory(dir.path())
             .expect("directory loads");
         assert!(system.fixture_types.contains_key("Mover"));
         assert!(
@@ -877,7 +1581,7 @@ mod tests {
         .unwrap();
         let mut system = LightingSystem::new();
         system
-            .load_fixture_types_directory(dir.path(), dir.path())
+            .load_fixture_types_directory(dir.path())
             .expect("directory loads");
         assert!(system.fixture_types.contains_key("Bar"));
         assert!(
@@ -916,26 +1620,25 @@ mod tests {
         }
         std::fs::write(
             ft_dir.join("movers.fixture"),
-            "fixture_type \"Plain\"\n  from gdtf(\"lighting/library/plain.gdtf\", mode \"Mover 16bit\")\n{ }\n\n\
-             fixture_type \"Yawed\"\n  from gdtf(\"lighting/library/yawed.gdtf\", mode \"Mover 16bit\")\n{ }\n",
+            "fixture_type \"Plain\"\n  from gdtf(\"lighting/library/plain.gdtf\")\n{ }\n\n\
+             fixture_type \"Yawed\"\n  from gdtf(\"lighting/library/yawed.gdtf\")\n{ }\n",
         )
         .expect("write fixture");
 
         let mut system = LightingSystem::new();
-        system
-            .load_fixture_types_directory(&ft_dir, base)
-            .expect("loads");
-        let plain = system.fixture_types["Plain"]
-            .aim()
-            .expect("a rig gives a calibration");
+        system.load_fixture_types_directory(&ft_dir).expect("loads");
+        let expand = |name: &str| {
+            LightingSystem::expand_mode(name, &system.referential[name], "Mover 16bit", base)
+                .expect("expands")
+                .0
+        };
+        let plain = expand("Plain").aim().expect("a rig gives a calibration");
         assert!(plain.frame_is_identity(), "{plain:?}");
         assert!(
             (plain.tilt_to_lens[2] + 0.06).abs() < 1e-9,
             "the lens offset comes with it: {plain:?}"
         );
-        let yawed = system.fixture_types["Yawed"]
-            .aim()
-            .expect("a rig gives a calibration");
+        let yawed = expand("Yawed").aim().expect("a rig gives a calibration");
         assert!(!yawed.frame_is_identity(), "{yawed:?}");
         assert!((yawed.pre[1][0] - 1.0).abs() < 1e-6, "{yawed:?}");
     }
@@ -950,32 +1653,36 @@ mod tests {
         std::fs::create_dir_all(&ft_dir).expect("mkdir");
         std::fs::write(
             library.join("synth.gdtf"),
-            crate::lighting::gdtf::build_zip(&[(
-                "description.xml",
-                crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.as_bytes(),
-            )]),
+            crate::testutil::lighting::synthetic_gdtf(),
         )
         .expect("write gdtf");
         std::fs::write(
             ft_dir.join("brick.fixture"),
-            "fixture_type \"Brick\"\n  from gdtf(\"lighting/library/synth.gdtf\", mode \"8: RGBS\")\n{\n  movement { max_pan_speed: 240.0deg/s }\n}\n",
+            "fixture_type \"Brick\"\n  from gdtf(\"lighting/library/synth.gdtf\")\n{\n  movement { max_pan_speed: 240.0deg/s }\n}\n",
         )
         .expect("write fixture");
 
         let mut system = LightingSystem::new();
-        system
-            .load_fixture_types_directory(&ft_dir, base)
-            .expect("loads");
+        system.load_fixture_types_directory(&ft_dir).expect("loads");
 
-        let brick = system.fixture_types.get("Brick").expect("expanded");
+        assert!(
+            !system.fixture_types.contains_key("Brick"),
+            "a GDTF fixture type is a declaration; only a mode has channels"
+        );
+        let expand = |system: &LightingSystem| {
+            LightingSystem::expand_mode("Brick", &system.referential["Brick"], "8: RGBS", base)
+                .expect("expands")
+                .0
+        };
+        let brick = expand(&system);
         assert_eq!(brick.channels().get("red"), Some(&1));
         assert_eq!(brick.channels().get("strobe"), Some(&4));
         assert_eq!(brick.strobe_dmx_offset(), Some(7));
         assert_eq!(brick.max_strobe_frequency(), Some(25.0));
         assert_eq!(brick.movement().max_pan_speed, Some(240.0));
         assert_eq!(
-            brick.source().map(|s| s.mode.as_str()),
-            Some("8: RGBS"),
+            brick.source().map(|s| s.path.as_str()),
+            Some("lighting/library/synth.gdtf"),
             "the expansion keeps its provenance"
         );
 
@@ -990,19 +1697,781 @@ mod tests {
                 .count()
         };
         assert_eq!(expansions(), 1);
-        let rig = system.fixture_types["Brick"]
-            .rig()
-            .expect("a referential type gets a rig");
+        let rig = brick.rig().expect("a referential type gets a rig");
         assert!(base.join("lighting/.cache/assets").join(rig).is_file());
 
         // A reload with the same inputs resolves to the same single entry.
         let mut reloaded = LightingSystem::new();
         reloaded
-            .load_fixture_types_directory(&ft_dir, base)
+            .load_fixture_types_directory(&ft_dir)
             .expect("loads");
-        assert!(reloaded.fixture_types.contains_key("Brick"));
+        let again = expand(&reloaded);
         assert_eq!(expansions(), 1);
-        assert_eq!(reloaded.fixture_types["Brick"].rig(), Some(rig));
+        assert_eq!(again.rig(), Some(rig));
+    }
+
+    /// A project with the synthetic two-mode GDTF ("8: RGBS": red, green,
+    /// blue, strobe; "Mover 16bit": pan, tilt, a fifth byte), `types` as its
+    /// fixture types file and `venues` as its venues file, loaded with
+    /// `current` as the current venue.
+    fn modal_project(
+        types: &str,
+        venues: &str,
+        current: &str,
+    ) -> (tempfile::TempDir, LightingSystem) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        for sub in [
+            "lighting/library",
+            "lighting/fixture_types",
+            "lighting/venues",
+        ] {
+            std::fs::create_dir_all(base.join(sub)).expect("mkdir");
+        }
+        std::fs::write(
+            base.join("lighting/library/synth.gdtf"),
+            crate::testutil::lighting::synthetic_gdtf(),
+        )
+        .expect("write gdtf");
+        std::fs::write(base.join("lighting/fixture_types/types.fixture"), types).expect("write");
+        std::fs::write(base.join("lighting/venues/house.venue"), venues).expect("write");
+        let config = Lighting::new(
+            Some(current.to_string()),
+            None,
+            Some(crate::config::lighting::Directories::new(
+                Some("lighting/fixture_types".to_string()),
+                Some("lighting/venues".to_string()),
+            )),
+        );
+        let mut system = LightingSystem::new();
+        system.load(&config, base).expect("loads");
+        (dir, system)
+    }
+
+    const BRICK_TYPE: &str = "fixture_type \"Brick\"\n  from gdtf(\"lighting/library/synth.gdtf\")\n{\n  movement { max_pan_speed: 240deg/s }\n}\n\nfixture_type \"Par\" {\n  channels: 1\n  channel_map: { \"dimmer\": 1 }\n}\n";
+
+    fn info<'a>(
+        infos: &'a [crate::lighting::effects::FixtureInfo],
+        name: &str,
+    ) -> &'a crate::lighting::effects::FixtureInfo {
+        infos.iter().find(|f| f.name == name).expect(name)
+    }
+
+    #[test]
+    fn two_fixtures_of_one_type_in_two_modes_get_their_own_channels() {
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n  fixture \"Spot\" Brick mode \"Mover 16bit\" @ 1:10\n  fixture \"Same\" Brick mode \"8: RGBS\" @ 1:20\n}\n",
+            "house",
+        );
+        let infos = system.get_current_venue_fixtures().expect("venue resolves");
+        let wash = info(&infos, "Wash");
+        assert_eq!(wash.channels.get("red"), Some(&1), "its own mode");
+        assert!(!wash.channels.contains_key("pan"));
+        let spot = info(&infos, "Spot");
+        assert_eq!(spot.channels.get("pan"), Some(&1), "its own mode");
+        assert_eq!(spot.channel_defs["pan"].fine, Some(2));
+        assert!(!spot.channels.contains_key("red"));
+        assert_eq!(spot.fixture_type, "Brick", "still the one type");
+        // The type's body applies to every mode.
+        assert_eq!(spot.movement.max_pan_speed, Some(240.0));
+        // One mode, one expansion, whoever names it.
+        assert_eq!(info(&infos, "Same").channels, wash.channels);
+        assert!(system
+            .fixture_problem("house", &system.venues["house"].fixtures()["Spot"])
+            .is_none());
+        // With no fixture in hand, the type is a declaration: no channels.
+        assert!(!system.fixture_types.contains_key("Brick"));
+        assert!(system.gdtf_types_iter().any(|(name, _)| name == "Brick"));
+    }
+
+    #[test]
+    fn a_gdtf_fixture_without_a_mode_is_a_load_error_listing_the_modes() {
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Spot\" Brick mode \"Mover 16bit\" @ 1:1\n}\n\nvenue \"bare\" {\n  fixture \"Lost\" Brick @ 1:1\n}\n",
+            "house",
+        );
+        let infos = system
+            .get_current_venue_fixtures()
+            .expect("named modes load");
+        assert_eq!(info(&infos, "Spot").channels.get("tilt"), Some(&3));
+        assert_eq!(
+            system.fixture_type_problem("Brick"),
+            None,
+            "the type loaded"
+        );
+
+        let lost = &system.venues["bare"].fixtures()["Lost"];
+        let problem = system.fixture_problem("bare", lost).expect("no mode");
+        assert!(
+            problem.starts_with(
+                "fixture \"Lost\" of \"Brick\" names no mode; every fixture of a GDTF \
+                 fixture states its mode — add `mode \"...\"` to its venue line, one of: \
+                 \"8: RGBS\", \"Mover 16bit\""
+            ),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("house.venue"),
+            "names the venue file: {problem}"
+        );
+    }
+
+    #[test]
+    fn a_long_mode_list_is_capped_in_the_error() {
+        let modes: String = (1..=12)
+            .map(|n| {
+                format!(
+                    r#"<DMXMode Name="M{n:02}" Geometry="Base"><DMXChannels><DMXChannel Offset="1" Geometry="Base"><LogicalChannel Attribute="Dimmer"><ChannelFunction Name="Dimmer" Attribute="Dimmer" DMXFrom="0/1"/></LogicalChannel></DMXChannel></DMXChannels></DMXMode>"#
+                )
+            })
+            .collect();
+        let description = crate::lighting::gdtf::SYNTHETIC_DESCRIPTION
+            .replace("<DMXModes>", &format!("<DMXModes>{modes}"));
+        assert_ne!(description, crate::lighting::gdtf::SYNTHETIC_DESCRIPTION);
+        let (dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Lost\" Brick @ 1:1\n}\n",
+            "house",
+        );
+        std::fs::write(
+            dir.path().join("lighting/library/synth.gdtf"),
+            crate::lighting::gdtf::build_zip(&[("description.xml", description.as_bytes())]),
+        )
+        .unwrap();
+        // The modes are read once per types load; a changed archive is a
+        // types reload.
+        system.reload_fixture_types().unwrap();
+        let err = system.get_current_venue_fixtures().unwrap_err().to_string();
+        assert!(
+            err.ends_with(
+                "one of: \"M01\", \"M02\", \"M03\", \"M04\", \"M05\", \"M06\", \"M07\", \
+                 \"M08\" and 6 more"
+            ),
+            "{err}"
+        );
+    }
+
+    /// A project as it stands once the shows are migrated: a record naming
+    /// the archive (a custom name, movement limits, no mode), a hand-written
+    /// type beside it, and venue lines that each state a mode. It loads as
+    /// it did before the default went away.
+    #[test]
+    fn a_migrated_production_project_loads_as_before() {
+        let (_dir, system) = modal_project(
+            "fixture_type \"Custom-Name\"\n  from gdtf(\"lighting/library/synth.gdtf\")\n{\n  \
+             movement { max_pan_speed: 240deg/s }\n}\n\nfixture_type \"Par\" {\n  channels: 1\n  \
+             channel_map: { \"dimmer\": 1 }\n}\n",
+            "venue \"house\" {\n  fixture \"Wash 1\" \"Custom-Name\" mode \"8: RGBS\" @ 1:1\n  \
+             fixture \"Wash 2\" \"Custom-Name\" mode \"8: RGBS\" @ 1:5\n  \
+             fixture \"Spot\" \"Custom-Name\" mode \"Mover 16bit\" @ 1:9\n  \
+             fixture \"Dim\" Par @ 1:20\n}\n",
+            "house",
+        );
+        let infos = system.get_current_venue_fixtures().expect("loads");
+        assert_eq!(infos.len(), 4);
+        assert_eq!(info(&infos, "Wash 2").channels.get("red"), Some(&1));
+        assert_eq!(info(&infos, "Wash 2").fixture_type, "Custom-Name");
+        assert_eq!(info(&infos, "Spot").channels.get("pan"), Some(&1));
+        assert_eq!(info(&infos, "Spot").movement.max_pan_speed, Some(240.0));
+        assert_eq!(info(&infos, "Dim").channels.get("dimmer"), Some(&1));
+        assert!(
+            !system
+                .gdtf_types_iter()
+                .any(|(name, _)| name == "Synth Brick"),
+            "a recorded archive is not a second fixture type"
+        );
+        assert!(system.current_venue_report().is_empty());
+        assert!(system.library_findings().is_empty());
+    }
+
+    /// A first-run project: the Lighting area's files in the default
+    /// directories, and a config naming a current venue but no directories.
+    fn first_run_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        for sub in [
+            "lighting/library",
+            "lighting/fixture_types",
+            "lighting/venues",
+        ] {
+            std::fs::create_dir_all(base.join(sub)).expect("mkdir");
+        }
+        std::fs::write(
+            base.join("lighting/library/synth.gdtf"),
+            crate::testutil::lighting::synthetic_gdtf(),
+        )
+        .expect("write gdtf");
+        std::fs::write(
+            base.join("lighting/fixture_types/par.light"),
+            "fixture_type \"Par\" {\n  channels: 1\n  channel_map: { \"dimmer\": 1 }\n}\n",
+        )
+        .expect("write");
+        std::fs::write(
+            base.join("lighting/venues/rig.light"),
+            "venue \"rig\" {\n  fixture \"Dim\" Par @ 1:1\n  \
+             fixture \"Brick\" \"Synth Brick\" mode \"8: RGBS\" @ 1:10\n}\n",
+        )
+        .expect("write");
+        dir
+    }
+
+    fn load_with(base: &Path, directories: Option<Directories>) -> LightingSystem {
+        let config = Lighting::new(Some("rig".to_string()), None, directories);
+        let mut system = LightingSystem::new();
+        system.load(&config, base).expect("loads");
+        system
+    }
+
+    #[test]
+    fn a_config_without_directories_loads_the_default_ones() {
+        // The hardware repro: `current_venue: rig`, no `directories`, and the
+        // files where the web UI writes them. It used to be "Venue 'rig' not
+        // found".
+        let dir = first_run_project();
+        let system = load_with(dir.path(), None);
+        let infos = system
+            .get_current_venue_fixtures()
+            .expect("the venue registers");
+        assert_eq!(infos.len(), 2);
+        assert_eq!(info(&infos, "Dim").channels.get("dimmer"), Some(&1));
+        // The GDTF from the library, in the mode its line names.
+        assert_eq!(info(&infos, "Brick").channels.get("red"), Some(&1));
+        assert_eq!(system.venues_dir(), Some("lighting/venues"));
+        assert!(system.current_venue_report().is_empty());
+    }
+
+    #[test]
+    fn naming_one_directory_leaves_the_other_at_its_default() {
+        let dir = first_run_project();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("stages")).unwrap();
+        std::fs::rename(
+            base.join("lighting/venues/rig.light"),
+            base.join("stages/rig.light"),
+        )
+        .unwrap();
+        let system = load_with(
+            base,
+            Some(Directories::new(None, Some("stages".to_string()))),
+        );
+        // Par comes from the default fixture types directory.
+        assert_eq!(system.get_current_venue_fixtures().unwrap().len(), 2);
+        assert_eq!(system.venues_dir(), Some("stages"));
+    }
+
+    #[test]
+    fn a_missing_default_directory_is_silently_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Lighting::new(None, None, None);
+        let mut system = LightingSystem::new();
+        system
+            .load(&config, dir.path())
+            .expect("a project without lighting loads");
+        assert_eq!(system.venues_iter().count(), 0);
+        assert_eq!(system.fixture_types_iter().count(), 0);
+        assert!(system.fixture_type_file_errors.is_empty());
+        assert!(system.library_findings().is_empty());
+    }
+
+    /// A tree with every shape the loader meets: nested files, a name two
+    /// files declare, files declaring several blocks, files that do not
+    /// parse, rich syntax in a `.light` file, a file with no blocks of its
+    /// kind and a library archive.
+    fn mixed_tree() -> tempfile::TempDir {
+        let dir = first_run_project();
+        let base = dir.path();
+        let files: &[(&str, &str)] = &[
+            (
+                "lighting/fixture_types/rig/b.fixture",
+                "fixture_type \"Wash\" {\n  channels: 2\n  channel_map: { \"dimmer\": 1, \"red\": 2 }\n}\n\
+                 fixture_type \"Spot\" {\n  channels: 1\n  channel_map: { \"dimmer\": 1 }\n}\n",
+            ),
+            (
+                "lighting/fixture_types/rig/old/par.light",
+                "fixture_type \"Par\" {\n  channels: 3\n  channel_map: { \"dimmer\": 1 }\n}\n",
+            ),
+            ("lighting/fixture_types/broken.light", "fixture_type {"),
+            (
+                "lighting/fixture_types/Club (Main).light",
+                "fixture_type \"Stray\" {\n  channel \"pan\" @ 1 fine 2\n}\n",
+            ),
+            (
+                "lighting/venues/tour/club.light",
+                "venue \"club\" {\n  fixture \"W\" Wash @ 1:1\n}\n\
+                 venue \"bar\" {\n  fixture \"S\" Spot @ 1:1\n  fixture \"X\" Stray @ 1:5\n}\n",
+            ),
+            (
+                "lighting/venues/tour/old/rig.light",
+                "venue \"rig\" {\n  fixture \"Other\" Par @ 2:1\n}\n",
+            ),
+            ("lighting/venues/broken.venue", "venue {"),
+            (
+                "lighting/venues/legacy.light",
+                "venue \"old\" {\n  fixture \"W1\" Par @ 1:1\n  group \"wash\" [\"W1\"]\n}\n",
+            ),
+            ("lighting/venues/empty.venue", ""),
+        ];
+        for (rel, text) in files {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    /// What a load gives, as text: every venue with its file and fixtures,
+    /// every type with its file, the problems and the current venue's report.
+    fn load_summary(system: &LightingSystem, base: &Path) -> Vec<String> {
+        let rel = |p: &str| p.replace(&format!("{}/", base.display()), "");
+        let mut out = Vec::new();
+        let mut venues: Vec<_> = system.venues_iter().collect();
+        venues.sort_by_key(|(name, _)| name.as_str());
+        for (name, venue) in venues {
+            let mut fixtures: Vec<String> = venue
+                .fixtures()
+                .values()
+                .map(|f| format!("{}:{}", f.name(), f.fixture_type()))
+                .collect();
+            fixtures.sort();
+            out.push(format!(
+                "venue {name} in {} [{}] problems {:?}",
+                rel(&system.venue_file_display(name)),
+                fixtures.join(", "),
+                system.venue_problems(name)
+            ));
+        }
+        let mut types: Vec<_> = system.fixture_types_iter().collect();
+        types.sort_by_key(|(name, _)| name.as_str());
+        for (name, fixture_type) in types {
+            out.push(format!(
+                "type {name} in {} channels {}",
+                rel(&system.fixture_type_files[name].display().to_string()),
+                fixture_type.channels().len()
+            ));
+        }
+        let mut gdtf: Vec<_> = system.gdtf_types_iter().map(|(n, _)| n.clone()).collect();
+        gdtf.sort();
+        for name in gdtf {
+            out.push(format!(
+                "gdtf {name} in {}",
+                rel(&system.fixture_type_files[&name].display().to_string())
+            ));
+        }
+        let mut errors: Vec<_> = system.fixture_type_errors.iter().collect();
+        errors.sort();
+        for (name, error) in errors {
+            out.push(format!("type error {name}: {error}"));
+        }
+        for error in &system.fixture_type_file_errors {
+            out.push(format!("type file error {error}"));
+        }
+        for name in ["Stray", "Missing"] {
+            out.push(format!(
+                "problem {name}: {:?}",
+                system.fixture_type_problem(name)
+            ));
+        }
+        for line in system.current_venue_report() {
+            out.push(format!("report {line}"));
+        }
+        out.into_iter().map(|line| rel(&line)).collect()
+    }
+
+    #[test]
+    fn a_mixed_tree_loads_as_on_main() {
+        let dir = mixed_tree();
+        let system = load_with(dir.path(), None);
+        // Captured from main (54f9718b) before the owner record went in:
+        // what loads, from where, and the problems, are as they were.
+        let main: &[&str] = &[
+            "venue bar in lighting/venues/tour/club.light [S:Spot, X:Stray] problems [(\"X\", \"Fixture type 'Stray' not found for fixture \\\"X\\\": rich channel syntax belongs in a .fixture file, not a .light file (venue \\\"bar\\\", lighting/venues/tour/club.light)\")]",
+            "venue club in lighting/venues/tour/club.light [W:Wash] problems []",
+            "venue rig in lighting/venues/rig.light [Brick:Synth Brick, Dim:Par] problems []",
+            "type Par in lighting/fixture_types/par.light channels 1",
+            "type Spot in lighting/fixture_types/rig/b.fixture channels 1",
+            "type Wash in lighting/fixture_types/rig/b.fixture channels 2",
+            "gdtf Synth Brick in lighting/library/synth.gdtf",
+            "type error Stray: rich channel syntax belongs in a .fixture file, not a .light file",
+            "type file error broken.light: Fixture types DSL parsing error at line 1, column 14: expected fixture_type_name\n\nContent around error:\n   1 | fixture_type {\n     |              ^",
+            "type file error rig/old/par.light: fixture type \"Par\" is defined in both par.light and rig/old/par.light",
+            "problem Stray: Some(\"rich channel syntax belongs in a .fixture file, not a .light file\")",
+            "problem Missing: Some(\"no fixture type named 'Missing' is defined; fixture type files that failed to parse: broken.light: Fixture types DSL parsing error at line 1, column 14: expected fixture_type_name\\n\\nContent around error:\\n   1 | fixture_type {\\n     |              ^; rig/old/par.light: fixture type \\\"Par\\\" is defined in both par.light and rig/old/par.light\")",
+        ];
+        assert_eq!(load_summary(&system, dir.path()), main);
+    }
+
+    #[test]
+    fn a_mixed_tree_keeps_its_venue_problems_as_type_problems_are_kept() {
+        let dir = mixed_tree();
+        let mut system = load_with(dir.path(), None);
+        let errors = system.venue_file_errors().to_vec();
+        assert_eq!(errors.len(), 3, "{errors:#?}");
+        assert!(errors[0].starts_with("broken.venue: "), "{errors:#?}");
+        assert!(errors[1].starts_with("legacy.light: "), "{errors:#?}");
+        assert_eq!(
+            errors[2],
+            "tour/old/rig.light: venue \"rig\" is defined in both rig.light and tour/old/rig.light"
+        );
+        // A reload reads them again rather than adding to them.
+        system.reload_venues().unwrap();
+        assert_eq!(system.venue_file_errors(), errors);
+        system.reload_fixture_types().unwrap();
+        assert_eq!(system.venue_file_errors(), errors);
+        assert_eq!(system.fixture_type_file_errors().len(), 2);
+    }
+
+    #[test]
+    fn a_mixed_tree_records_each_name_s_owner() {
+        use files::{Editable, Kind, ReadOnly};
+        let dir = mixed_tree();
+        let base = dir.path();
+        let mut system = load_with(base, None);
+        let venues = base.join("lighting/venues");
+        let types = base.join("lighting/fixture_types");
+        let owner = |system: &LightingSystem, kind, name| system.owner(kind, name).unwrap();
+
+        let rig = owner(&system, Kind::Venue, "rig");
+        assert_eq!(rig.path, venues.join("rig.light"));
+        assert_eq!(
+            rig.editable,
+            Editable::ReadOnly(ReadOnly::Duplicate {
+                files: vec![venues.join("rig.light"), venues.join("tour/old/rig.light")],
+            })
+        );
+        assert_eq!(
+            owner(&system, Kind::Venue, "bar").editable,
+            Editable::ReadOnly(ReadOnly::Shared {
+                others: vec!["club".to_string()],
+            })
+        );
+        // A venue in a file that does not parse has no owner: the file is
+        // listed, not searched.
+        assert_eq!(system.owner(Kind::Venue, "old"), None);
+        let unparseable: Vec<_> = system
+            .owners(Kind::Venue)
+            .into_iter()
+            .filter(|l| l.name.is_none())
+            .map(|l| l.owner.path)
+            .collect();
+        assert_eq!(
+            unparseable,
+            [venues.join("broken.venue"), venues.join("legacy.light")]
+        );
+
+        // A type that did not load (rich syntax in .light) is still its
+        // file's; a library-only GDTF type is no file's.
+        let stray = owner(&system, Kind::FixtureType, "Stray");
+        assert_eq!(stray.path, types.join("Club (Main).light"));
+        assert_eq!(stray.editable, Editable::Editable);
+        assert_eq!(system.owner(Kind::FixtureType, "Synth Brick"), None);
+        assert_eq!(
+            owner(&system, Kind::FixtureType, "Wash").editable,
+            Editable::ReadOnly(ReadOnly::Shared {
+                others: vec!["Spot".to_string()],
+            })
+        );
+
+        // A reload records the files as they are now.
+        std::fs::remove_file(venues.join("tour/old/rig.light")).unwrap();
+        std::fs::remove_file(types.join("rig/old/par.light")).unwrap();
+        system.reload_fixture_types().unwrap();
+        assert_eq!(
+            owner(&system, Kind::Venue, "rig").editable,
+            Editable::Editable
+        );
+        assert_eq!(
+            owner(&system, Kind::FixtureType, "Par").editable,
+            Editable::Editable
+        );
+    }
+
+    #[test]
+    fn a_missing_configured_directory_reports_as_before() {
+        // Before defaults, a configured directory that was not there loaded
+        // as empty, kept as the venues directory, and the current venue was
+        // the one not found: still so.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let system = load_with(
+            dir.path(),
+            Some(Directories::new(
+                Some("nowhere/types".to_string()),
+                Some("nowhere/venues".to_string()),
+            )),
+        );
+        assert_eq!(system.venues_iter().count(), 0);
+        assert_eq!(system.venues_dir(), Some("nowhere/venues"));
+        let err = system.get_current_venue_fixtures().unwrap_err();
+        assert!(err.to_string().contains("Venue 'rig' not found"), "{err}");
+    }
+
+    #[test]
+    fn reloads_read_the_default_directories_too() {
+        let dir = first_run_project();
+        let mut system = load_with(dir.path(), None);
+        std::fs::write(
+            dir.path().join("lighting/venues/rig.light"),
+            "venue \"rig\" {\n  fixture \"Dim\" Par @ 1:1\n}\n",
+        )
+        .unwrap();
+        system.reload_venues().expect("reloads venues");
+        assert_eq!(system.get_current_venue_fixtures().unwrap().len(), 1);
+        system.reload_fixture_types().expect("reloads types");
+        assert_eq!(system.get_current_venue_fixtures().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_mode_on_a_native_type_is_a_load_error_not_ignored() {
+        let (_dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Dim\" Par mode \"8: RGBS\" @ 1:1\n}\n",
+            "house",
+        );
+        let dim = &system.venues["house"].fixtures()["Dim"];
+        let problem = system.fixture_problem("house", dim).expect("refused");
+        assert!(
+            problem.starts_with(
+                "fixture \"Dim\" names mode \"8: RGBS\", but fixture type \"Par\" (in \
+                 types.fixture) is not GDTF-sourced and has no modes"
+            ),
+            "{problem}"
+        );
+        // It fails the venue the way a missing type does.
+        let err = system.get_current_venue_fixtures().unwrap_err().to_string();
+        assert!(err.contains("fixture \"Dim\" names mode"), "{err}");
+        system.current_venue = Some("nowhere".to_string());
+        assert!(system.get_current_venue_fixtures().is_err());
+    }
+
+    #[test]
+    fn a_mode_that_does_not_match_fails_its_venue_by_name() {
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n  fixture \"Typo\" Brick mode \"Mover 61bit\" @ 1:10\n}\n",
+            "house",
+        );
+        let err = system.get_current_venue_fixtures().unwrap_err().to_string();
+        assert!(
+            err.starts_with(
+                "fixture \"Typo\": mode \"Mover 61bit\" of fixture type \"Brick\" did not load:"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("no mode matching"), "{err}");
+        // The type is untouched, and the overlap check skips the unknown.
+        assert_eq!(system.fixture_type_problem("Brick"), None);
+        assert!(system.current_venue_overlaps().is_empty());
+    }
+
+    #[test]
+    fn a_drifted_mode_name_loads_with_a_warning() {
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Spot\" Brick mode \"mover 16BIT\" @ 1:1\n}\n",
+            "house",
+        );
+        let infos = system
+            .get_current_venue_fixtures()
+            .expect("normalized match loads");
+        assert_eq!(info(&infos, "Spot").channels.get("pan"), Some(&1));
+        let note = system
+            .mode_warning("Brick", "mover 16BIT")
+            .expect("the normalization is reported");
+        assert!(note.contains("only after normalizing"), "{note}");
+        assert!(system.mode_warning("Brick", "8: RGBS").is_none());
+    }
+
+    #[test]
+    fn every_venue_is_expanded_so_a_switch_parses_nothing() {
+        let (dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n}\n\nvenue \"club\" {\n  fixture \"Spot\" Brick mode \"Mover 16bit\" @ 1:1\n}\n",
+            "house",
+        );
+        assert!(system
+            .mode_expansions
+            .contains_key(&("Brick".to_string(), "Mover 16bit".to_string())));
+        // With the archive gone, the other venue still resolves: its mode
+        // was expanded at load, not on the switch.
+        std::fs::remove_file(dir.path().join("lighting/library/synth.gdtf")).unwrap();
+        system.current_venue = Some("club".to_string());
+        let infos = system
+            .get_current_venue_fixtures()
+            .expect("already expanded");
+        assert_eq!(info(&infos, "Spot").channels.get("pan"), Some(&1));
+    }
+
+    #[test]
+    fn a_venue_reload_expands_a_newly_named_mode_and_drops_unused_ones() {
+        let (dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n}\n",
+            "house",
+        );
+        let expanded = |system: &LightingSystem| {
+            let mut modes: Vec<String> = system
+                .mode_expansions
+                .keys()
+                .map(|(_, mode)| mode.clone())
+                .collect();
+            modes.sort();
+            modes
+        };
+        assert_eq!(expanded(&system), ["8: RGBS"]);
+        std::fs::write(
+            dir.path().join("lighting/venues/house.venue"),
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"Mover 16bit\" @ 1:1\n}\n",
+        )
+        .unwrap();
+        system.reload_venues().unwrap();
+        let infos = system.get_current_venue_fixtures().expect("re-moded");
+        assert_eq!(info(&infos, "Wash").channels.get("pan"), Some(&1));
+        std::fs::write(
+            dir.path().join("lighting/venues/house.venue"),
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n}\n",
+        )
+        .unwrap();
+        system.reload_venues().unwrap();
+        assert_eq!(expanded(&system), ["8: RGBS"], "the mover mode is dropped");
+    }
+
+    #[test]
+    fn a_type_edit_reaches_the_system_through_a_types_reload() {
+        let (dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n}\n",
+            "house",
+        );
+        // Renamed, and the venue line follows (re-moded on the way): what
+        // the fixture page's settings save and the venue editor write.
+        std::fs::write(
+            dir.path().join("lighting/fixture_types/types.fixture"),
+            BRICK_TYPE.replace("\"Brick\"", "\"Pixel\""),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("lighting/venues/house.venue"),
+            "venue \"house\" {\n  fixture \"Wash\" Pixel mode \"Mover 16bit\" @ 1:1\n}\n",
+        )
+        .unwrap();
+        system.reload_fixture_types().unwrap();
+        system.reload_venues().unwrap();
+        assert!(system.fixture_type_problem("Brick").is_some());
+        let infos = system
+            .get_current_venue_fixtures()
+            .expect("the renamed type loads");
+        assert_eq!(info(&infos, "Wash").channels.get("pan"), Some(&1));
+    }
+
+    #[test]
+    fn a_fixture_s_footprint_is_its_own_mode_s() {
+        // The mover mode is five bytes; "8: RGBS" four. Re-moding Spot
+        // grows it into Wash's first address — the line's patch unchanged.
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Spot\" Brick mode \"8: RGBS\" @ 1:1\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:5\n}\n",
+            "house",
+        );
+        assert!(system.current_venue_overlaps().is_empty());
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Spot\" Brick mode \"Mover 16bit\" @ 1:1\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:5\n}\n",
+            "house",
+        );
+        let spans = system.patch_spans(&system.venues["house"]);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.fixture.as_str(), s.footprint))
+                .collect::<Vec<_>>(),
+            [("Spot", 5), ("Wash", 4)]
+        );
+        let overlaps = system.current_venue_overlaps();
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!((overlaps[0].from, overlaps[0].to), (5, 5));
+        assert_eq!(
+            (overlaps[0].first.as_str(), overlaps[0].second.as_str()),
+            ("Spot", "Wash")
+        );
+    }
+
+    #[test]
+    fn a_plain_project_has_nothing_to_report() {
+        // Every GDTF line states its mode, no overlaps (two pars ganged at one address
+        // are deliberate): nothing new is logged or reported.
+        let (_dir, system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n  fixture \"Dim1\" Par @ 1:20\n  \
+             fixture \"Dim2\" Par @ 1:20\n}\n",
+            "house",
+        );
+        assert!(system.venue_problems("house").is_empty());
+        assert!(system.venue_problem("house").is_none());
+        assert!(system.current_venue_overlaps().is_empty());
+        assert!(system.current_venue_overruns().is_empty());
+        assert!(system.current_venue_report().is_empty());
+        assert_eq!(system.logged_venue_report, Some(Vec::new()));
+    }
+
+    #[test]
+    fn only_the_current_venue_is_reported_one_line_per_kind() {
+        let (dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"A\" Par mode \"x\" @ 1:1\n  fixture \"B\" Par mode \"x\" @ 1:2\n  \
+             fixture \"C\" Par mode \"x\" @ 1:3\n  fixture \"D\" Par mode \"x\" @ 1:4\n  \
+             fixture \"Spot\" Brick mode \"Mover 16bit\" @ 1:10\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:14\n  \
+             fixture \"End\" Brick mode \"8: RGBS\" @ 1:511\n}\n\nvenue \"other\" {\n  fixture \"Z\" Nope @ 1:1\n}\n",
+            "house",
+        );
+        let lines = system.current_venue_report();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].starts_with("4 fixture(s) cannot be driven, so the venue will not light: \"A\", \"B\", \"C\" and 1 more; first: fixture \"A\" names mode"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].starts_with("1 patch overlap(s)"), "{}", lines[1]);
+        assert!(lines[2].contains("\"End\""), "{}", lines[2]);
+        assert!(!lines.iter().any(|l| l.contains("\"Z\"")), "other venue");
+        // The other venue's problem is there for whoever asks.
+        assert_eq!(system.venue_problem("other").unwrap().0, "Z");
+        assert_eq!(system.venue_problem("house").unwrap().0, "A");
+
+        // An unchanged reload does not change what was logged.
+        let logged = system.logged_venue_report.clone();
+        system.reload_venues().unwrap();
+        assert_eq!(system.logged_venue_report, logged);
+        let _ = dir;
+    }
+
+    #[test]
+    fn a_mode_that_failed_is_retried_on_the_next_reload() {
+        let (dir, mut system) = modal_project(
+            BRICK_TYPE,
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"8: RGBS\" @ 1:1\n}\n",
+            "house",
+        );
+        // The archive goes missing just as a fixture is re-moded.
+        let archive = dir.path().join("lighting/library/synth.gdtf");
+        let bytes = std::fs::read(&archive).unwrap();
+        std::fs::remove_file(&archive).unwrap();
+        std::fs::write(
+            dir.path().join("lighting/venues/house.venue"),
+            "venue \"house\" {\n  fixture \"Wash\" Brick mode \"Mover 16bit\" @ 1:1\n}\n",
+        )
+        .unwrap();
+        system.reload_venues().unwrap();
+        assert!(system.get_current_venue_fixtures().is_err());
+        assert!(system.venue_problem("house").is_some());
+
+        // It comes back; the next reload tries again and resolves.
+        std::fs::write(&archive, bytes).unwrap();
+        system.reload_venues().unwrap();
+        let infos = system.get_current_venue_fixtures().expect("retried");
+        assert_eq!(info(&infos, "Wash").channels.get("pan"), Some(&1));
+        assert!(system.mode_errors.is_empty());
+        assert!(system.venue_problem("house").is_none());
     }
 
     #[test]
@@ -1013,19 +2482,45 @@ mod tests {
         std::fs::create_dir_all(&ft_dir).expect("mkdir");
         std::fs::write(
             ft_dir.join("mixed.fixture"),
-            "fixture_type \"Ghost\"\n  from gdtf(\"lighting/library/missing.gdtf\", mode \"X\")\n{ }\n\nfixture_type \"Par\" {\n  channels: 1\n  channel_map: { \"dimmer\": 1 }\n}\n",
+            "fixture_type \"Ghost\"\n  from gdtf(\"lighting/library/missing.gdtf\")\n{ }\n\nfixture_type \"Par\" {\n  channels: 1\n  channel_map: { \"dimmer\": 1 }\n}\n",
         )
         .expect("write");
 
         let mut system = LightingSystem::new();
-        system
-            .load_fixture_types_directory(&ft_dir, base)
-            .expect("loads");
+        system.load_fixture_types_directory(&ft_dir).expect("loads");
         assert!(
             !system.fixture_types.contains_key("Ghost"),
             "a failed expansion must not register an empty shell"
         );
         assert!(system.fixture_types.contains_key("Par"));
+    }
+
+    #[test]
+    fn a_type_that_did_not_load_says_why() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        let ft_dir = base.join("lighting/fixture_types");
+        std::fs::create_dir_all(&ft_dir).expect("mkdir");
+        std::fs::write(
+            ft_dir.join("mixed.fixture"),
+            "fixture_type \"Ghost\"\n  from gdtf(\"lighting/library/missing.gdtf\")\n{ }\n\nfixture_type \"Par\" {\n  channels: 1\n  channel_map: { \"dimmer\": 1 }\n}\n",
+        )
+        .expect("write");
+        std::fs::write(ft_dir.join("broken.light"), "fixture_type {{{").expect("write");
+
+        let mut system = LightingSystem::new();
+        system.load_fixture_types_directory(&ft_dir).expect("loads");
+        assert_eq!(system.fixture_type_problem("Par"), None);
+        // A GDTF type is a declaration: its archive is read for a mode a
+        // fixture names, and that is where a missing one says so.
+        assert_eq!(system.fixture_type_problem("Ghost"), None);
+        let ghost = LightingSystem::expand_mode("Ghost", &system.referential["Ghost"], "x", base)
+            .unwrap_err()
+            .to_string();
+        assert!(ghost.contains("missing.gdtf"), "{ghost}");
+        let nope = system.fixture_type_problem("Nope").expect("nope is absent");
+        assert!(nope.contains("no fixture type named 'Nope'"), "{nope}");
+        assert!(nope.contains("broken.light"), "{nope}");
     }
 
     #[test]
@@ -1038,14 +2533,12 @@ mod tests {
         std::fs::write(dir.path().join("outside.gdtf"), b"whatever").expect("write");
         std::fs::write(
             ft_dir.join("evil.fixture"),
-            "fixture_type \"Evil\"\n  from gdtf(\"../outside.gdtf\", mode \"X\")\n{ }\n",
+            "fixture_type \"Evil\"\n  from gdtf(\"../outside.gdtf\")\n{ }\n",
         )
         .expect("write");
 
         let mut system = LightingSystem::new();
-        system
-            .load_fixture_types_directory(&ft_dir, &base)
-            .expect("loads");
+        system.load_fixture_types_directory(&ft_dir).expect("loads");
         assert!(!system.fixture_types.contains_key("Evil"));
     }
 
@@ -1845,10 +3338,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let gdtf = crate::lighting::gdtf::build_zip(&[(
-            "description.xml",
-            crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.as_bytes(),
-        )]);
+        let gdtf = crate::testutil::lighting::synthetic_gdtf();
         let mvr = crate::lighting::gdtf::build_zip(&[
             (
                 "GeneralSceneDescription.xml",
@@ -1871,7 +3361,6 @@ mod tests {
 
         let config = Lighting::new(
             Some("kellys".to_string()),
-            None,
             None,
             Some(crate::config::lighting::Directories::new(
                 Some("lighting/fixture_types".to_string()),

@@ -31,6 +31,13 @@ controllers:
     # traffic is quiet for this long is closed and its resources released.
     # Defaults to 14400 (4 hours). Set to null to disable eviction.
     # idle_session_timeout_secs: 14400
+
+    # `Host` header values the server answers to, as DNS-rebinding
+    # protection; each is a host or host:port. Unset, a localhost bind
+    # accepts only localhost, 127.0.0.1 and ::1, and any other bind_address
+    # accepts every Host (bearer_token is the access control there). An
+    # empty list accepts every Host.
+    # allowed_hosts: ["mtrack.local", "192.168.1.20:43237"]
 ```
 
 The endpoint is then reachable at `http://<bind_address>:<port>/mcp`.
@@ -50,24 +57,45 @@ client's MCP server settings.
 
 ### Tools
 
-Roughly 50 tools are available. They fall into a few groups:
+About 65 tools are available. They fall into a few groups:
 
 - **Status & discovery** — current playback status, host/runtime info, and listings of songs,
-  playlists, groups, venues, and fixture types.
+  playlists, groups, venues, and fixture types. `status` also reports the
+  [ambient light](../lighting/configuration.md#ambient-light) (`ambient: {mode, show, source, state}`,
+  where `mode` is `auto`, `on` or `off`, `source` is whose settings the show plays (`profile`,
+  `playlist` or `entry`; `null` with no show), and `state` is `pending` while its delay runs,
+  `playing`, `off`, or `unavailable` when `on` has no show to play; `{available: false,
+  reason}` when its state could not be read; `null` without a DMX engine) and a song about to [auto play](../getting-started/playlists.md#auto-play)
+  (`auto_play: {song, starts_in_seconds}`, `null` when there is none).
 - **Playback control** — play, stop, next/previous, play-from-a-time, play-a-named-song-from-a-time,
   seek within the current song (to a time or a named section), switch playlist, stop triggered
   samples, and section-loop control (loop a section, stop the loop, acknowledge the current
-  section in reactive looping).
+  section in reactive looping). `set_ambient_mode` sets the
+  [ambient mode](../lighting/configuration.md#ambient-mode) (`{"mode": "on"}`), and
+  `cancel_auto_play` calls off a song waiting to auto play, answering `cancelled: false` when
+  none was.
 - **Configuration editing** — read the full config and update the `audio`, `midi`, `dmx`, and
   `controllers` subsections, plus add / update / remove hardware profiles.
 - **Song & playlist authoring** — read, write, and patch `song.yaml` and playlist files, plus
-  detailed song metadata and beat-grid queries.
+  detailed song metadata and beat-grid queries. A playlist write is checked as the player would
+  load it: each entry's `fade_out`, `fade_in` and `auto_play`, and the playlist's `ambient`.
 - **Lighting authoring** — read, write, validate, patch, and delete `.light` DSL files for songs,
-  venues, and fixture types (venue tools also take `.venue` files, fixture-type tools `.fixture`),
-  list the lighting cues and active effects, and fetch a DSL reference primer. Manufacturer and
+  and venues and fixture types by name, by the web UI's rules: a new one is written to its own
+  `<stem>.venue` or `<stem>.fixture`, an existing one only where its file is its alone (a shared,
+  broken or doubly declared one is read-only, refused with the file and why), and `from` renames.
+  The listings give every file in the host's profile's directories, at any depth, with each
+  name's owner, and `read_venue` / `read_fixture_type` read any of those files by path. List
+  the lighting cues and active effects, and fetch a DSL reference primer. Manufacturer and
   venue files import through `list_gdtf_modes` / `import_gdtf` and `inspect_mvr` / `import_mvr`
   (and go back out through `export_mvr`),
-  so an agent can fetch a GDTF or a venue's MVR, pick the mode or origin, and wire it in. Deleting a song's lighting file also removes its `lighting:` entry, so the song is never
+  so an agent can fetch a GDTF or a venue's MVR, read its modes or pick the origin, and wire it in.
+  `import_gdtf` takes the archive's path and an optional `name`, and nothing about modes: a GDTF
+  in the library is a fixture type with all of its modes, and every venue fixture line of it
+  names one (`mode "…"`), which `list_gdtf_modes` lists with footprints. `list_fixture_types`
+  lists hand-written types with their channels and GDTF fixtures with their archive and modes,
+  each with its `strobe_curve` (null when automatic) and the `strobe_curve_in_use`. A GDTF
+  fixture's own settings (its record) are written with the fixture-type tools, in its `.fixture`
+  file. Deleting a song's lighting file also removes its `lighting:` entry, so the song is never
   left with a dangling reference.
   `validate_lighting` returns each show's resolved cue timeline alongside the parse result, so
   "the cues land where I meant" can be checked without loading the show into the player, plus
@@ -77,6 +105,13 @@ Roughly 50 tools are available. They fall into a few groups:
   (`capability-gap`), and fixtures patched on a universe the active profile has no output for
   (`unconfigured-universe`). `list_venues` reports each venue's placed-fixture count, focus
   points and MVR provenance.
+  `suggest_group_tags` takes a group name some song's show targets and, when the group finds
+  no fixtures in the current venue, suggests which fixtures should carry which tags: the
+  fixtures able to do what the shows ask of the group (move, colour, strobe, cells), the
+  largest cluster by type and by where they hang (deck, low rig, truss; downstage to upstage,
+  when the venue places them) as the `suggestion` with a structured `reason`, the rest as
+  `others`, and, when nothing fits, the wants nothing in the venue meets. It is the same
+  suggestion the web UI's Fit shows page offers, and it changes nothing.
 - **Show comparison** — `diff_shows` reports what changed between two versions of a show: added,
   removed and changed effects by resolved time, plus the dark windows the revision opened and
   closed. It compares resolved effects rather than text, since identical cue text can land in
@@ -96,10 +131,24 @@ Roughly 50 tools are available. They fall into a few groups:
   not light. `evaluate_show`
   needs no audio, no DMX output, and no real-time waiting, so a show can be verified without
   playing the song through the PA and the rig — and without perturbing playback if a song *is*
-  running.
+  running. A setting still moving when its effect ends or a cue cuts it (a zoom
+  fading down, a head mid-move) evaluates where it got to at that instant; the live rig can hold
+  it one output frame short of that (about 23 ms on a Pi, longer under load).
 
 Every write and patch tool validates its input (YAML schema or `.light` DSL parse) **before** it
 writes to disk, so a malformed edit is rejected rather than corrupting a project file.
+
+### Lock mode
+
+While the player is [locked](web-ui.md#lock-mode), every tool that writes config or project
+files is refused before it runs: the `update_*` config tools, the profile tools, every `write_*`,
+`patch_*` and `delete_*` tool, `import_gdtf`, `import_mvr` and `export_mvr`. The refusal is a
+tool error (`isError: true`) whose text says the player is locked. Reads, validation,
+`evaluate_show`, `analyze_show`, `diff_shows`, `inspect_mvr` and the playback controls work while
+locked. Track gains set from the web UI's faders, gRPC or OSC still save to the active
+profile while locked. mtrack starts locked, so unlock it from the web UI before an agent edits
+the show. When the web UI cannot start, the player runs unlocked, since nothing else could
+release the lock.
 
 ### Resources
 

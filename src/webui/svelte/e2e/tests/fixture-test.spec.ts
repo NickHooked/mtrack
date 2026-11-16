@@ -1,0 +1,379 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+
+import { test, expect, type Page } from "@playwright/test";
+import type { MessageShape } from "@bufbuild/protobuf";
+import {
+  FixtureTestUnavailable,
+  LightingService,
+  type FixtureTestOptionsSchema,
+  type StartFixtureTestRequestSchema,
+} from "../../src/gen/player/v1/player_pb";
+import { sendWatch, setWatchOpening } from "../support/watch";
+import { PLAYBACK_STATE, STATUS } from "../mock-server/test-data";
+import { lightingClientAt } from "../support/player-client";
+import { mockRpc } from "../support/rpc";
+
+// "Test this fixture" on a fixture's page: does the light answer when
+// mtrack sends to it, and if not, why not. Every test records what the page
+// sends with `mockRpc` and lets the mock answer.
+
+let counter = 0;
+const wsId = () =>
+  `ftest-${test.info().parallelIndex}-${++counter}-${Date.now()}`;
+
+interface Sent {
+  method: string;
+  body: Record<string, unknown> | null;
+}
+
+/** The request as the page once sent it as JSON, so the assertions read the
+ *  controls and the raw channels the way the test panel means them. */
+function bodyOf(req: MessageShape<typeof StartFixtureTestRequestSchema>) {
+  const c = req.controls;
+  const controls: Record<string, unknown> = {};
+  if (c) {
+    if (c.color !== undefined) controls.color = c.color;
+    if (c.dimmer !== undefined) controls.dimmer = c.dimmer;
+    if (c.strobe) controls.strobe = c.strobe.hertz ?? null;
+    if (c.pan !== undefined) controls.pan = c.pan;
+    if (c.tilt !== undefined) controls.tilt = c.tilt;
+    Object.assign(controls, c.levels);
+  }
+  return {
+    fixture_type: req.fixtureType,
+    mode: req.mode ?? null,
+    universe: req.universe,
+    address: req.address,
+    controls,
+    raw: Object.fromEntries(Object.entries(req.raw)),
+  };
+}
+
+/** Records every start (`POST`) and stop (`DELETE`) of the test, in order,
+ *  and lets the mock server answer them. */
+async function record(page: Page): Promise<Sent[]> {
+  const sent: Sent[] = [];
+  await mockRpc(page, {
+    onCall: (call) => {
+      if (call.method === "StartFixtureTest") {
+        sent.push({
+          method: "POST",
+          body: bodyOf(
+            call.request as MessageShape<typeof StartFixtureTestRequestSchema>,
+          ),
+        });
+      } else if (call.method === "StopFixtureTest") {
+        sent.push({ method: "DELETE", body: null });
+      }
+    },
+  });
+  return sent;
+}
+
+/** Rewrites the options the mock server answers. */
+async function options(
+  page: Page,
+  change: (o: MessageShape<typeof FixtureTestOptionsSchema>) => void,
+  type = "pixelbrick",
+): Promise<void> {
+  const baseURL = test.info().project.use.baseURL;
+  const real = await lightingClientAt(baseURL!).getFixtureTestOptions({
+    fixtureType: type,
+  });
+  change(real);
+  const rpc = await mockRpc(page);
+  rpc.unary(LightingService.method.getFixtureTestOptions, real);
+}
+
+async function playback(page: Page, id: string, extra: object) {
+  await sendWatch(page, id, { ...PLAYBACK_STATE, tracks: [], ...extra });
+}
+
+/** Opens a fixture's page and its test section. */
+async function openTest(page: Page, type = "pixelbrick", id = wsId()) {
+  await page.goto(`/?wsId=${id}#/lighting/fixtures/${type}`);
+  const section = page.getByTestId("fixture-test");
+  await section.locator("summary").first().click();
+  await expect(page.getByTestId("ftest-send")).toBeVisible();
+  await expect(page.getByTestId("ftest-send")).toBeEnabled();
+  return id;
+}
+
+const posts = (sent: Sent[]) => sent.filter((s) => s.method === "POST");
+const lastPost = (sent: Sent[]) => posts(sent).at(-1)?.body ?? null;
+
+test("the mode drives the controls: strobe is there in RGBS and not in RGB", async ({
+  page,
+}) => {
+  await openTest(page);
+  await expect(page.getByTestId("ftest-mode")).toHaveValue("8: RGBS");
+  await expect(page.getByTestId("ftest-span")).toHaveText("Uses addresses 1–4");
+  await expect(page.getByTestId("ftest-strobe-on")).toBeVisible();
+  await page.getByTestId("ftest-mode").selectOption("1: RGB");
+  await expect(page.getByTestId("ftest-strobe-na")).toHaveText(
+    "not in this mode",
+  );
+  await expect(page.getByTestId("ftest-span")).toHaveText("Uses addresses 1–3");
+});
+
+test("nothing is sent until Send is on; Send alone sends full white", async ({
+  page,
+}) => {
+  const sent = await record(page);
+  await openTest(page);
+  await page.waitForTimeout(600);
+  expect(sent).toEqual([]);
+
+  await page.getByTestId("ftest-send").check();
+  await expect.poll(() => posts(sent).length).toBeGreaterThan(0);
+  expect(posts(sent)[0].body).toEqual({
+    fixture_type: "pixelbrick",
+    mode: "8: RGBS",
+    universe: 1,
+    address: 1,
+    controls: { color: "#ffffff", dimmer: 1, strobe: null },
+    raw: {},
+  });
+  await expect(page.getByTestId("ftest-live")).toHaveText(
+    "Test output is live on universe 1, addresses 1–4",
+  );
+  // What mtrack is sending, from the answer.
+  await expect(page.getByTestId("ftest-sending")).toHaveText(
+    "mtrack is sending 255, 255, 255, 0 to universe 1, addresses 1–4.",
+  );
+  // The heartbeat keeps it alive with nothing touched.
+  const before = posts(sent).length;
+  await expect
+    .poll(() => posts(sent).length, { timeout: 5000 })
+    .toBeGreaterThan(before);
+});
+
+test("a swatch sends its colour; Blackout sends dark", async ({ page }) => {
+  const sent = await record(page);
+  await openTest(page);
+  await page.getByTestId("ftest-send").check();
+  await page.getByTestId("ftest-swatch-red").click();
+  await expect
+    .poll(() => (lastPost(sent)?.controls as { color?: string })?.color)
+    .toBe("#ff0000");
+  await expect(page.getByTestId("ftest-sending")).toContainText(
+    "sending 255, 0, 0, 0",
+  );
+  await page.getByTestId("ftest-strobe-on").check();
+  await expect
+    .poll(() => (lastPost(sent)?.controls as { strobe?: number })?.strobe)
+    .toBe(5);
+  await page.getByTestId("ftest-blackout").click();
+  await expect
+    .poll(() => lastPost(sent)?.controls)
+    .toEqual({ color: "#000000", dimmer: 0, strobe: null });
+});
+
+test("a raw channel is sent by hand and marked manual until reset", async ({
+  page,
+}) => {
+  const sent = await record(page);
+  await openTest(page);
+  await page.getByTestId("ftest-send").check();
+  await page.getByTestId("ftest-raw").locator("summary").click();
+  const row = page.locator('[data-testid="ftest-raw-row"][data-offset="3"]');
+  await row.getByTestId("ftest-raw-number").fill("128");
+  await row.getByTestId("ftest-raw-number").press("Enter");
+  await expect.poll(() => lastPost(sent)?.raw).toEqual({ "3": 128 });
+  await expect(row.getByTestId("ftest-raw-manual")).toHaveText("manual");
+  // The other rows show what the answer said.
+  await expect(
+    page
+      .locator('[data-testid="ftest-raw-row"][data-offset="1"]')
+      .getByTestId("ftest-raw-number"),
+  ).toHaveValue("255");
+  await row.getByTestId("ftest-raw-reset").click();
+  await expect.poll(() => lastPost(sent)?.raw).toEqual({});
+  await expect(row.getByTestId("ftest-raw-manual")).toHaveCount(0);
+});
+
+test("Stop releases, and so does leaving the page", async ({ page }) => {
+  const sent = await record(page);
+  await openTest(page);
+  await page.getByTestId("ftest-send").check();
+  await expect.poll(() => posts(sent).length).toBeGreaterThan(0);
+  await page.getByTestId("ftest-stop").click();
+  await expect.poll(() => sent.at(-1)?.method).toBe("DELETE");
+  await expect(page.getByTestId("ftest-live")).toHaveCount(0);
+  await expect(page.getByTestId("ftest-send")).not.toBeChecked();
+
+  await page.getByTestId("ftest-send").check();
+  await expect.poll(() => sent.at(-1)?.method).toBe("POST");
+  await page
+    .locator(".lighting__tabs")
+    .getByRole("link", { name: "Venues" })
+    .click();
+  await expect.poll(() => sent.at(-1)?.method).toBe("DELETE");
+});
+
+test("moving the address while live releases the old one first", async ({
+  page,
+}) => {
+  const sent = await record(page);
+  await openTest(page);
+  await page.getByTestId("ftest-send").check();
+  await expect.poll(() => posts(sent).length).toBeGreaterThan(0);
+  const at = sent.length;
+  await page.getByTestId("ftest-address").fill("9");
+  await page.getByTestId("ftest-address").press("Enter");
+  await expect
+    .poll(() => sent.slice(at).find((s) => s.method === "POST")?.body?.address)
+    .toBe(9);
+  const after = sent.slice(at);
+  const release = after.findIndex((s) => s.method === "DELETE");
+  const resend = after.findIndex(
+    (s) => s.method === "POST" && s.body?.address === 9,
+  );
+  expect(release).toBeGreaterThanOrEqual(0);
+  expect(release).toBeLessThan(resend);
+  expect(after.some((s) => s.method === "POST" && s.body?.address === 1)).toBe(
+    false,
+  );
+  await expect(page.getByTestId("ftest-live")).toHaveText(
+    "Test output is live on universe 1, addresses 9–12",
+  );
+});
+
+test("a hand-written type sends no mode, and its own dimmer", async ({
+  page,
+}) => {
+  const sent = await record(page);
+  await openTest(page, "par");
+  await expect(page.getByTestId("ftest-mode")).toHaveCount(0);
+  await page.getByTestId("ftest-send").check();
+  await expect.poll(() => posts(sent).length).toBeGreaterThan(0);
+  expect(posts(sent)[0].body).toMatchObject({
+    fixture_type: "par",
+    mode: null,
+    controls: { color: "#ffffff", dimmer: 1 },
+  });
+});
+
+test("help while live lists the unpatched universe first, with olad's page", async ({
+  page,
+}) => {
+  await options(page, (o) => {
+    o.universes[0].patched = false;
+  });
+  await openTest(page);
+  await expect(page.getByTestId("ftest-unpatched")).toBeVisible();
+  await page.getByTestId("ftest-send").check();
+  const causes = page.getByTestId("ftest-help").locator("li");
+  await expect(causes.first()).toHaveAttribute(
+    "data-testid",
+    "ftest-cause-unpatched",
+  );
+  await expect(causes.first().getByRole("link")).toHaveAttribute(
+    "href",
+    /:9090$/,
+  );
+  await expect(page.getByTestId("ftest-cause-address")).toContainText(
+    "set to 1",
+  );
+  await expect(page.getByTestId("ftest-cause-mode")).toContainText(
+    '"8: RGBS" (4 channels)',
+  );
+});
+
+test("the nav says a test is live on every page, and stops it", async ({
+  page,
+}) => {
+  const sent = await record(page);
+  const id = wsId();
+  // The player's status says a test is live.
+  await setWatchOpening(page, id, {
+    type: "hardware",
+    ...STATUS,
+    hardware: {
+      ...STATUS.hardware,
+      test_output: {
+        universe: 1,
+        address: 5,
+        footprint: 4,
+        fixture_type: "pixelbrick",
+        mode: "8: RGBS",
+        expires_in_secs: 4,
+      },
+    },
+  });
+  await page.goto(`/?wsId=${id}#/`);
+  const banner = page.getByTestId("test-output-banner");
+  await expect(banner).toContainText(
+    "Test output is live on universe 1, addresses 5–8 (pixelbrick).",
+  );
+  await expect(banner.getByRole("link", { name: "Open" })).toHaveAttribute(
+    "href",
+    "#/lighting/fixtures/pixelbrick",
+  );
+  await page.getByTestId("test-output-stop").click();
+  await expect.poll(() => sent.at(-1)?.method).toBe("DELETE");
+  await expect(banner).toHaveCount(0);
+});
+
+test.describe("when testing cannot happen, the section says why", () => {
+  test("locked: unlock", async ({ page }) => {
+    const id = await openTest(page);
+    await playback(page, id, { locked: true });
+    const why = page.getByTestId("ftest-unavailable");
+    await expect(why).toHaveAttribute("data-reason", "locked");
+    await expect(why).toContainText("The player is locked");
+    await expect(why.getByRole("button", { name: "Unlock" })).toBeVisible();
+    await expect(page.getByTestId("ftest-send")).toBeDisabled();
+  });
+
+  test("playing: stop the song; a live test stops too", async ({ page }) => {
+    const sent = await record(page);
+    const id = await openTest(page);
+    await page.getByTestId("ftest-send").check();
+    await expect.poll(() => posts(sent).length).toBeGreaterThan(0);
+    await playback(page, id, { is_playing: true });
+    const why = page.getByTestId("ftest-unavailable");
+    await expect(why).toHaveAttribute("data-reason", "playing");
+    await expect(why).toContainText("A song is playing");
+    await expect(page.getByTestId("ftest-send")).not.toBeChecked();
+    await expect(page.getByTestId("ftest-send")).toBeDisabled();
+  });
+
+  for (const reason of ["no_dmx", "no_universes"] as const) {
+    test(`${reason}: a link to the profile's DMX settings`, async ({
+      page,
+    }) => {
+      await options(page, (o) => {
+        o.available = false;
+        o.unavailable =
+          reason === "no_dmx"
+            ? FixtureTestUnavailable.NO_DMX
+            : FixtureTestUnavailable.NO_UNIVERSES;
+        if (reason === "no_universes") o.universes = [];
+      });
+      await page.goto(`/?wsId=${wsId()}#/lighting/fixtures/pixelbrick`);
+      await page.getByTestId("fixture-test").locator("summary").first().click();
+      const why = page.getByTestId("ftest-unavailable");
+      await expect(why).toHaveAttribute("data-reason", reason);
+      await expect(why).toContainText(
+        reason === "no_dmx" ? "no DMX output" : "no universes",
+      );
+      await expect(
+        why.getByRole("link", { name: "Open the profile's DMX settings" }),
+      ).toHaveAttribute("href", "#/config/test-host.yaml/lighting");
+      await expect(page.getByTestId("ftest-send")).toBeDisabled();
+    });
+  }
+});

@@ -13,6 +13,16 @@
      *
      * -->
 <script lang="ts">
+  import { onMount } from "svelte";
+  import type {
+    MidiEvent,
+    PilotConfig,
+    Section,
+    SongFailure,
+    SongInfo,
+    Track,
+    TrackPeaks,
+  } from "../../gen/rules/mtrack_rules";
   import { t } from "svelte-i18n";
   import { get } from "svelte/store";
   import YAML from "yaml";
@@ -25,15 +35,11 @@
     uploadTrack,
     uploadTracks,
     type MetronomeConfig,
-    type PilotConfig,
     type SongFile,
-    type SongFailure,
-    type SongSummary,
     type TempoConfig,
-    type WaveformTrack,
   } from "../../lib/api/songs";
   import { fetchLightingFile } from "../../lib/api/config";
-  import { parseLightFile } from "../../lib/lighting/parser";
+  import { rules } from "../../lib/rules";
   import type { TempoSection } from "../../lib/lighting/types";
   import { showConfirm } from "../../lib/dialog.svelte";
   import { registerDirtyGuard } from "../../lib/dirtyGuard";
@@ -43,27 +49,26 @@
   } from "../../lib/video/timeline-state";
   import type { VideoConfig } from "../../lib/video/types";
   import { playbackStore } from "../../lib/ws/stores";
-  import { statusStore } from "../../lib/ws/status";
   import FileBrowser from "./FileBrowser.svelte";
   import FileUpload from "./FileUpload.svelte";
   import FilePicker from "./FilePicker.svelte";
   import TrackEditor from "./TrackEditor.svelte";
   import SongLightingEditor from "./SongLightingEditor.svelte";
+  import SlotOverrides from "../palette/SlotOverrides.svelte";
+  import type { SlotColor } from "../../lib/lighting/palette";
   import SectionTimelineEditor from "./SectionTimelineEditor.svelte";
   import SongMetronomeEditor from "./SongMetronomeEditor.svelte";
   import SamplesSection from "../config/SamplesSection.svelte";
   import type { SampleBrowseTarget } from "../config/SamplesSection.svelte";
   import MidiEventEditor from "../config/MidiEventEditor.svelte";
-  import type { MidiEvent } from "../config/MidiEventEditor.svelte";
   import NotificationsSection from "../config/NotificationsSection.svelte";
   import type { NotifBrowseTarget } from "../config/NotificationsSection.svelte";
   import VideoTimelineEditor from "../video/VideoTimelineEditor.svelte";
-
-  interface TrackEntry {
-    name: string;
-    file: string;
-    file_channel?: number;
-  }
+  import {
+    audioAccept,
+    midiAccept,
+    withoutExtension,
+  } from "../../lib/util/paths";
 
   /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -78,17 +83,19 @@
       | "sections"
       | "video"
       | "config";
+    /** Where to put the lighting editor's cursor, from `?t=` in the address. */
+    initialTimeMs?: number | null;
   }
 
-  let { songName, initialTab }: Props = $props();
+  let { songName, initialTab, initialTimeMs = null }: Props = $props();
 
-  let song = $state<SongSummary | null>(null);
+  let song = $state<SongInfo | null>(null);
   let songFiles = $state<SongFile[]>([]);
-  let waveformTracks = $state<WaveformTrack[]>([]);
+  let waveformTracks = $state<TrackPeaks[]>([]);
   let rawYaml = $state("");
   let editedYaml = $state("");
   let parsedConfig = $state<Record<string, unknown> | null>(null);
-  let tracks = $state<TrackEntry[]>([]);
+  let tracks = $state<Track[]>([]);
   let loading = $state(true);
   let error = $state("");
   let failureError = $state<string | null>(null);
@@ -102,6 +109,32 @@
   // Lighting editor state (lifted up for unified save)
   let lightingDirty = $state(false);
   let lightingEditorRef: SongLightingEditor | undefined = $state();
+  /** The palette slots the song's files declare as the editor has them,
+   *  once it has loaded them; until then, the saved song's. */
+  let liveSlots = $state<SlotColor[] | null>(null);
+  let paletteSlots = $derived<SlotColor[]>(
+    liveSlots ?? song?.palette.slots ?? [],
+  );
+  /** The song's own palette overrides, as its YAML has them. */
+  let songPalette = $derived.by((): Record<string, string> => {
+    const raw = parsedConfig?.palette;
+    if (!raw || typeof raw !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(raw).filter(
+        (e): e is [string, string] => typeof e[1] === "string",
+      ),
+    );
+  });
+
+  /** Sets the song's palette overrides; none left removes the key. */
+  function setSongPalette(next: Record<string, string>) {
+    if (!parsedConfig) return;
+    const updated = { ...parsedConfig };
+    if (Object.keys(next).length > 0) updated.palette = next;
+    else delete updated.palette;
+    parsedConfig = updated;
+    editedYaml = buildYaml();
+  }
 
   // Tab state
   type TabKey =
@@ -125,10 +158,16 @@
   // Collapsible Notifications section within Config tab
   let notifSectionOpen = $state(false);
 
+  /** Opens song `name`'s page on the tab this one shows. */
+  function goToSong(name: string) {
+    const base = `#/songs/${encodeURIComponent(name)}`;
+    window.location.hash =
+      activeTab === "tracks" ? base : `${base}/${activeTab}`;
+  }
+
   function setTab(tab: TabKey) {
     activeTab = tab;
-    const base = `#/songs/${encodeURIComponent(songName)}`;
-    window.location.hash = tab === "tracks" ? base : `${base}/${tab}`;
+    goToSong(songName);
   }
 
   const tabs: { key: TabKey; labelKey: string }[] = [
@@ -153,18 +192,13 @@
 
   // Loop playback state
   let loopPlayback = $state(false);
+  // `loop_crossfade` as written ("2measures", "6s"), and the tracks that
+  // switch over at its midpoint instead of fading.
+  let loopCrossfade = $state("");
+  let loopCrossfadeCut = $state<string[]>([]);
 
   // Section editor state
-  let sections = $state<
-    {
-      name: string;
-      start_measure: number;
-      end_measure: number;
-      start_beat?: number;
-      end_beat?: number;
-      color?: string;
-    }[]
-  >([]);
+  let sections = $state<Section[]>([]);
   let sectionsDirty = $state(false);
 
   // Tempo map state (the song.yaml `tempo:` block)
@@ -177,6 +211,21 @@
   let pilotConfig = $state<PilotConfig | null>(null);
 
   // Lifted up so video edits survive tab switches and use the unified save.
+  let videoPreviewAvailable = $state<boolean | null>(null);
+  onMount(() => {
+    let cancelled = false;
+    fetch("/api/video/capabilities")
+      .then((response) => (response.ok ? response.json() : null))
+      .then((capabilities) => {
+        if (!cancelled && typeof capabilities?.video_preview === "boolean") {
+          videoPreviewAvailable = capabilities.video_preview;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  });
   let videoConfig = $state<VideoConfig | null>(null);
   let videoValidationError = $state<string | null>(null);
   let videoSelectedClipId = $state<string | null>(null);
@@ -194,8 +243,11 @@
     const found: { file: string; tempo: TempoSection }[] = [];
     for (const file of files) {
       try {
-        const parsed = parseLightFile(await fetchLightingFile(file));
-        if (parsed.tempo) {
+        const parsed = rules.document(
+          await fetchLightingFile(file),
+          file,
+        ).document;
+        if (parsed?.tempo) {
           found.push({ file, tempo: parsed.tempo });
         }
       } catch {
@@ -238,7 +290,11 @@
       } else {
         const newTracks = paths.map((p) => {
           const filename = p.split("/").pop() ?? p;
-          return { name: filename.replace(/\.[^.]+$/, ""), file: p };
+          return {
+            name: withoutExtension(filename),
+            file: p,
+            file_channel: null,
+          };
         });
         onTracksChange([...tracks, ...newTracks]);
       }
@@ -295,19 +351,21 @@
         tracks = (parsed.tracks ?? []).map((t: Record<string, unknown>) => ({
           name: (t.name as string) ?? "",
           file: (t.file as string) ?? "",
-          file_channel: t.file_channel as number | undefined,
+          file_channel: (t.file_channel as number | undefined) ?? null,
         }));
         midiEvent = (parsed.midi_event as MidiEvent) ?? null;
         loopPlayback = parsed.loop_playback === true;
+        loopCrossfade =
+          typeof parsed.loop_crossfade === "string"
+            ? parsed.loop_crossfade
+            : "";
+        loopCrossfadeCut = Array.isArray(parsed.loop_crossfade_cut)
+          ? parsed.loop_crossfade_cut.filter(
+              (t: unknown): t is string => typeof t === "string",
+            )
+          : [];
         sections = (parsed.sections ?? []).map((s: Record<string, unknown>) => {
-          const entry: {
-            name: string;
-            start_measure: number;
-            end_measure: number;
-            start_beat?: number;
-            end_beat?: number;
-            color?: string;
-          } = {
+          const entry: Section = {
             name: (s.name as string) ?? "",
             start_measure: (s.start_measure as number) ?? 1,
             end_measure: (s.end_measure as number) ?? 2,
@@ -344,6 +402,8 @@
       tracks = [];
       midiEvent = null;
       loopPlayback = false;
+      loopCrossfade = "";
+      loopCrossfadeCut = [];
       sections = [];
       songSamples = {};
       notificationAudio = {};
@@ -362,7 +422,7 @@
       kind: "song",
       tracks: tracks.map((t) => {
         const entry: Record<string, unknown> = { name: t.name, file: t.file };
-        if (t.file_channel !== undefined) {
+        if (t.file_channel !== null) {
           entry.file_channel = t.file_channel;
         }
         return entry;
@@ -377,6 +437,16 @@
       updated.loop_playback = true;
     } else {
       delete updated.loop_playback;
+    }
+    if (loopCrossfade.trim()) {
+      updated.loop_crossfade = loopCrossfade.trim();
+    } else {
+      delete updated.loop_crossfade;
+    }
+    if (loopCrossfadeCut.length > 0) {
+      updated.loop_crossfade_cut = loopCrossfadeCut;
+    } else {
+      delete updated.loop_crossfade_cut;
     }
     if (sections.length > 0) {
       updated.sections = sections;
@@ -424,7 +494,33 @@
     return YAML.stringify(updated, { lineWidth: 0 });
   }
 
+  /**
+   * After an upload: the name the server gave the song, when it is not
+   * this page's (a new song whose name was taken, #674), opens its page,
+   * where the files that follow go. True when it did.
+   */
+  function followUploadedSong(data: { song?: unknown } | null): boolean {
+    const name = data?.song;
+    if (typeof name !== "string" || name === "" || name === songName) {
+      return false;
+    }
+    goToSong(name);
+    return true;
+  }
+
+  /** The song name a config's YAML declares, if it reads and has one. */
+  function declaredName(yaml: string): string | null {
+    try {
+      const name = (YAML.parse(yaml) as { name?: unknown } | null)?.name;
+      return typeof name === "string" && name !== "" ? name : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function load() {
+    // The slots are the song's own again once its lighting editor loads them.
+    liveSlots = null;
     loading = true;
     error = "";
     failureError = null;
@@ -469,7 +565,7 @@
 
   load();
 
-  function onTracksChange(updated: TrackEntry[]) {
+  function onTracksChange(updated: Track[]) {
     tracks = updated;
     const yaml = buildYaml();
     editedYaml = yaml;
@@ -497,11 +593,34 @@
     editedYaml = buildYaml();
   }
 
-  function setLightingFile(filename: string) {
+  /** A lighting file's song.yaml entry: its path relative to the song's
+   * folder. The editor hands over paths under the songs root (`Song/x.light`),
+   * which is how the lighting API addresses them; song.yaml resolves `file`
+   * from the song's own folder, so the folder comes off here. */
+  function songRelative(path: string): string {
+    const dir = song?.base_dir;
+    return dir && path.startsWith(`${dir}/`)
+      ? path.slice(dir.length + 1)
+      : path;
+  }
+
+  /** Whether a song.yaml `file` entry names `filename` in the song's
+   * folder: as written, with a leading `./`, or as an absolute path. */
+  function entryNames(entry: string, filename: string): boolean {
+    if (entry.replace(/^(\.\/)+/, "") === filename) return true;
+    const dir = song?.base_dir;
+    return (
+      entry.startsWith("/") &&
+      entry.endsWith(dir ? `/${dir}/${filename}` : `/${filename}`)
+    );
+  }
+
+  function setLightingFile(path: string) {
     if (!parsedConfig) return;
+    const filename = songRelative(path);
     const existing =
       (parsedConfig.lighting as { file: string }[] | undefined) ?? [];
-    if (!existing.some((l) => l.file === filename)) {
+    if (!existing.some((l) => entryNames(l.file, filename))) {
       parsedConfig = {
         ...parsedConfig,
         lighting: [...existing, { file: filename }],
@@ -510,11 +629,12 @@
     }
   }
 
-  function removeLightingFile(filename: string) {
+  function removeLightingFile(path: string) {
     if (!parsedConfig) return;
+    const filename = songRelative(path);
     const existing =
       (parsedConfig.lighting as { file: string }[] | undefined) ?? [];
-    const filtered = existing.filter((l) => l.file !== filename);
+    const filtered = existing.filter((l) => !entryNames(l.file, filename));
     parsedConfig = {
       ...parsedConfig,
       lighting: filtered.length > 0 ? filtered : undefined,
@@ -600,21 +720,31 @@
     saveMsg = "";
     saveOk = false;
     try {
-      // Save song config if dirty.
+      // New lighting files first: writing them registers them in the
+      // config, and the reload the config save starts wants them on disk.
+      if (lightingDirty && lightingEditorRef) {
+        await lightingEditorRef.saveLightingFiles("before");
+      }
+
+      // Save song config if dirty. The name the saved config gives the
+      // song: a rename in the editor makes it another song's page, by its
+      // new name (#680), where the next save or delete goes.
+      let savedName: string | null = null;
       if (configDirty) {
-        const res = await updateSong(songName, editedYaml);
-        if (!res.ok) {
-          const data = await res.json().catch(() => null);
-          saveMsg =
-            data?.error ?? data?.errors?.[0] ?? `Save failed (${res.status})`;
-          return;
-        }
+        await updateSong(songName, editedYaml);
+        savedName = declaredName(editedYaml);
         rawYaml = editedYaml;
       }
 
-      // Save lighting files if dirty.
+      // The song's other lighting files, and the removed ones' deletion,
+      // once the config no longer names them.
       if (lightingDirty && lightingEditorRef) {
-        await lightingEditorRef.saveLightingFiles();
+        await lightingEditorRef.saveLightingFiles("after");
+      }
+
+      if (savedName && savedName !== songName) {
+        goToSong(savedName);
+        return;
       }
 
       saveMsg = get(t)("common.saved");
@@ -664,19 +794,11 @@
     uploadMsg = "";
     uploadOk = false;
     try {
-      let res: Response;
-      if (files.length === 1) {
-        res = await uploadTrack(songName, files[0]);
-      } else {
-        res = await uploadTracks(songName, files);
-      }
-      if (!res.ok) {
-        const data = await res.json().catch(() => null);
-        uploadMsg = data?.error ?? `Upload failed (${res.status})`;
-        return;
-      }
-      const data = await res.json().catch(() => null);
-      if (data?.replaced) {
+      const data =
+        files.length === 1
+          ? await uploadTrack(songName, files[0])
+          : await uploadTracks(songName, files);
+      if ("replaced" in data && data.replaced) {
         uploadMsg = get(t)("songs.detail.replacedFiles", {
           values: { count: files.length },
         });
@@ -687,6 +809,7 @@
       }
       uploadOk = true;
       setTimeout(() => (uploadMsg = ""), 3000);
+      if (followUploadedSong(data)) return;
       await load();
     } catch (e) {
       uploadMsg = e instanceof Error ? e.message : "Upload failed";
@@ -718,18 +841,13 @@
     uploadMsg = "";
     uploadOk = false;
     try {
-      const res = await uploadTrack(songName, files[0]);
-      if (!res.ok) {
-        const data = await res.json().catch(() => null);
-        uploadMsg = data?.error ?? `Upload failed (${res.status})`;
-        return;
-      }
-      const data = await res.json().catch(() => null);
-      uploadMsg = data?.replaced
+      const data = await uploadTrack(songName, files[0]);
+      uploadMsg = data.replaced
         ? get(t)("songs.detail.midiReplaced")
         : get(t)("songs.detail.midiUploaded");
       uploadOk = true;
       setTimeout(() => (uploadMsg = ""), 3000);
+      if (followUploadedSong(data)) return;
       await load();
     } catch (e) {
       uploadMsg = e instanceof Error ? e.message : "Upload failed";
@@ -885,12 +1003,7 @@
     notifUploading = true;
     notifUploadMsg = "";
     try {
-      const res = await uploadTrack(songName, files[0]);
-      if (!res.ok) {
-        const data = await res.json().catch(() => null);
-        notifUploadMsg = data?.error ?? `Upload failed (${res.status})`;
-        return;
-      }
+      await uploadTrack(songName, files[0]);
       notifUploadMsg = get(t)("notifications.uploaded", {
         values: { name: files[0].name },
       });
@@ -982,6 +1095,47 @@
         </label>
         <span class="field-hint">{$t("songs.detail.loopPlaybackHint")}</span>
       </div>
+      {#if loopPlayback}
+        <div class="field loop-crossfade">
+          <label for="loop-crossfade">{$t("songs.detail.loopCrossfade")}</label>
+          <input
+            id="loop-crossfade"
+            class="input"
+            type="text"
+            placeholder="2measures"
+            value={loopCrossfade}
+            onchange={(e) => {
+              loopCrossfade = (e.currentTarget as HTMLInputElement).value;
+              editedYaml = buildYaml();
+            }}
+          />
+          <span class="field-hint">{$t("songs.detail.loopCrossfadeHint")}</span>
+          {#if loopCrossfade.trim() && tracks.length > 0}
+            <fieldset class="loop-crossfade-cut">
+              <legend>{$t("songs.detail.loopCrossfadeCut")}</legend>
+              {#each tracks as track (track.name)}
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={loopCrossfadeCut.includes(track.name)}
+                    onchange={(e) => {
+                      const on = (e.currentTarget as HTMLInputElement).checked;
+                      loopCrossfadeCut = on
+                        ? [...loopCrossfadeCut, track.name]
+                        : loopCrossfadeCut.filter((t) => t !== track.name);
+                      editedYaml = buildYaml();
+                    }}
+                  />
+                  {track.name}
+                </label>
+              {/each}
+              <span class="field-hint"
+                >{$t("songs.detail.loopCrossfadeCutHint")}</span
+              >
+            </fieldset>
+          {/if}
+        </div>
+      {/if}
     {/if}
 
     <!-- Tab bar with inline save -->
@@ -1042,7 +1196,7 @@
         />
         <div class="upload-area">
           <FileUpload
-            accept=".wav,.flac,.mp3,.ogg,.aac,.m4a,.mp4,.aiff,.aif"
+            accept={audioAccept()}
             label={uploading
               ? $t("common.uploading")
               : $t("songs.detail.dropAudio")}
@@ -1098,7 +1252,7 @@
               </div>
               <div class="upload-area">
                 <FileUpload
-                  accept=".mid"
+                  accept={midiAccept()}
                   label={uploading
                     ? $t("common.uploading")
                     : $t("songs.detail.dropMidi")}
@@ -1230,11 +1384,24 @@
         {/if}
       {:else if activeTab === "lighting"}
         {#if song}
+          <div class="song-palette" data-testid="song-palette">
+            <span class="section-label">{$t("palette.song.title")}</span>
+            <p class="muted hint-text">{$t("palette.song.hint")}</p>
+            <SlotOverrides
+              slots={paletteSlots}
+              overrides={songPalette}
+              baseLabel={$t("palette.song.base")}
+              idPrefix="song-palette"
+              onchange={setSongPalette}
+            />
+          </div>
           <SongLightingEditor
             bind:this={lightingEditorRef}
             bind:dirty={lightingDirty}
+            bind:declaredSlots={liveSlots}
             {song}
             songTempo={tempoConfig}
+            initialCursorMs={initialTimeMs}
             onreload={load}
             onaddlightfile={setLightingFile}
             onremovelightfile={removeLightingFile}
@@ -1242,11 +1409,11 @@
         {/if}
       {:else if activeTab === "video"}
         <VideoTimelineEditor
+          previewAvailable={videoPreviewAvailable}
           video={videoConfig}
           {songName}
           songDurationSeconds={(song?.duration_ms ?? 0) / 1000}
           files={songFiles}
-          previewAvailable={$statusStore?.capabilities.video_preview ?? null}
           bind:selectedClipId={videoSelectedClipId}
           onchange={onVideoChange}
           onvaliditychange={onVideoValidityChange}
@@ -1462,6 +1629,40 @@
     cursor: pointer;
     color: var(--nc-fg-1);
   }
+  .loop-crossfade {
+    margin-left: 24px;
+  }
+  .loop-crossfade > label {
+    display: block;
+    font-size: 13px;
+    color: var(--nc-fg-2);
+    margin-bottom: 4px;
+  }
+  .loop-crossfade input[type="text"] {
+    max-width: 12rem;
+  }
+  .loop-crossfade .field-hint {
+    margin-left: 0;
+  }
+  .loop-crossfade-cut {
+    border: none;
+    padding: 0;
+    margin: 8px 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+  }
+  .loop-crossfade-cut legend {
+    font-size: 13px;
+    color: var(--nc-fg-2);
+    margin-bottom: 4px;
+  }
+  .loop-crossfade-cut label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+  }
   .field-hint {
     display: block;
     font-size: 12px;
@@ -1611,6 +1812,16 @@
     margin-top: 20px;
     padding-top: 16px;
     border-top: 1px solid var(--card-border);
+  }
+  .song-palette {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    border: 1px solid var(--card-border);
+    border-radius: var(--nc-radius-md);
+    background: var(--inset-bg);
   }
   .section-header {
     display: flex;

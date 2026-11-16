@@ -12,10 +12,11 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-/** Formats milliseconds as "m:ss". */
-export function formatMs(ms: number): string {
-  const totalSeconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+import { rules } from "../rules";
+
+/** A fade length as written (`1measure`, `4beats`, `2s`) for reading, by
+ *  the player's own reading of it (`rules.fade_length_text`): `1 measure`,
+ *  `4 beats`; text that is no length shows as written. */
+export function formatFadeLength(length: string): string {
+  return rules.fade_length_text(length) ?? length.trim();
 }

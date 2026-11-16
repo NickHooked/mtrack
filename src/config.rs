@@ -11,89 +11,33 @@
 // You should have received a copy of the GNU General Public License along with
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
-mod audio;
-mod controller;
-mod dmx;
-mod error;
-mod hostname;
-pub mod lighting;
-pub mod metronome;
-#[cfg(test)]
-pub mod midi;
-#[cfg(not(test))]
-mod midi;
-pub mod notification;
-pub mod pilot;
-mod player;
-mod playlist;
-mod profile;
-pub mod samples;
-mod song;
-mod statusevents;
+//! The player's configuration. The files' types and their loaders are
+//! `mtrack-core`'s; the store that edits them on a running player is here.
+
+pub use mtrack_core::config::*;
+
 pub mod store;
-mod tempo;
-mod track;
-mod trackmappings;
-pub mod trigger;
-pub mod video;
-
-pub use self::audio::{Audio, ResamplerType, StreamBufferSize};
-pub use self::controller::Controller;
-pub use self::controller::CustomModel;
-pub use self::controller::GrpcController;
-pub use self::controller::McpController;
-pub use self::controller::MidiController;
-pub use self::controller::MorningstarConfig;
-pub use self::controller::MorningstarModel;
-pub use self::controller::OscController;
-pub use self::controller::DEFAULT_GRPC_PORT;
-pub use self::controller::DEFAULT_MCP_PORT;
-pub use self::dmx::Dmx;
-pub use self::dmx::Universe;
-// Re-exported for the hardware harness, which needs the default port to probe
-// for a running OLA daemon. Gated to match the constant itself, which (with
-// `Dmx::ola_port`) is excluded from test builds; the harness links the
-// non-test build and so still sees it.
-#[cfg(not(test))]
-pub use self::dmx::DEFAULT_OLA_PORT;
-pub use self::error::ConfigError;
-pub use self::lighting::Lighting;
-pub use self::metronome::MetronomeConfig;
-pub use self::midi::Midi;
-pub use self::midi::MidiTransformer;
-pub use self::midi::ToMidiEvent;
-pub use self::pilot::PilotConfig;
-pub use self::player::{MetronomeDefaults, Player};
-pub use self::playlist::Playlist;
-// Sample types are exported for external configuration
-pub use self::hostname::resolve_hostname;
-pub use self::notification::{NotificationConfig, SongNotificationConfig};
-pub use self::profile::Profile;
-#[allow(unused_imports)]
-pub use self::samples::{
-    ReleaseBehavior, RetriggerBehavior, SampleDefinition, SampleTrigger, SamplesConfig,
-    VelocityConfig, VelocityLayer, VelocityMode,
-};
-pub use self::song::{LightShow, LightingShow, MidiPlayback, Section, Song};
-pub use self::statusevents::StatusEvents;
 pub use self::store::ConfigStore;
-pub use self::tempo::{parse_time_signature, TempoChangeConfig, TempoConfig, TransitionConfig};
-pub use self::track::Track;
-pub use self::video::VideoConfig;
 
-mod kind;
-pub use self::kind::{peek_kind, ConfigKind};
+#[cfg(test)]
+mod tests {
+    use super::Player;
 
-use std::time::Duration;
+    const LEGACY_YAML: &str = "songs: songs\nprofiles:\n  - hostname: rig\nstatus_events:\n  \
+                               off_events: []\n  idling_events: []\n  playing_events: []\n";
 
-/// Parses an optional duration string (e.g. "500ms") into a `Duration`,
-/// returning `default` when `raw` is `None`.
-pub(crate) fn parse_playback_delay(
-    raw: &Option<String>,
-    default: Duration,
-) -> Result<Duration, Box<dyn std::error::Error>> {
-    match raw {
-        Some(s) => Ok(duration_string::DurationString::from_string(s.clone())?.into()),
-        None => Ok(default),
+    /// A draft being validated is not the running config: reading one gives
+    /// no warning, so it cannot use up the one the loaded config gives.
+    #[test]
+    fn a_draft_gives_no_legacy_warning() {
+        let (layer, lines) = crate::tui::logging::capture_layer(10);
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            let subscriber = tracing_subscriber::Registry::default().with(layer);
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let player = Player::deserialize_from_str(LEGACY_YAML).expect("config parses");
+            assert!(player.status_events().is_some());
+        }
+        assert!(lines.lock().is_empty(), "{:?}", lines.lock());
     }
 }

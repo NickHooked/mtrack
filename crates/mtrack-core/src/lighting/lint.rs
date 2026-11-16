@@ -1,0 +1,2121 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+//! Non-fatal checks over a parsed light show.
+//!
+//! "Does it parse" is a low bar. Several classes of mistake are perfectly legal
+//! DSL and silently do nothing, or silently do the wrong thing: a group that
+//! matches no fixture, an effect running past the end of the song, two
+//! `replace` effects fighting over the same layer and group, a `tempo` block
+//! that drifts from the click track it is supposed to describe.
+//!
+//! These are warnings, never errors. A show that parses is still valid; these
+//! only say what looks suspicious.
+
+use crate::lighting::effects::LayerSet;
+pub use crate::lighting::findings::{Severity, Want, Warning};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Duration;
+
+use crate::audio::click_analysis::BeatGrid;
+use crate::lighting::effects::{
+    BlendMode, EffectLayer, EffectType, MoveTarget, DEFAULT_BLEND, DEFAULT_LAYER,
+};
+use crate::lighting::parser::{effect_keyword, Cue, Effect, LightShow};
+use crate::lighting::timeline::EffectEnd;
+
+impl Warning {
+    fn new(kind: &'static str, message: String) -> Self {
+        Warning {
+            kind,
+            message,
+            severity: Severity::Note,
+        }
+    }
+
+    /// A warning that the rig will not do what the show says.
+    fn attention(kind: &'static str, message: String) -> Self {
+        Warning {
+            severity: Severity::Attention,
+            ..Warning::new(kind, message)
+        }
+    }
+}
+
+/// What the checks can be run against. Every field is optional; a check whose
+/// input is missing is skipped rather than guessed at, because a warning that
+/// fires on absent information is worse than no warning.
+#[derive(Default)]
+pub struct LintContext<'a> {
+    /// How many fixtures each targeted group resolves to in the current venue.
+    /// Leave empty when no venue is loaded: every group would resolve to
+    /// nothing, and reporting them all as empty is noise, not a finding.
+    pub group_fixture_counts: HashMap<String, usize>,
+    /// Length of the song the show accompanies.
+    pub song_duration: Option<Duration>,
+    /// The song's click-derived beat grid, for checking a `tempo` block against
+    /// what the audio actually does.
+    pub beat_grid: Option<&'a BeatGrid>,
+    /// What each targeted group's fixtures can do, in the current venue.
+    /// Leave empty when no venue is loaded.
+    pub group_capabilities: HashMap<String, GroupCapabilities>,
+    /// The current venue's focus points. `None` when no venue is loaded —
+    /// an empty set is a venue with none, which is a finding.
+    pub focus_points: Option<HashSet<String>>,
+    /// The palette slots the song overrides (its `palette:`). Leave empty
+    /// for a bare source.
+    pub palette_overrides: Vec<String>,
+    /// The player's lighting layers, by which warnings name a layer. The
+    /// default set when left out.
+    pub layers: LayerSet,
+}
+
+impl Want {
+    /// What an effect needs of its group's fixtures to do what it says,
+    /// if anything: a chase, or a static naming no colour, asks nothing
+    /// in particular.
+    pub fn of(effect_type: &EffectType) -> Option<Want> {
+        match effect_type {
+            EffectType::Strobe { .. } => Some(Want::Strobe),
+            EffectType::Dimmer { .. } | EffectType::Pulse { .. } => Some(Want::Dimmer),
+            EffectType::ColorCycle { .. } | EffectType::Rainbow { .. } => Some(Want::Color),
+            EffectType::Move { .. } => Some(Want::Move),
+            // A static's colour arrives as red, green and blue.
+            EffectType::Static { parameters, .. }
+                if ["red", "green", "blue"]
+                    .iter()
+                    .any(|c| parameters.contains_key(*c)) =>
+            {
+                Some(Want::Color)
+            }
+            EffectType::Static { .. } | EffectType::Chase { .. } => None,
+        }
+    }
+
+    /// The name used in the API and in findings.
+    pub fn name(self) -> &'static str {
+        match self {
+            Want::Move => "move",
+            Want::Color => "color",
+            Want::Strobe => "strobe",
+            Want::Cells => "cells",
+            Want::Dimmer => "dimmer",
+        }
+    }
+
+    /// Whether `fixture` has what this asks for. The one rule, for lint's
+    /// findings and for refusing an effect at load.
+    pub fn met_by(self, fixture: &crate::lighting::effects::FixtureInfo) -> bool {
+        use crate::lighting::effects::FixtureCapabilities as Cap;
+        let has = |cap| fixture.has_capability(cap);
+        match self {
+            Want::Move => has(Cap::PANNING) || has(Cap::TILTING),
+            Want::Color => has(Cap::RGB_COLOR),
+            Want::Strobe => has(Cap::STROBING) || has(Cap::DIMMING) || has(Cap::RGB_COLOR),
+            Want::Cells => !fixture.cells.is_empty(),
+            Want::Dimmer => has(Cap::DIMMING) || has(Cap::RGB_COLOR),
+        }
+    }
+
+    /// What a fixture has it with, for a finding.
+    pub(crate) fn what(self) -> &'static str {
+        match self {
+            Want::Move => "pan or tilt channels",
+            Want::Color => "colour channels (RGB or CMY)",
+            Want::Strobe => "a strobe channel, a dimmer or colour channels",
+            Want::Cells => "cells",
+            Want::Dimmer => "a dimmer or colour channels",
+        }
+    }
+}
+
+/// Whether `fixture` can do what an effect of `effect_type` asks: the rule
+/// the engine leaves a fixture out of an effect by. An effect with a
+/// [`Want`] needs a fixture that meets it. A static sets channels, so it
+/// needs a fixture that takes any of them: its level by a dimmer or colour
+/// channels, any other channel by having it. A static setting nothing asks
+/// nothing.
+pub fn can_do(effect_type: &EffectType, fixture: &crate::lighting::effects::FixtureInfo) -> bool {
+    match effect_type {
+        EffectType::Static { parameters, .. } => {
+            parameters.is_empty()
+                || parameters.keys().any(|channel| match channel.as_str() {
+                    "dimmer" => Want::Dimmer.met_by(fixture),
+                    other => fixture.takes_channel(other),
+                })
+        }
+        other => Want::of(other).is_none_or(|want| want.met_by(fixture)),
+    }
+}
+
+/// What an effect of `effect_type` needs of a fixture ([`can_do`]), in
+/// words, for a refusal.
+pub fn what_it_needs(effect_type: &EffectType) -> &'static str {
+    match effect_type {
+        EffectType::Static { .. } => "one of the channels it sets",
+        other => Want::of(other).map_or("nothing", Want::what),
+    }
+}
+
+/// The focus points a `move` aims at: its `to`, and its `from` when it has
+/// one. Nothing for any other effect.
+pub fn focus_targets(effect_type: &EffectType) -> impl Iterator<Item = &str> {
+    let targets = match effect_type {
+        EffectType::Move { to, from, .. } => [Some(to), from.as_ref()],
+        _ => [None, None],
+    };
+    targets.into_iter().flatten().filter_map(|t| match t {
+        MoveTarget::Focus(name) => Some(name.as_str()),
+        _ => None,
+    })
+}
+
+/// How many of a group's fixtures have each capability an effect can ask
+/// for, derived from their channel maps.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GroupCapabilities {
+    pub fixtures: usize,
+    pub rgb: usize,
+    pub dimmer: usize,
+    pub strobe: usize,
+    /// Fixtures with a pan or tilt channel.
+    pub pan_tilt: usize,
+    /// Fixtures the venue places (position and rotation known).
+    pub positioned: usize,
+    /// Fixtures whose pan and tilt carry a physical range, so degrees
+    /// resolve precisely rather than over an assumed travel.
+    pub ranged: usize,
+    /// Fixtures with cells (pixel fixtures), which `per: cell` can reach.
+    pub cells: usize,
+}
+
+impl GroupCapabilities {
+    /// How many of the group's fixtures can do what `want` asks.
+    pub fn have(&self, want: Want) -> usize {
+        match want {
+            Want::Move => self.pan_tilt,
+            Want::Color => self.rgb,
+            Want::Strobe => self.strobe + self.dimmer + self.rgb,
+            Want::Cells => self.cells,
+            Want::Dimmer => self.dimmer + self.rgb,
+        }
+    }
+
+    /// Tallies a group from its resolved fixtures.
+    pub fn from_fixtures<'f>(
+        fixtures: impl IntoIterator<Item = &'f crate::lighting::effects::FixtureInfo>,
+    ) -> GroupCapabilities {
+        let mut out = GroupCapabilities::default();
+        for fixture in fixtures {
+            out.fixtures += 1;
+            if Want::Cells.met_by(fixture) {
+                out.cells += 1;
+            }
+            if Want::Color.met_by(fixture) {
+                out.rgb += 1;
+            }
+            if fixture.has_dimmer() {
+                out.dimmer += 1;
+            }
+            if fixture.has_capability(crate::lighting::effects::FixtureCapabilities::STROBING) {
+                out.strobe += 1;
+            }
+            if Want::Move.met_by(fixture) {
+                out.pan_tilt += 1;
+                if fixture.position.is_some() {
+                    out.positioned += 1;
+                }
+                // An axis the fixture does not have is not imprecise — a
+                // pan-only mover simply is not tilted — so only an axis that
+                // exists without a range counts against the group.
+                let ranged = |name: &str| {
+                    fixture.channel_defs.get(name).is_none_or(|def| {
+                        def.range.is_some() || def.functions.iter().any(|f| f.physical.is_some())
+                    })
+                };
+                if ranged("pan") && ranged("tilt") {
+                    out.ranged += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Fixtures grouped by the universes `configured` says nothing drives:
+/// universe -> fixture names, both sorted for stable reporting.
+pub fn unconfigured_universes(
+    fixtures: &[crate::lighting::effects::FixtureInfo],
+    configured: impl Fn(u16) -> bool,
+) -> BTreeMap<u16, Vec<String>> {
+    let mut gaps: BTreeMap<u16, Vec<String>> = Default::default();
+    for fixture in fixtures {
+        if !configured(fixture.universe) {
+            gaps.entry(fixture.universe)
+                .or_default()
+                .push(fixture.name.clone());
+        }
+    }
+    for names in gaps.values_mut() {
+        names.sort_unstable();
+    }
+    gaps
+}
+
+/// A venue-level finding: fixtures patched on a universe the active
+/// profile configures no output for. Reported at registration and on
+/// first drop today; this makes it a pre-show answer. `configured` is the
+/// profile's `dmx.universes`.
+pub fn universe_coverage(
+    fixtures: &[crate::lighting::effects::FixtureInfo],
+    configured: &[u16],
+) -> Vec<Warning> {
+    unconfigured_universes(fixtures, |universe| configured.contains(&universe))
+        .into_iter()
+        .map(|(universe, names)| {
+            Warning::new(
+                "unconfigured-universe",
+                format!(
+                    "universe {universe} has no output under `dmx.universes` in the active \
+                     profile, so {} will not light: {}",
+                    if names.len() == 1 {
+                        "this fixture".to_string()
+                    } else {
+                        format!("these {} fixtures", names.len())
+                    },
+                    names.join(", ")
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Runs every applicable check over `shows`.
+pub fn lint_shows(shows: &[LightShow], ctx: &LintContext) -> Vec<Warning> {
+    let mut warnings = Vec::new();
+    for show in shows {
+        empty_groups(show, ctx, &mut warnings);
+        capability_coverage(show, ctx, &mut warnings);
+        movement_checks(show, ctx, &mut warnings);
+        cell_checks(show, ctx, &mut warnings);
+        tempo_disagrees_with_grid(show, ctx, &mut warnings);
+        cues_beyond_the_tempo_map(show, ctx, &mut warnings);
+    }
+    // Across all shows at once, for the same reason the stomp check is: a
+    // `clear` in one show of a file ends effects in its siblings. Each
+    // effect's real end, as the show plays (#595).
+    let cues: Vec<&Cue> = shows.iter().flat_map(|show| show.cues.iter()).collect();
+    let ends = crate::lighting::timeline::effect_ends(cues.iter().copied());
+    effects_past_end_of_song(&cues, &ends, ctx, &mut warnings);
+    parameters_the_effect_ignores(shows, &mut warnings);
+    palette_overrides_without_a_slot(shows, ctx, &mut warnings);
+    // Across all shows at once, not per show: `LightingTimeline` merges every
+    // show in a file into one cue list and plays them together, so two shows
+    // both driving `wash` on the background layer stomp each other exactly as
+    // two cues in one show would. Checking them separately misses that.
+    stomping_replace_effects(&cues, &ends, ctx, &mut warnings);
+    warnings
+}
+
+/// A song's `palette:` override for a slot none of its shows declares
+/// (`palette-override-unknown-slot`). It changes nothing, and a note: a show
+/// edited since the override was written must not stop the song loading.
+fn palette_overrides_without_a_slot(
+    shows: &[LightShow],
+    ctx: &LintContext,
+    out: &mut Vec<Warning>,
+) {
+    for slot in crate::lighting::parser::unknown_slots(shows, &ctx.palette_overrides) {
+        out.push(Warning::new(
+            "palette-override-unknown-slot",
+            format!(
+                "the song's palette overrides '{slot}', which none of its shows declares, so \
+                 it changes nothing"
+            ),
+        ));
+    }
+}
+
+/// `per: cell` and `spread` (design §17.4): `per: cell` on a group with no
+/// pixel fixtures, or on an effect that gives every target the same value;
+/// `spread` on an effect that does not take it.
+fn cell_checks(show: &LightShow, ctx: &LintContext, out: &mut Vec<Warning>) {
+    let mut reported = HashSet::new();
+    for cue in &show.cues {
+        for effect in &cue.effects {
+            let kind = effect_keyword(&effect.effect_type);
+            let varies = matches!(
+                effect.effect_type,
+                EffectType::Chase { .. }
+                    | EffectType::Rainbow { .. }
+                    | EffectType::ColorCycle { .. }
+            );
+            if effect.per_cell
+                && !varies
+                && reported.insert(("per-cell-no-effect", effect.groups.join(", "), kind))
+            {
+                {
+                    out.push(Warning::new(
+                        "per-cell-no-effect",
+                        format!(
+                            "`per: cell` on `{}` (`{kind}`) at {:.3}s does nothing: {kind} gives \
+                             every target the same value (and a move stays on the fixtures, since \
+                             cells have no pan or tilt) — only chase, rainbow and cycle vary \
+                             across cells",
+                            effect.groups.join(", "),
+                            cue.time.as_secs_f64(),
+                        ),
+                    ));
+                }
+            }
+            if effect.per_cell {
+                for group in &effect.groups {
+                    let Some(capabilities) = ctx.group_capabilities.get(group) else {
+                        continue;
+                    };
+                    if capabilities.fixtures > 0
+                        && capabilities.cells == 0
+                        && reported.insert(("cells-absent", group.clone(), kind))
+                    {
+                        out.push(Warning::new(
+                            "cells-absent",
+                            format!(
+                                "`per: cell` on `{group}` at {:.3}s: none of the group's {} \
+                                 fixtures has cells in this venue, so it runs per fixture",
+                                cue.time.as_secs_f64(),
+                                capabilities.fixtures,
+                            ),
+                        ));
+                    }
+                }
+            }
+            let takes_spread = matches!(
+                effect.effect_type,
+                EffectType::Rainbow { .. } | EffectType::ColorCycle { .. }
+            );
+            if effect.spread != 0.0
+                && !takes_spread
+                && reported.insert(("spread-unused", effect.groups.join(", "), kind))
+            {
+                out.push(Warning::new(
+                    "spread-unused",
+                    format!(
+                        "`spread` on `{}` (`{kind}`) at {:.3}s does nothing: only rainbow and \
+                         cycle spread across their targets",
+                        effect.groups.join(", "),
+                        cue.time.as_secs_f64(),
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// A parameter the effect type does not use.
+///
+/// The DSL accepts any parameter and each effect type takes what it recognises,
+/// so `rainbow ... direction: left_to_right` parses and does nothing — the
+/// author has written a setting that will never have an effect, and nothing
+/// says so. Non-fatal, because shows already carry these and rejecting them
+/// would break on upgrade.
+fn parameters_the_effect_ignores(shows: &[LightShow], out: &mut Vec<Warning>) {
+    let mut reported = HashSet::new();
+    for cue in shows.iter().flat_map(|show| show.cues.iter()) {
+        for effect in &cue.effects {
+            for name in &effect.ignored_parameters {
+                // The DSL keyword, not the Rust variant: `ColorCycle` would be
+                // reported as "colorcycle", which is not a word the author can
+                // have written.
+                let kind = effect_keyword(&effect.effect_type);
+                // Once per (group, effect type, parameter): a show repeating
+                // the same mistake on forty cues has one problem, not forty —
+                // but the message names a group and a time, so two groups
+                // making the same mistake must not collapse into one warning
+                // pointing at whichever came first.
+                if !reported.insert((effect.groups.join(", "), kind, name.clone())) {
+                    continue;
+                }
+                out.push(Warning::new(
+                    "unused-parameter",
+                    format!(
+                        "`{}` on `{}` at {:.3}s is not a parameter {} uses, so it does \
+                         nothing — check the spelling, or the effect type",
+                        name,
+                        effect.groups.join(", "),
+                        cue.time.as_secs_f64(),
+                        kind,
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+/// A group that resolves to no fixtures. Its cues parse and silently no-op, so
+/// a whole design layer can vanish with no signal.
+fn empty_groups(show: &LightShow, ctx: &LintContext, out: &mut Vec<Warning>) {
+    if ctx.group_fixture_counts.is_empty() {
+        return;
+    }
+    let mut reported = HashSet::new();
+    for cue in &show.cues {
+        for effect in &cue.effects {
+            for group in &effect.groups {
+                if ctx.group_fixture_counts.get(group) != Some(&0) {
+                    continue;
+                }
+                if reported.insert(group.clone()) {
+                    out.push(Warning::new(
+                        "empty-group",
+                        format!(
+                            "group `{group}` resolves to 0 fixtures — its cues will do nothing"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// An effect asking a group for something none of its fixtures can do. The
+/// fixture profile degrades gracefully — a strobe on a fixture with no
+/// strobe channel is simply not strobed — so nothing fails; the cue just
+/// does not do what it says, and only a venue-aware check can tell.
+fn capability_coverage(show: &LightShow, ctx: &LintContext, out: &mut Vec<Warning>) {
+    if ctx.group_capabilities.is_empty() {
+        return;
+    }
+    let mut reported = HashSet::new();
+    for cue in &show.cues {
+        for effect in &cue.effects {
+            let Some(want) = Want::of(&effect.effect_type) else {
+                continue;
+            };
+            for group in &effect.groups {
+                let Some(capabilities) = ctx.group_capabilities.get(group) else {
+                    continue;
+                };
+                // An empty group is its own finding.
+                if capabilities.fixtures == 0 || capabilities.have(want) > 0 {
+                    continue;
+                }
+                if reported.insert((group.clone(), want)) {
+                    out.push(Warning::attention(
+                        "capability-gap",
+                        format!(
+                            "`{}` on `{group}` at {:.3}s needs {}, and none of the \
+                             group's {} fixtures has one — the cue will not do what it says",
+                            effect_keyword(&effect.effect_type),
+                            cue.time.as_secs_f64(),
+                            want.what(),
+                            capabilities.fixtures,
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The checks a `move` needs a venue for (design §15.5): a focus point the
+/// venue does not bind, a positional move on fixtures the venue has not
+/// placed, and degrees resolving over an assumed travel because the
+/// fixture type carries no range.
+fn movement_checks(show: &LightShow, ctx: &LintContext, out: &mut Vec<Warning>) {
+    let mut reported = HashSet::new();
+    for cue in &show.cues {
+        for effect in &cue.effects {
+            if !matches!(effect.effect_type, EffectType::Move { .. }) {
+                continue;
+            }
+            for name in focus_targets(&effect.effect_type) {
+                if let Some(points) = &ctx.focus_points {
+                    if !points.contains(name) && reported.insert(("focus", name.to_string())) {
+                        out.push(Warning::attention(
+                            "unbound-focus-point",
+                            format!(
+                                "`move` on `{}` at {:.3}s aims at focus point \"{name}\", which \
+                                 the current venue does not bind — add `focus \"{name}\" (x, y, z)` \
+                                 to the venue",
+                                effect.groups.join(", "),
+                                cue.time.as_secs_f64(),
+                            ),
+                        ));
+                    }
+                }
+            }
+            let aims_at_focus = focus_targets(&effect.effect_type).next().is_some();
+            for group in &effect.groups {
+                let Some(capabilities) = ctx.group_capabilities.get(group) else {
+                    continue;
+                };
+                if capabilities.pan_tilt == 0 {
+                    continue; // capability_coverage reports it
+                }
+                if aims_at_focus
+                    && capabilities.positioned < capabilities.pan_tilt
+                    && reported.insert(("positions", group.clone()))
+                {
+                    out.push(Warning::new(
+                        "move-without-positions",
+                        format!(
+                            "`move` on `{group}` at {:.3}s aims at a focus point, but {} of the \
+                             group's {} movers have no `position` in the venue — they will snap to \
+                             pan 0 / tilt 0",
+                            cue.time.as_secs_f64(),
+                            capabilities.pan_tilt - capabilities.positioned,
+                            capabilities.pan_tilt,
+                        ),
+                    ));
+                }
+                if capabilities.ranged < capabilities.pan_tilt
+                    && reported.insert(("range", group.clone()))
+                {
+                    out.push(Warning::new(
+                        "move-imprecise",
+                        format!(
+                            "`move` on `{group}` at {:.3}s: {} of the group's {} movers have no \
+                             pan/tilt range in their fixture type, so degrees resolve over an \
+                             assumed 540°/270° travel — import the GDTF or add `range` to the \
+                             channels",
+                            cue.time.as_secs_f64(),
+                            capabilities.pan_tilt - capabilities.ranged,
+                            capabilities.pan_tilt,
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// An effect whose duration runs past the end of the song. Playback truncates
+/// it, which is usually not what the author meant.
+///
+/// By its real end (see `timeline::effect_ends`), not the written one: a long
+/// bed cut by a `clear` or a `stop sequence`, or taken off its heads by a
+/// later move, does not overrun the song, and warning that it does is a false
+/// positive; a freeze or a slowed layer carries an effect past its written
+/// end. One held for good by a freeze runs to the end it was written with.
+fn effects_past_end_of_song(
+    cues: &[&Cue],
+    ends: &[EffectEnd],
+    ctx: &LintContext,
+    out: &mut Vec<Warning>,
+) {
+    let Some(song_end) = ctx.song_duration else {
+        return;
+    };
+    // A song with no audio tracks has zero duration, which would put every
+    // effect "past the end".
+    if song_end.is_zero() {
+        return;
+    }
+    for end in ends {
+        let (cue, effect) = (cues[end.cue], &cues[end.cue].effects[end.effect]);
+        let end = end.until();
+        // Under a frame past the end is rounding against the audio's
+        // length, not an effect cut short: nothing that brief can be seen.
+        if end <= song_end + PAST_END_TOLERANCE {
+            continue;
+        }
+        out.push(Warning::new(
+            "past-end-of-song",
+            format!(
+                "an effect on `{}` at {:.3}s runs to {:.3}s, past the song's {:.3}s — \
+                 it will be cut short",
+                effect.groups.join(", "),
+                cue.time.as_secs_f64(),
+                end.as_secs_f64(),
+                song_end.as_secs_f64(),
+            ),
+        ));
+    }
+}
+
+/// How far past the end of the song an effect may run before it is reported:
+/// one frame of the 44 Hz engine. A last effect sized in beats routinely ends
+/// a few milliseconds after the audio does (#541).
+const PAST_END_TOLERANCE: Duration = Duration::from_millis(25);
+
+/// Overlaps and dark windows shorter than this are not reported.
+///
+/// A gap or overlap of a few nanoseconds is rounding, not authoring: a frame is
+/// tens of milliseconds, so nothing that short can be seen, and a list padded
+/// with them hides the one window that matters (#534). A millisecond is well
+/// under a frame and well over any rounding.
+pub const MIN_REPORTED_SPAN: Duration = Duration::from_millis(1);
+
+/// When a replace-blend effect starts and ends, and the effect itself.
+type Span<'a> = (Duration, Duration, &'a Effect);
+
+/// Two `replace`-blend effects overlapping on the same layer *and* group. Last
+/// writer wins with no diagnostic, which is the easiest way to author a cue
+/// that appears to do nothing because something else is stomping it.
+///
+/// By their real spans (see `timeline::effect_ends`): a `clear` on the layer,
+/// a `stop sequence` naming the effect's sequence or a later move taking its
+/// heads ends it there, and comparing written spans would report a stomp
+/// between two effects that never coexist.
+fn stomping_replace_effects(
+    cues: &[&Cue],
+    ends: &[EffectEnd],
+    ctx: &LintContext,
+    out: &mut Vec<Warning>,
+) {
+    // (layer, group) -> the spans replace-blend effects occupy on it, with the
+    // effect occupying each.
+    let mut spans: BTreeMap<(EffectLayer, String), Vec<Span>> = BTreeMap::new();
+
+    for end in ends {
+        let (cue, effect) = (cues[end.cue], &cues[end.cue].effects[end.effect]);
+        // Both default to what the engine applies when the DSL omits them,
+        // so an unannotated effect is checked as it will run.
+        if effect.blend_mode.unwrap_or(DEFAULT_BLEND) != BlendMode::Replace {
+            continue;
+        }
+        let layer = effect.layer.unwrap_or(DEFAULT_LAYER);
+        let end = end.until();
+        if end <= cue.time {
+            continue;
+        }
+        for group in &effect.groups {
+            spans
+                .entry((layer, group.clone()))
+                .or_default()
+                .push((cue.time, end, effect));
+        }
+    }
+
+    for ((layer, group), mut occupied) in spans {
+        occupied.sort_by_key(|(start, end, _)| (*start, *end));
+        for pair in occupied.windows(2) {
+            let ((_, first_end, first), (second_start, _, second)) = (pair[0], pair[1]);
+            // Touching is fine — one ends exactly where the next begins — and
+            // so is an overlap too short to be anything but rounding.
+            if second_start + MIN_REPORTED_SPAN >= first_end {
+                continue;
+            }
+            // A restatement changes nothing on stage: the padding cue that
+            // re-sends the colour already showing, so a sequence lasts the
+            // length it should, is not something being stomped (#541).
+            if restates(first, second) {
+                continue;
+            }
+            out.push(Warning::new(
+                "replace-overlap",
+                format!(
+                    "two `replace` effects overlap on `{group}` in the {} layer between \
+                     {:.3}s and {:.3}s — the later one wins and the earlier appears to do nothing",
+                    ctx.layers.display_name(layer),
+                    second_start.as_secs_f64(),
+                    first_end.as_secs_f64(),
+                ),
+            ));
+            break; // One report per layer+group is enough to send them looking.
+        }
+    }
+}
+
+/// Whether `later` puts on stage exactly what `earlier` already does: the same
+/// effect with the same parameters (durations aside), not fading in.
+fn restates(earlier: &Effect, later: &Effect) -> bool {
+    later.up_time.is_none()
+        && earlier.effect_type.name() == later.effect_type.name()
+        && earlier.effect_type.parameters() == later.effect_type.parameters()
+        && earlier.per_cell == later.per_cell
+        && earlier.spread == later.spread
+}
+
+/// A `tempo` block that disagrees with the click-derived grid. Silent, and
+/// produces a show that is right for the first N bars and wrong after the first
+/// meter change.
+fn tempo_disagrees_with_grid(show: &LightShow, ctx: &LintContext, out: &mut Vec<Warning>) {
+    let (Some(block), Some(grid)) = (show.tempo_map.as_ref(), ctx.beat_grid) else {
+        return;
+    };
+    let Some(measure_count) = grid.measure_starts.len().checked_sub(1) else {
+        return;
+    };
+    if measure_count == 0 {
+        return;
+    }
+
+    // Compare bar by bar: where does the block put each downbeat, and where
+    // does the audio? A block that agrees drifts by milliseconds; one that
+    // disagrees diverges and stays diverged.
+    const TOLERANCE: f64 = 0.050;
+    for measure in 0..measure_count {
+        let Some(&beat_index) = grid.measure_starts.get(measure) else {
+            break;
+        };
+        let Some(&grid_time) = grid.beats.get(beat_index) else {
+            break;
+        };
+        let Some(block_time) = block.measure_to_time_with_offset(measure as u32 + 1, 1.0, 0, 0.0)
+        else {
+            break;
+        };
+        let drift = (block_time.as_secs_f64() - grid_time).abs();
+        if drift <= TOLERANCE {
+            continue;
+        }
+        out.push(Warning::new(
+            "tempo-grid-mismatch",
+            format!(
+                "the tempo block puts bar {} at {:.3}s but the click track has it at {:.3}s \
+                 ({:.3}s off) — the block and the audio disagree from here on",
+                measure + 1,
+                block_time.as_secs_f64(),
+                grid_time,
+                drift,
+            ),
+        ));
+        return; // The first divergence is the useful one; the rest follow from it.
+    }
+}
+
+/// A cue positioned past the end of the tempo map. `@150/1` on a 102-measure
+/// song resolves to something rather than erroring.
+fn cues_beyond_the_tempo_map(show: &LightShow, ctx: &LintContext, out: &mut Vec<Warning>) {
+    let Some(map) = show.tempo_map.as_ref() else {
+        return;
+    };
+    // A tempo map alone is unbounded — it will happily place bar 10,000. Only
+    // the grid says where the music actually stops, so without one this check
+    // cannot run.
+    let Some(last_measure) = grid_measure_count(ctx) else {
+        return;
+    };
+
+    for (index, cue) in show.cues.iter().enumerate() {
+        let (measure, _) = map.time_to_measure_beat(cue.time);
+        if measure as usize <= last_measure {
+            continue;
+        }
+        out.push(Warning::new(
+            "cue-past-end",
+            format!("cue {index} resolves to bar {measure}, past the song's {last_measure} bars"),
+        ));
+        return;
+    }
+}
+
+/// How many bars the grid covers.
+///
+/// `measure_starts` holds one index per downbeat, so its length is the number
+/// of bars the song reaches. (`BeatGrid::measure_count` subtracts one because
+/// it counts bars of *known duration*; for "is this cue past the end", a cue in
+/// the final bar is inside the song.)
+fn grid_measure_count(ctx: &LintContext) -> Option<usize> {
+    ctx.beat_grid
+        .map(|g| g.measure_starts.len())
+        .filter(|n| *n > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lighting::parser::parse_light_shows_with_tempo;
+
+    use crate::testutil::lighting::shows;
+
+    fn kinds(warnings: &[Warning]) -> Vec<&str> {
+        warnings.iter().map(|w| w.kind).collect()
+    }
+
+    /// A steady grid of `measures` bars of 4 beats at `bpm`, starting at zero.
+    ///
+    /// Shaped the way real grids are: one `measure_starts` entry per downbeat
+    /// and nothing after the last beat. An earlier version appended a trailing
+    /// sentinel that neither `from_tempo_map` nor `analyze_click_track`
+    /// produces, which hid an off-by-one in the bar count.
+    fn grid(bpm: f64, measures: usize) -> BeatGrid {
+        let spacing = 60.0 / bpm;
+        let mut beats = Vec::new();
+        let mut measure_starts = Vec::new();
+        for m in 0..measures {
+            measure_starts.push(beats.len());
+            for b in 0..4 {
+                beats.push((m * 4 + b) as f64 * spacing);
+            }
+        }
+        BeatGrid {
+            beats,
+            measure_starts,
+        }
+    }
+
+    // ── empty groups ───────────────────────────────────────────────
+
+    #[test]
+    fn a_group_resolving_to_nothing_is_reported_once() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    movers: static color: "blue", duration: 2s
+
+    @00:04.000
+    movers: static color: "red", duration: 2s
+}
+"#;
+        let ctx = LintContext {
+            group_fixture_counts: HashMap::from([("movers".to_string(), 0)]),
+            ..Default::default()
+        };
+        let warnings = lint_shows(&shows(source), &ctx);
+        assert_eq!(kinds(&warnings), ["empty-group"]);
+        assert!(warnings[0].message.contains("movers"));
+    }
+
+    #[test]
+    fn a_group_that_resolves_is_not_reported() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 2s
+}
+"#;
+        let ctx = LintContext {
+            group_fixture_counts: HashMap::from([("wash".to_string(), 4)]),
+            ..Default::default()
+        };
+        assert!(lint_shows(&shows(source), &ctx).is_empty());
+    }
+
+    #[test]
+    fn a_static_colour_on_a_group_with_no_colour_is_reported() {
+        let shows = shows(
+            r#"
+show "s" {
+    @00:00.000
+    spots: static color: "magenta", dimmer: 100%, duration: 2s
+    @00:03.000
+    spots: static dimmer: 50%, duration: 2s
+}
+"#,
+        );
+        let mut group_capabilities = HashMap::new();
+        group_capabilities.insert(
+            "spots".to_string(),
+            GroupCapabilities {
+                fixtures: 3,
+                rgb: 0,
+                dimmer: 3,
+                ..GroupCapabilities::default()
+            },
+        );
+        let ctx = LintContext {
+            group_capabilities,
+            ..LintContext::default()
+        };
+        let warnings = lint_shows(&shows, &ctx);
+        // The colour cue is flagged once; the dimmer-only cue is fine.
+        assert_eq!(kinds(&warnings), vec!["capability-gap"]);
+        assert!(
+            warnings[0].message.contains("`static` on `spots`")
+                && warnings[0].message.contains("RGB or CMY"),
+            "{}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn a_strobe_on_a_group_that_cannot_strobe_is_reported() {
+        let shows = shows(
+            r#"
+show "s" {
+    @00:00.000
+    wash: strobe frequency: 10, duration: 1s
+    spots: strobe frequency: 10, duration: 1s
+
+    @00:02.000
+    spots: rainbow speed: 1, duration: 1s
+}
+"#,
+        );
+        let mut group_capabilities = HashMap::new();
+        group_capabilities.insert(
+            "wash".to_string(),
+            GroupCapabilities {
+                fixtures: 4,
+                pan_tilt: 4,
+                ..GroupCapabilities::default()
+            },
+        );
+        // A strobe channel, a dimmer or colour will do: the engine strobes
+        // a dimmer or colour in software.
+        group_capabilities.insert(
+            "spots".to_string(),
+            GroupCapabilities {
+                fixtures: 2,
+                rgb: 2,
+                ..GroupCapabilities::default()
+            },
+        );
+        let ctx = LintContext {
+            group_capabilities,
+            ..LintContext::default()
+        };
+        let warnings = lint_shows(&shows, &ctx);
+        assert_eq!(kinds(&warnings), vec!["capability-gap"]);
+        assert!(
+            warnings[0].message.contains("`strobe` on `wash`"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(warnings[0]
+            .message
+            .contains("none of the group's 4 fixtures"));
+    }
+
+    #[test]
+    fn movement_checks_report_unbound_focus_points_and_unplaced_or_rangeless_movers() {
+        let shows = shows(
+            r#"
+show "s" {
+    @00:00.000
+    spots: move focus: "drummer", duration: 2s
+    @00:04.000
+    spots: move focus: "singer", duration: 2s
+}
+"#,
+        );
+        let mut group_capabilities = HashMap::new();
+        group_capabilities.insert(
+            "spots".to_string(),
+            GroupCapabilities {
+                fixtures: 2,
+                pan_tilt: 2,
+                positioned: 1,
+                ranged: 1,
+                ..GroupCapabilities::default()
+            },
+        );
+        let ctx = LintContext {
+            group_capabilities,
+            focus_points: Some(HashSet::from(["drummer".to_string()])),
+            ..LintContext::default()
+        };
+        let warnings = lint_shows(&shows, &ctx);
+        let mut found = kinds(&warnings);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "move-imprecise",
+                "move-without-positions",
+                "unbound-focus-point"
+            ]
+        );
+        let unbound = warnings
+            .iter()
+            .find(|w| w.kind == "unbound-focus-point")
+            .unwrap();
+        assert!(
+            unbound.message.contains("\"singer\""),
+            "{}",
+            unbound.message
+        );
+        assert!(
+            !unbound.message.contains("\"drummer\""),
+            "{}",
+            unbound.message
+        );
+    }
+
+    #[test]
+    fn group_capabilities_count_ranged_movers_per_present_axis() {
+        use crate::lighting::effects::FixtureInfo;
+        use crate::lighting::types::{ChannelDef, PhysicalRange, PhysicalUnit};
+        let degrees = |from, to| {
+            Some(PhysicalRange {
+                from,
+                to,
+                unit: PhysicalUnit::Degrees,
+            })
+        };
+        let build = |name: &str, defs: Vec<(&str, ChannelDef)>| {
+            let channels = defs
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.offset))
+                .collect();
+            let mut info =
+                FixtureInfo::new(name.to_string(), 1, 1, "T".to_string(), channels, None);
+            info.position = Some([0.0; 3]);
+            info.with_channel_defs(defs.into_iter().map(|(n, d)| (n.to_string(), d)).collect())
+        };
+        let mut ranged_pan = ChannelDef::at(1);
+        ranged_pan.range = degrees(-270.0, 270.0);
+        let mut ranged_tilt = ChannelDef::at(2);
+        ranged_tilt.range = degrees(-135.0, 135.0);
+
+        let full = build(
+            "full",
+            vec![("pan", ranged_pan.clone()), ("tilt", ranged_tilt)],
+        );
+        let pan_only = build("pan_only", vec![("pan", ranged_pan)]);
+        let bare = build(
+            "bare",
+            vec![("pan", ChannelDef::at(1)), ("tilt", ChannelDef::at(2))],
+        );
+        let caps = GroupCapabilities::from_fixtures([&full, &pan_only, &bare]);
+        assert_eq!(caps.pan_tilt, 3);
+        assert_eq!(caps.positioned, 3);
+        assert_eq!(
+            caps.ranged, 2,
+            "a pan-only mover with a ranged pan is precise; a rangeless one is not"
+        );
+    }
+
+    #[test]
+    fn a_move_on_a_group_that_cannot_move_is_a_capability_gap_only() {
+        let shows = shows(
+            "\nshow \"s\" {\n    @00:00.000\n    wash: move focus: \"drummer\", duration: 2s\n}\n",
+        );
+        let mut group_capabilities = HashMap::new();
+        group_capabilities.insert(
+            "wash".to_string(),
+            GroupCapabilities {
+                fixtures: 4,
+                rgb: 4,
+                ..GroupCapabilities::default()
+            },
+        );
+        let ctx = LintContext {
+            group_capabilities,
+            focus_points: Some(HashSet::from(["drummer".to_string()])),
+            ..LintContext::default()
+        };
+        assert_eq!(kinds(&lint_shows(&shows, &ctx)), vec!["capability-gap"]);
+        // Without a venue, nothing is guessed.
+        assert!(lint_shows(&shows, &LintContext::default()).is_empty());
+    }
+
+    #[test]
+    fn without_a_venue_the_capability_check_does_not_guess() {
+        let shows = shows(
+            "\nshow \"s\" {\n    @00:00.000\n    wash: strobe frequency: 10, duration: 1s\n}\n",
+        );
+        assert!(lint_shows(&shows, &LintContext::default()).is_empty());
+    }
+
+    #[test]
+    fn fixtures_on_an_unconfigured_universe_are_reported_per_universe() {
+        use crate::lighting::effects::FixtureInfo;
+        let fixture = |name: &str, universe: u16| {
+            FixtureInfo::new(
+                name.to_string(),
+                universe,
+                1,
+                "T".to_string(),
+                HashMap::new(),
+                None,
+            )
+        };
+        let fixtures = vec![
+            fixture("a", 1),
+            fixture("c", 2),
+            fixture("b", 2),
+            fixture("d", 3),
+        ];
+        let warnings = universe_coverage(&fixtures, &[1]);
+        assert_eq!(
+            kinds(&warnings),
+            vec!["unconfigured-universe", "unconfigured-universe"]
+        );
+        assert!(
+            warnings[0].message.contains("universe 2"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[0]
+                .message
+                .contains("these 2 fixtures will not light: b, c"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(
+            warnings[1].message.contains("this fixture"),
+            "{}",
+            warnings[1].message
+        );
+        assert!(universe_coverage(&fixtures, &[1, 2, 3]).is_empty());
+    }
+
+    #[test]
+    fn unconfigured_universes_group_sorted_fixtures() {
+        let fixture = |name: &str, universe: u16| {
+            let mut channels = HashMap::new();
+            channels.insert("dimmer".to_string(), 1);
+            crate::lighting::effects::FixtureInfo::new(
+                name.to_string(),
+                universe,
+                1,
+                "Par".to_string(),
+                channels,
+                None,
+            )
+        };
+        let fixtures = vec![
+            fixture("Wash1", 1),
+            fixture("Truss2", 9),
+            fixture("Truss1", 9),
+            fixture("Side1", 4),
+        ];
+        let gaps = unconfigured_universes(&fixtures, |universe| universe == 1);
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[&4], vec!["Side1".to_string()]);
+        assert_eq!(
+            gaps[&9],
+            vec!["Truss1".to_string(), "Truss2".to_string()],
+            "fixture names sort for stable reports"
+        );
+        assert!(!gaps.contains_key(&1));
+        assert!(unconfigured_universes(&fixtures[..1], |universe| universe == 1).is_empty());
+    }
+
+    #[test]
+    fn without_a_venue_the_group_check_does_not_guess() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    movers: static color: "blue", duration: 2s
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    // ── per: cell / spread (design §17.3/17.4) ────────────────────
+
+    #[test]
+    fn each_cell_check_kind_fires_once_per_group_and_effect_across_many_cues() {
+        // Pulse neither varies across targets nor takes `spread`, and
+        // `bars` has fixtures but none with cells — every one of the three
+        // kinds should apply, but only once each, no matter how many cues
+        // repeat the same mistake.
+        let source = r#"
+show "s" {
+    @00:00.000
+    bars: pulse frequency: 2, spread: 45deg, per: cell, duration: 1s
+
+    @00:02.000
+    bars: pulse frequency: 2, spread: 45deg, per: cell, duration: 1s
+
+    @00:04.000
+    bars: pulse frequency: 2, spread: 45deg, per: cell, duration: 1s
+}
+"#;
+        let mut group_capabilities = HashMap::new();
+        group_capabilities.insert(
+            "bars".to_string(),
+            GroupCapabilities {
+                fixtures: 2,
+                dimmer: 2,
+                ..GroupCapabilities::default()
+            },
+        );
+        let ctx = LintContext {
+            group_capabilities,
+            ..LintContext::default()
+        };
+        let warnings = lint_shows(&shows(source), &ctx);
+        let mut found = kinds(&warnings);
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["cells-absent", "per-cell-no-effect", "spread-unused"]
+        );
+    }
+
+    #[test]
+    fn a_palette_override_for_an_undeclared_slot_is_a_note() {
+        let source = r##"
+palette { primary: "#C01020" }
+show "s" {
+    @00:00.000
+    wash: static color: palette.primary, duration: 1s
+}
+"##;
+        let ctx = |slots: &[&str]| LintContext {
+            palette_overrides: slots.iter().map(|s| s.to_string()).collect(),
+            ..LintContext::default()
+        };
+        // Declared slots, or no overrides at all: nothing to say.
+        assert!(lint_shows(&shows(source), &ctx(&["primary"])).is_empty());
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+
+        let warnings = lint_shows(&shows(source), &ctx(&["primary", "gone", "Primary"]));
+        assert_eq!(
+            kinds(&warnings),
+            vec!["palette-override-unknown-slot"; 2],
+            "{warnings:?}"
+        );
+        assert!(warnings.iter().all(|w| w.severity == Severity::Note));
+        // Sorted, and a slot is named by its exact name.
+        assert!(warnings[0].message.contains("'Primary'"));
+        assert!(warnings[1].message.contains("'gone'"));
+    }
+
+    #[test]
+    fn cells_absent_does_not_fire_without_group_capabilities_or_with_no_fixtures() {
+        let source = r#"
+show "s" {
+    @00:00.000
+    bars: chase pattern: linear, per: cell, duration: 1s
+}
+"#;
+        // No venue loaded at all: `group_capabilities` is empty.
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+
+        // A venue loaded, but this group is not in it (stale/misspelled
+        // group name — a different check's business).
+        let ctx_missing = LintContext {
+            group_capabilities: HashMap::from([(
+                "other".to_string(),
+                GroupCapabilities {
+                    fixtures: 2,
+                    ..GroupCapabilities::default()
+                },
+            )]),
+            ..LintContext::default()
+        };
+        assert!(lint_shows(&shows(source), &ctx_missing).is_empty());
+
+        // The group resolves, but to nothing — its own finding (empty-group,
+        // when `group_fixture_counts` is set), not `cells-absent`.
+        let ctx_empty = LintContext {
+            group_capabilities: HashMap::from([("bars".to_string(), GroupCapabilities::default())]),
+            ..LintContext::default()
+        };
+        assert!(lint_shows(&shows(source), &ctx_empty).is_empty());
+    }
+
+    #[test]
+    fn a_valid_per_cell_chase_on_a_group_with_cells_is_silent() {
+        let source = r#"
+show "s" {
+    @00:00.000
+    bars: chase pattern: linear, per: cell, duration: 1s
+}
+"#;
+        let ctx = LintContext {
+            group_capabilities: HashMap::from([(
+                "bars".to_string(),
+                GroupCapabilities {
+                    fixtures: 2,
+                    cells: 2,
+                    ..GroupCapabilities::default()
+                },
+            )]),
+            ..LintContext::default()
+        };
+        let cell_warnings: Vec<Warning> = lint_shows(&shows(source), &ctx)
+            .into_iter()
+            .filter(|w| {
+                matches!(
+                    w.kind,
+                    "per-cell-no-effect" | "cells-absent" | "spread-unused"
+                )
+            })
+            .collect();
+        assert!(
+            cell_warnings.is_empty(),
+            "cell_checks should have nothing to say: {cell_warnings:?}"
+        );
+    }
+
+    // ── past end of song ───────────────────────────────────────────
+
+    #[test]
+    fn an_effect_running_past_the_song_is_reported() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 30s
+}
+"#;
+        let ctx = LintContext {
+            song_duration: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        let warnings = lint_shows(&shows(source), &ctx);
+        assert_eq!(kinds(&warnings), ["past-end-of-song"]);
+    }
+
+    /// Running past the end by less than a frame is rounding, not an effect
+    /// cut short (#541); a tenth of a second past is still reported.
+    #[test]
+    fn an_overrun_under_a_frame_is_not_reported() {
+        let ctx = LintContext {
+            song_duration: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        let source = |length: &str| {
+            format!("show \"T\" {{\n    @00:00.000\n    wash: static color: \"blue\", duration: {length}\n}}")
+        };
+        assert!(lint_shows(&shows(&source("10.014s")), &ctx).is_empty());
+        assert_eq!(
+            kinds(&lint_shows(&shows(&source("10.1s")), &ctx)),
+            ["past-end-of-song"]
+        );
+    }
+
+    #[test]
+    fn an_effect_ending_exactly_at_the_song_end_is_fine() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 10s
+}
+"#;
+        let ctx = LintContext {
+            song_duration: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        assert!(lint_shows(&shows(source), &ctx).is_empty());
+    }
+
+    /// By the effect's real end, as the show plays (the lint used to cap
+    /// the written end by clears and stops alone): a layer slowed to half
+    /// speed carries a bed past the song, and a move another takes the heads
+    /// from ends there.
+    #[test]
+    fn past_the_song_is_judged_by_the_real_end() {
+        let ctx = LintContext {
+            song_duration: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+        let slowed = r#"
+show "T" {
+    @00:00.000
+    master(layer: background, speed: 0.5)
+    wash: static color: "blue", duration: 8s
+}
+"#;
+        assert_eq!(
+            kinds(&lint_shows(&shows(slowed), &ctx)),
+            ["past-end-of-song"]
+        );
+        let taken = r#"
+show "T" {
+    @00:00.000
+    movers: move pan: 90deg, tilt: 0deg, duration: 30s
+    @00:05.000
+    movers: move pan: 0deg, tilt: 0deg, duration: 2s
+}
+"#;
+        assert!(lint_shows(&shows(taken), &ctx).is_empty());
+    }
+
+    // ── stomping replace effects ───────────────────────────────────
+
+    #[test]
+    fn overlapping_replace_effects_on_one_group_are_reported() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 10s
+
+    @00:05.000
+    wash: static color: "red", duration: 10s
+}
+"#;
+        let warnings = lint_shows(&shows(source), &LintContext::default());
+        assert_eq!(kinds(&warnings), ["replace-overlap"]);
+        assert!(warnings[0].message.contains("wash"), "{warnings:?}");
+    }
+
+    /// By real spans: a bed the speed master runs at double speed is over
+    /// before the next look comes in, and a sequence's pass that never fires,
+    /// the sequence stopped first, stomps nothing.
+    #[test]
+    fn overlaps_are_judged_by_the_real_spans() {
+        let sped = r#"
+show "T" {
+    @00:00.000
+    master(layer: background, speed: 2)
+    wash: static color: "blue", duration: 4s
+    @00:03.000
+    wash: static color: "red", duration: 4s
+}
+"#;
+        assert!(lint_shows(&shows(sped), &LintContext::default()).is_empty());
+        let stopped = r#"
+sequence "s" {
+    @00:00.000
+    wash: static color: "blue", duration: 4s
+}
+
+show "T" {
+    @00:00.000
+    sequence "s", loop: 3
+    @00:01.000
+    stop sequence "s"
+    @00:05.000
+    wash: static color: "red", duration: 4s
+}
+"#;
+        assert!(lint_shows(&shows(stopped), &LintContext::default()).is_empty());
+    }
+
+    /// An overlap shorter than a millisecond is rounding, not a stomp (#534).
+    #[test]
+    fn a_sub_millisecond_overlap_is_not_reported() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 1.0005s
+    @00:01.000
+    wash: static color: "red", duration: 1s
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    /// A padding cue that re-sends the colour already showing is not a stomp
+    /// (#541): it changes nothing on stage. A different colour, or the same
+    /// one fading in, still is.
+    #[test]
+    fn a_restatement_is_not_an_overlap() {
+        let source = |second: &str| {
+            format!(
+                "show \"T\" {{\n    @00:00.000\n    wash: static color: \"blue\", duration: 4s\n    @00:03.000\n    wash: static {second}\n}}"
+            )
+        };
+        let ctx = LintContext::default();
+        assert!(
+            lint_shows(&shows(&source("color: \"blue\", duration: 1s")), &ctx).is_empty(),
+            "a restatement was reported"
+        );
+        assert_eq!(
+            kinds(&lint_shows(
+                &shows(&source("color: \"red\", duration: 1s")),
+                &ctx
+            )),
+            ["replace-overlap"]
+        );
+        assert_eq!(
+            kinds(&lint_shows(
+                &shows(&source("color: \"blue\", duration: 1s, up_time: 0.5s")),
+                &ctx
+            )),
+            ["replace-overlap"]
+        );
+    }
+
+    #[test]
+    fn abutting_effects_are_not_an_overlap() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 5s
+
+    @00:05.000
+    wash: static color: "red", duration: 5s
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    #[test]
+    fn overlaps_on_different_layers_do_not_stomp() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 10s, layer: background
+
+    @00:05.000
+    wash: static color: "red", duration: 10s, layer: foreground
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    #[test]
+    fn a_non_replace_blend_is_not_stomping() {
+        // `add` is how you deliberately stack effects; only `replace` clobbers.
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 10s, blend_mode: add
+
+    @00:05.000
+    wash: static color: "red", duration: 10s, blend_mode: add
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    #[test]
+    fn overlaps_on_different_groups_do_not_stomp() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 10s
+
+    @00:05.000
+    spot: static color: "red", duration: 10s
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    #[test]
+    fn two_shows_in_one_file_can_stomp_each_other() {
+        // A file's shows are merged into one timeline and played together, so
+        // they contend for a layer exactly as two cues in one show would.
+        let source = r#"
+show "A" {
+    @00:00.000
+    wash: static color: "blue", duration: 10s
+}
+
+show "B" {
+    @00:05.000
+    wash: static color: "red", duration: 10s
+}
+"#;
+        let warnings = lint_shows(&shows(source), &LintContext::default());
+        assert_eq!(kinds(&warnings), ["replace-overlap"], "{warnings:?}");
+    }
+
+    #[test]
+    fn a_clear_between_two_effects_prevents_the_stomp() {
+        // The bed is authored for 30s and would overlap the later cue, but the
+        // clear at 5s ends it. Reporting a stomp here would be a false alarm,
+        // and a lint that cries wolf gets ignored.
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 30s
+
+    @00:05.000
+    clear(layer: background)
+
+    @00:08.000
+    wash: static color: "red", duration: 2s
+}
+"#;
+        assert!(
+            lint_shows(&shows(source), &LintContext::default()).is_empty(),
+            "the clear ends the bed before the second cue starts"
+        );
+    }
+
+    #[test]
+    fn a_clear_on_another_layer_does_not_rescue_an_overlap() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 30s, layer: background
+
+    @00:05.000
+    clear(layer: foreground)
+
+    @00:08.000
+    wash: static color: "red", duration: 2s, layer: background
+}
+"#;
+        let warnings = lint_shows(&shows(source), &LintContext::default());
+        assert_eq!(kinds(&warnings), ["replace-overlap"], "{warnings:?}");
+    }
+
+    #[test]
+    fn a_bare_clear_ends_every_layer() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 30s, layer: foreground
+
+    @00:05.000
+    clear()
+
+    @00:08.000
+    wash: static color: "red", duration: 2s, layer: foreground
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    // ── tempo block vs beat grid ───────────────────────────────────
+
+    #[test]
+    fn a_tempo_block_matching_the_grid_is_quiet() {
+        let source = r#"
+tempo {
+    start: 0ms
+    bpm: 120
+    time_signature: 4/4
+}
+
+show "T" {
+    @1/1
+    wash: static color: "blue", duration: 1s
+}
+"#;
+        let g = grid(120.0, 8);
+        let ctx = LintContext {
+            beat_grid: Some(&g),
+            ..Default::default()
+        };
+        assert!(
+            lint_shows(&shows(source), &ctx).is_empty(),
+            "a correct block should be silent"
+        );
+    }
+
+    #[test]
+    fn a_tempo_block_drifting_from_the_grid_is_reported_at_first_divergence() {
+        // The block claims 120bpm; the click track is at 100. Bar 1 agrees, and
+        // everything after it does not.
+        let source = r#"
+tempo {
+    start: 0ms
+    bpm: 120
+    time_signature: 4/4
+}
+
+show "T" {
+    @1/1
+    wash: static color: "blue", duration: 1s
+}
+"#;
+        let g = grid(100.0, 8);
+        let ctx = LintContext {
+            beat_grid: Some(&g),
+            ..Default::default()
+        };
+        let warnings = lint_shows(&shows(source), &ctx);
+        assert_eq!(kinds(&warnings), ["tempo-grid-mismatch"], "{warnings:?}");
+        // Reported once, at the first bar that disagrees, not at all of them.
+        assert!(warnings[0].message.contains("bar 2"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_12_8_block_matching_a_dotted_quarter_click_is_quiet() {
+        // 12/8 at 169 (quarter-note BPM): six quarters a bar, clicked on the
+        // dotted quarter, so four clicks a bar at 112.67 (#515).
+        let source = r#"
+tempo {
+    start: 0ms
+    bpm: 169
+    time_signature: 12/8
+}
+
+show "T" {
+    @1/1
+    wash: static color: "blue", duration: 1s
+}
+"#;
+        let g = grid(169.0 / 1.5, 16);
+        let ctx = LintContext {
+            beat_grid: Some(&g),
+            ..Default::default()
+        };
+        assert!(
+            lint_shows(&shows(source), &ctx).is_empty(),
+            "a correct 12/8 block should be silent"
+        );
+    }
+
+    #[test]
+    fn without_a_grid_the_tempo_check_does_not_run() {
+        let source = r#"
+tempo {
+    start: 0ms
+    bpm: 120
+    time_signature: 4/4
+}
+
+show "T" {
+    @1/1
+    wash: static color: "blue", duration: 1s
+}
+"#;
+        assert!(lint_shows(&shows(source), &LintContext::default()).is_empty());
+    }
+
+    // ── cues past the end ──────────────────────────────────────────
+
+    #[test]
+    fn a_cue_past_the_last_bar_is_reported() {
+        let map = crate::tempo::TempoMap::new(
+            Duration::ZERO,
+            120.0,
+            crate::tempo::TimeSignature::new(4, 4),
+            vec![],
+        );
+        let source = r#"
+show "T" {
+    @1/1
+    wash: static color: "blue", duration: 1s
+
+    @50/1
+    wash: static color: "red", duration: 1s
+}
+"#;
+        let parsed: Vec<LightShow> = parse_light_shows_with_tempo(source, Some(&map))
+            .expect("parses")
+            .into_values()
+            .collect();
+        let g = grid(120.0, 8);
+        let ctx = LintContext {
+            beat_grid: Some(&g),
+            ..Default::default()
+        };
+        let warnings = lint_shows(&parsed, &ctx);
+        assert_eq!(kinds(&warnings), ["cue-past-end"], "{warnings:?}");
+        assert!(warnings[0].message.contains("bar 50"), "{warnings:?}");
+    }
+
+    #[test]
+    fn cues_inside_the_song_are_quiet() {
+        let map = crate::tempo::TempoMap::new(
+            Duration::ZERO,
+            120.0,
+            crate::tempo::TimeSignature::new(4, 4),
+            vec![],
+        );
+        let source = r#"
+show "T" {
+    @1/1
+    wash: static color: "blue", duration: 1s
+
+    @4/1
+    wash: static color: "red", duration: 1s
+}
+"#;
+        let parsed: Vec<LightShow> = parse_light_shows_with_tempo(source, Some(&map))
+            .expect("parses")
+            .into_values()
+            .collect();
+        let g = grid(120.0, 8);
+        let ctx = LintContext {
+            beat_grid: Some(&g),
+            ..Default::default()
+        };
+        assert!(lint_shows(&parsed, &ctx).is_empty());
+    }
+
+    #[test]
+    fn a_cue_in_the_songs_last_bar_is_not_past_the_end() {
+        // The bar count is the number of downbeats. Counting bars of known
+        // duration instead reports the final bar as out of range.
+        let map = crate::tempo::TempoMap::new(
+            Duration::ZERO,
+            120.0,
+            crate::tempo::TimeSignature::new(4, 4),
+            vec![],
+        );
+        let source = r#"
+show "T" {
+    @8/1
+    wash: static color: "blue", duration: 1s
+}
+"#;
+        let parsed: Vec<LightShow> = parse_light_shows_with_tempo(source, Some(&map))
+            .expect("parses")
+            .into_values()
+            .collect();
+        let g = grid(120.0, 8);
+        let ctx = LintContext {
+            beat_grid: Some(&g),
+            ..Default::default()
+        };
+        assert!(
+            lint_shows(&parsed, &ctx).is_empty(),
+            "bar 8 of an 8-bar song is inside it"
+        );
+    }
+
+    #[test]
+    fn an_effect_cut_by_a_clear_does_not_overrun_the_song() {
+        // The long-bed-plus-clear idiom, which `analyze`'s own tests use. The
+        // bed is authored for 60s but ends at 5s, well inside a 30s song.
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 60s
+
+    @00:05.000
+    clear(layer: background)
+}
+"#;
+        let ctx = LintContext {
+            song_duration: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert!(
+            lint_shows(&shows(source), &ctx).is_empty(),
+            "the clear ends the bed long before the song does"
+        );
+    }
+
+    #[test]
+    fn an_effect_cut_by_a_stop_sequence_does_not_overrun_the_song() {
+        // The same claim as the clear case, by the other mechanism that ends an
+        // effect early. `LightingEngine::stop_sequence` drops every effect cued
+        // from the sequence, so the 60s bed really ends at 15s —
+        // well inside a 30s song.
+        //
+        // The stomp check already reasons this way. When only that one did, two
+        // lints in the same file disagreed about the same effect.
+        let source = r#"
+sequence "X" {
+    @00:00.000
+    wash: static color: "blue", duration: 60s
+}
+
+show "T" {
+    @00:10.000
+    sequence "X"
+
+    @00:15.000
+    stop sequence "X"
+}
+"#;
+        let ctx = LintContext {
+            song_duration: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert!(
+            lint_shows(&shows(source), &ctx).is_empty(),
+            "the stop ends the bed long before the song does, but got: {:?}",
+            lint_shows(&shows(source), &ctx)
+        );
+    }
+
+    /// The parameters the editor keeps on an effect-type change and offers
+    /// controls for (`EffectKind::params`, the web UI's vocabulary) must
+    /// each be one the engine reads, or the editor would carry a dead
+    /// setting the engine silently drops.
+    #[test]
+    fn the_editors_parameter_table_matches_what_the_engine_accepts() {
+        let mut checked = 0;
+        for words in crate::lighting::parser::edit::vocabulary(LayerSet::standard()).effects {
+            let kind = words.kind.keyword();
+            for param in words.params {
+                let value = sample_value(kind, param);
+                // A `move` needs a target; a parameter that is not one gets
+                // a focus point to ride along with.
+                let companion =
+                    if kind == "move" && !matches!(param, "focus" | "to" | "pan" | "tilt") {
+                        ", focus: \"a\""
+                    } else {
+                        ""
+                    };
+                let source = format!(
+                    "show \"T\" {{\n    @00:00.000\n    wash: {kind} {param}: {value}{companion}, duration: 2s\n}}\n"
+                );
+                let parsed = crate::lighting::parser::parse_light_shows(&source)
+                    .unwrap_or_else(|e| panic!("`{kind} {param}: {value}` does not parse: {e}"));
+                let shows: Vec<_> = parsed.into_values().collect();
+                let unused: Vec<&str> = lint_shows(&shows, &LintContext::default())
+                    .iter()
+                    .filter(|w| w.kind == "unused-parameter" && w.message.contains(param))
+                    .map(|_| param)
+                    .collect();
+                assert!(
+                    unused.is_empty(),
+                    "the editor keeps `{param}` when an effect becomes `{kind}`, but {kind} \
+                     does not read it — the editor would carry a setting that does nothing"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 25, "only {checked} parameters were checked");
+    }
+
+    /// A value the parser accepts for a given parameter.
+    fn sample_value(kind: &str, param: &str) -> &'static str {
+        match param {
+            "duration" => "2s",
+            "direction" if kind == "chase" => "left_to_right",
+            "direction" => "forward",
+            "transition" => "fade",
+            "pattern" => "linear",
+            "curve" => "linear",
+            "speed" | "frequency" => "1",
+            "focus" | "to" | "from" => "\"drummer\"",
+            "pan" | "tilt" | "from_pan" | "from_tilt" => "45deg",
+            "easing" => "smooth",
+            "color" => "\"red\"",
+            "spread" => "30deg",
+            _ => "0.5",
+        }
+    }
+
+    /// The shipped shows must not carry a parameter that does nothing.
+    ///
+    /// They carried nineteen: `fade`, `loop`, `duty`, `dimmer` on a cycle,
+    /// `intensity` on a strobe, `color` on pulse/chase/strobe, and the rainbow
+    /// `direction` that led to this check. Anyone copying an example inherited
+    /// settings that are silently ignored, which is how the habit spreads.
+    #[test]
+    fn the_shipped_examples_carry_no_parameter_that_does_nothing() {
+        fn shows_in(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    shows_in(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("light") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        shows_in(std::path::Path::new("../../examples"), &mut files);
+        assert!(!files.is_empty(), "no example shows were found to check");
+
+        let mut offenders = Vec::new();
+        for path in files {
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Fixture-type and venue files live alongside the shows and are
+            // not shows, so a parse failure is expected for them — but a show
+            // that stops parsing must not drop silently out of this check.
+            let is_show = source.contains("show \"");
+            let parsed = match crate::lighting::parser::parse_light_shows(&source) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    assert!(
+                        !is_show,
+                        "{} declares a show but does not parse: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            let shows: Vec<_> = parsed.into_values().collect();
+            for warning in lint_shows(&shows, &LintContext::default()) {
+                if warning.kind == "unused-parameter" {
+                    offenders.push(format!("{}: {}", path.display(), warning.message));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "shipped examples carry parameters that do nothing:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn a_parameter_the_effect_does_not_use_is_reported() {
+        // `EffectType::Rainbow` has no direction. This parses, the direction is
+        // dropped, and the author has written a setting that will never do
+        // anything — which is what the web UI's own rainbow direction control
+        // used to produce before it was removed.
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: rainbow speed: 0.5, direction: left_to_right, duration: 4s
+}
+"#;
+        let warnings = lint_shows(&shows(source), &LintContext::default());
+        let unused: Vec<&Warning> = warnings
+            .iter()
+            .filter(|w| w.kind == "unused-parameter")
+            .collect();
+        assert_eq!(unused.len(), 1, "{warnings:?}");
+        assert!(
+            unused[0].message.contains("direction") && unused[0].message.contains("rainbow"),
+            "the parameter and the effect type both have to be named: {}",
+            unused[0].message
+        );
+    }
+
+    #[test]
+    fn a_parameter_the_effect_does_use_is_not_reported() {
+        // Guards against the check firing on every parameter, which would make
+        // it noise and get it ignored.
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: rainbow speed: 0.5, saturation: 80%, brightness: 90%, duration: 4s
+}
+"#;
+        let warnings = lint_shows(&shows(source), &LintContext::default());
+        assert!(
+            !warnings.iter().any(|w| w.kind == "unused-parameter"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_mistake_on_many_cues_is_reported_once() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: rainbow speed: 0.5, direction: left_to_right, duration: 2s
+
+    @00:04.000
+    wash: rainbow speed: 0.5, direction: left_to_right, duration: 2s
+}
+"#;
+        let warnings = lint_shows(&shows(source), &LintContext::default());
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.kind == "unused-parameter")
+                .count(),
+            1,
+            "a repeated mistake is one problem, not one per cue: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_song_with_no_duration_is_not_warned_about() {
+        // A song with no audio tracks has zero duration; warning that every
+        // effect overruns it is noise.
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 4s
+}
+"#;
+        let ctx = LintContext {
+            song_duration: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        assert!(lint_shows(&shows(source), &ctx).is_empty());
+    }
+
+    // ── nothing to say ─────────────────────────────────────────────
+
+    #[test]
+    fn a_clean_show_produces_no_warnings() {
+        let source = r#"
+show "T" {
+    @00:00.000
+    wash: static color: "blue", duration: 4s
+
+    @00:04.000
+    wash: static color: "red", duration: 4s
+}
+"#;
+        let ctx = LintContext {
+            group_fixture_counts: HashMap::from([("wash".to_string(), 4)]),
+            song_duration: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(lint_shows(&shows(source), &ctx).is_empty());
+    }
+}

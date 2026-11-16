@@ -15,87 +15,52 @@
 <script lang="ts">
   import { t } from "svelte-i18n";
   import { get } from "svelte/store";
+  import type {
+    AudioOutputHealth,
+    SubsystemStatus,
+  } from "../gen/rules/mtrack_rules";
+  import { restartControllers as restart } from "../lib/api/config";
+  import { statusStore } from "../lib/ws/status";
+  import { connect, watchConnected, watchError } from "../lib/ws/stores";
+  import { untrack } from "svelte";
 
-  interface SubsystemStatus {
-    status: string;
-    name: string | null;
-    /** Why init gave up. Present only for `failed`. */
-    error?: string | null;
-  }
-
-  interface ControllerStatus {
-    kind: string;
-    status: string;
-    detail: string | null;
-    error: string | null;
-  }
-
-  /** Runtime state of the audio output callback, as distinct from whether the
-   * device opened. `status` is the verdict; the rest is the evidence. */
-  interface AudioOutputHealth {
-    status: "healthy" | "recovering" | "stalled" | "never_started";
-    callback_alive: boolean;
-    writing_signal: boolean;
-    since_last_callback_ms: number | null;
-    since_last_signal_ms: number | null;
-    callbacks: number;
-    recoveries: number;
-    underruns: number;
-    last_error: string | null;
-  }
-
-  interface StatusResponse {
-    build: {
-      version: string;
-      git_hash: string;
-      build_time: string;
-    };
-    hardware: {
-      init_done: boolean;
-      hostname: string | null;
-      profile: string | null;
-      audio: SubsystemStatus;
-      /** Present once an audio device is open and able to report. */
-      audio_output: AudioOutputHealth | null;
-      midi: SubsystemStatus;
-      dmx: SubsystemStatus;
-      trigger: SubsystemStatus;
-    };
-    controllers: ControllerStatus[];
-  }
-
-  let data = $state<StatusResponse | null>(null);
-  let error = $state<string | null>(null);
+  const data = $derived($statusStore);
+  // The player says its hardware by itself, within about a second of a
+  // change (the `Watch` stream, lib/grpc/watch.ts). Refresh asks it again:
+  // a new stream opens with the status as it is now.
   let loading = $state(false);
-  let lastFetchTime = $state<number>(Date.now());
+  // When the stream was lost, while it is; the page's status is then as old
+  // as that.
+  let droppedAt = $state<number | null>(null);
   let secondsAgo = $state<number>(0);
 
-  async function fetchStatus() {
+  /** How long a refresh waits for the player before it gives up waiting. */
+  const REFRESH_WAIT_MS = 5000;
+
+  function refresh() {
     loading = true;
-    error = null;
-    try {
-      const res = await fetch("/api/status");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      data = await res.json();
-      lastFetchTime = Date.now();
-      secondsAgo = 0;
-    } catch (e: unknown) {
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      loading = false;
-    }
+    setTimeout(() => (loading = false), REFRESH_WAIT_MS);
+    connect();
   }
 
+  // The refresh is over when the player answers (any status) or fails to.
   $effect(() => {
-    fetchStatus();
-    const poll = setInterval(() => fetchStatus(), 5000);
+    void $statusStore;
+    void $watchError;
+    untrack(() => (loading = false));
+  });
+
+  $effect(() => {
+    if ($watchConnected) droppedAt = null;
+    else untrack(() => (droppedAt ??= Date.now()));
+  });
+
+  $effect(() => {
     const tick = setInterval(() => {
-      secondsAgo = Math.round((Date.now() - lastFetchTime) / 1000);
+      secondsAgo =
+        droppedAt === null ? 0 : Math.round((Date.now() - droppedAt) / 1000);
     }, 1000);
-    return () => {
-      clearInterval(poll);
-      clearInterval(tick);
-    };
+    return () => clearInterval(tick);
   });
 
   function statusColor(status: string): string {
@@ -179,17 +144,16 @@
   }
 
   let restarting = $state(false);
+  /** What went wrong restarting the controllers. */
+  let error = $state<string | null>(null);
 
   async function restartControllers() {
     restarting = true;
+    error = null;
     try {
-      const res = await fetch("/api/controllers/restart", { method: "POST" });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        error = body?.error ?? `Restart failed (${res.status})`;
-      } else {
-        await fetchStatus();
-      }
+      await restart();
+      // The controllers' new status arrives by itself, within about a
+      // second, on the `Watch` stream.
     } catch (e: unknown) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -198,7 +162,7 @@
   }
 
   const subsystems: {
-    key: keyof StatusResponse["hardware"];
+    key: "audio" | "midi" | "dmx" | "trigger";
     labelKey: string;
     /** Section slug within the profile editor URL. */
     section: string;
@@ -223,19 +187,25 @@
     <div>
       <h1 class="page__title">{$t("status.title")}</h1>
       <p class="page__subtitle">
-        {$t("status.lastUpdated", { values: { seconds: secondsAgo } })}
+        {#if $watchConnected}
+          {$t("status.live")}
+        {:else}
+          {$t("status.lastUpdated", { values: { seconds: secondsAgo } })}
+        {/if}
       </p>
     </div>
     <div class="refresh-group">
-      <button class="btn" onclick={fetchStatus} disabled={loading}>
+      <button class="btn" onclick={refresh} disabled={loading}>
         {loading ? $t("common.refreshing") : $t("common.refresh")}
       </button>
     </div>
   </div>
 
-  {#if error}
+  {#if error || ($watchError && !$watchConnected)}
     <div class="error-banner">
-      {$t("status.failedToLoad", { values: { error } })}
+      {$t("status.failedToLoad", {
+        values: { error: error ?? $watchError },
+      })}
     </div>
   {/if}
 
@@ -260,8 +230,10 @@
         {/if}
         <div class="subsystem-list">
           {#each subsystems as sub (sub.key)}
-            {@const s = data.hardware[sub.key] as SubsystemStatus}
-            {@const needsConfig = s.status !== "connected"}
+            {@const s = data.hardware[sub.key]}
+            <!-- A connected row can still carry a startup problem (audio mapped past
+                 the device's channels): the fix is in the profile all the same. -->
+            {@const needsConfig = s.status !== "connected" || !!s.error}
             {@const isAudio = sub.key === "audio"}
             {@const dotColor = isAudio
               ? audioDotColor(s)

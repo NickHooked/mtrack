@@ -1,12 +1,28 @@
 # Hardware Profiles
 
-If you have multiple devices or run `mtrack` on multiple hosts sharing the same config file,
-you can use hardware profiles instead of the flat `audio:` / `midi:` / `dmx:` / `track_mappings:` sections.
-Each profile represents one complete host configuration with all subsystems. Profiles are filtered
-by hostname; the first match is used.
+A hardware profile is one complete host configuration: the audio device and its track
+mappings, the MIDI device, DMX universes, trigger inputs, controllers, status events and
+notification sounds. `mtrack.yaml` can carry several, so one project directory can be shared by
+several hosts; each host picks the profile that matches it.
+
+## Choosing a profile
+
+Profiles are matched by **hostname**. A profile with a `hostname` applies only on the host
+whose hostname equals it; a profile without one matches any host. Profiles are tried in order
+(file order in `profiles_dir`, list order inline) and the first match is used, so put
+host-specific profiles before a catch-all.
+
+mtrack reads the hostname from the `MTRACK_HOSTNAME` environment variable when it is set and
+non-empty, and from the operating system otherwise. Set the variable to test another host's
+profile, or when the OS hostname differs from the one you want to match on.
+
+When no profile matches, mtrack starts with no hardware: no audio, MIDI or DMX is opened, and the
+web UI runs so you can add a profile from its Config page. `mtrack verify <config> --hostname
+<name>` checks the profiles a given hostname would select and warns when none match.
+
+Inline, the profiles are a list under `profiles:`:
 
 ```yaml
-# Unified profiles: each entry defines one complete host configuration
 profiles:
   # Raspberry Pi A: Full setup with WING audio + MIDI + DMX
   - hostname: raspberry-pi-a
@@ -30,9 +46,6 @@ profiles:
     midi:
       device: "Behringer WING"
       playback_delay: 500ms
-      midi_to_dmx:
-        - midi_channel: 15
-          universe: light-show
     dmx:
       dim_speed_modifier: 0.25
       universes:
@@ -61,6 +74,15 @@ profiles:
       universes:
         - universe: 1
           name: light-show
+      lighting:
+        current_venue: main_stage
+        # The lighting layers, bottom to top (see Lighting Configuration, Layers); these are
+        # the defaults, and a profile that leaves them out gets them.
+        layers: [background, midground, foreground]
+        # The show the rig plays between songs (see Lighting Configuration).
+        ambient:
+          show: lighting/ambient.light
+          delay: 3s
 
   # Fallback: minimal audio setup for any host (no MIDI/DMX)
   - audio:
@@ -78,6 +100,9 @@ profiles:
 - A profile can define any combination of subsystems, enabling dedicated roles such as
   lighting-only nodes, MIDI-only controllers, or full audio + MIDI + DMX setups.
 
+Every key a profile accepts, with its default, is listed under
+[Profile keys](player-config.md#profile-keys) in the player configuration reference.
+
 **Per-track gain (`track_gains`):** an optional map of output-track names (the keys of
 `track_mappings`) to gain in dB, from -60 to +12 (values at or below -60 mute the track;
 tracks without an entry play at unity). Gains are adjustable live from the web UI Tracks
@@ -85,38 +110,37 @@ card, gRPC (`SetTrackGain` / `GetTrackGains`), and OSC (`/mtrack/track/*/gain`).
 changes are written back to the owning profile after a short debounce, so they survive
 restarts.
 
-Profiles with a `hostname` constraint only apply on hosts whose hostname matches. Profiles
-without a hostname constraint match any host. Set the `MTRACK_HOSTNAME` environment variable
-to override the system hostname (useful for testing or when the OS hostname differs from
-what you want).
+### Reserved track names
 
-The existing flat format (`audio:` + `track_mappings:` + `midi:` + `dmx:`) continues to work
-unchanged. At startup, legacy fields are automatically normalized into a single profile,
-so all internal code paths use the same profile-based logic.
+Three track names in `track_mappings` route audio that mtrack generates rather than a file
+from `song.yaml`:
+
+| Name | Routes |
+|------|--------|
+| `metronome` | the generated click of songs with a `metronome:` block (the song can rename it with `metronome.track`) |
+| `pilot` | pilot hint samples (renamed with `pilot.track`) |
+| `mtrack:looping` | the [notification sounds](#notification-audio) for section looping |
+
+A song refuses to load when one of its audio tracks shares a name with its metronome or pilot
+track, or when the two virtual tracks share one. Without a mapping a virtual track is silent.
+The web UI's track-mapping editor offers `mtrack:looping` alongside the track names found in
+your songs.
 
 ## External Profiles Directory
 
-Instead of defining all profiles inline, you can load them from individual YAML files in a
-directory. Each file defines one profile using the same format as inline profile entries.
+Instead of defining profiles inline, you can load them from individual YAML files in a
+directory. Each file defines one profile using the same keys as an inline entry, plus
+`kind: hardware_profile`.
 
 ```yaml
+# mtrack.yaml
 # Load profiles from a directory (path relative to this config file)
 profiles_dir: profiles/
-
-# Inline profiles still work alongside directory profiles.
-# Directory profiles are prepended before inline profiles.
-profiles:
-  # Fallback for any host not matched by a directory profile
-  - audio:
-      device: "Built-in Audio"
-      track_mappings:
-        click: [1]
-        backing-track-l: [1]
-        backing-track-r: [2]
 ```
 
 ```yaml
 # profiles/01-pi-a.yaml
+kind: hardware_profile
 hostname: raspberry-pi-a
 audio:
   device: "Behringer WING"
@@ -136,11 +160,35 @@ dmx:
 ```
 
 Files are sorted by filename for deterministic ordering. Use numeric prefixes
-(e.g., `01-pi-a.yaml`, `02-pi-b.yaml`, `99-fallback.yaml`) to control priority.
+(e.g., `01-pi-a.yaml`, `02-pi-b.yaml`, `99-fallback.yaml`) to control priority. Files with an
+extension other than `.yaml`/`.yml` are ignored; a file that fails to parse is an error at
+startup.
+
+The directory **replaces** an inline `profiles:` list: when it holds at least one profile, the
+inline list is ignored with a warning in the log. Only when the directory exists but holds no
+profile files does mtrack fall back to the inline list. A missing directory is an error. Keep a
+catch-all profile as a file in the directory (`99-fallback.yaml`) rather than inline.
+
+The web UI's Config page edits profile files in place, and runtime gain changes are written to
+the file the active profile came from. Every profile file loads and is listed, even two that
+share a stem (`stage.yaml` and `stage.yml`). The web UI addresses and links each profile file
+by its full file name (`#/config/stage.yml`), and opens, saves and deletes the file of the row.
+A row shows the stem, or the full file name when the stem could be taken for another file (one
+sharing it, or one named it: `stage.yaml` beside `stage.yaml.yaml`). An older link by stem
+(`#/config/stage`) opens the stem's `.yaml`, else its `.yml`. A file whose name is not UTF-8 is
+listed read-only, and one that does not parse is listed with why and not opened. A link that names no file
+says so and opens none. A new profile is created as what was typed (`<name>.yaml` for a stem),
+and only created: a name that reaches a file already there (`stage.yaml` with only
+`stage.yaml.yaml`, or `stage` with only `stage.yml`) is refused, as is one whose file would
+differ only in case from a file there (`Stage` beside `stage.yaml`). The file is created with
+the filesystem refusing one already there, so a name that differs from an existing one only by
+Unicode normalization (which macOS treats as the same) is refused too, never written over. The
+profile file calls of the gRPC `ConfigService` (see [gRPC](../interfaces/grpc.md#configservice)) take a full file name the directory lists, else a stem, which is its
+`.yaml`, else its `.yml`; with neither there, a full file name is created as written (`x.yml`).
 
 ## Controllers
 
-Controllers (gRPC, OSC, MIDI) are defined per-profile under the `controllers` key.
+Controllers (gRPC, OSC, MIDI, MCP) are defined per-profile under the `controllers` key.
 They are initialized after all hardware devices are ready.
 
 ```yaml
@@ -156,6 +204,8 @@ profiles:
       - kind: grpc
       - kind: osc
         port: 43235
+      - kind: mcp
+        port: 43237
       - kind: midi
         play:
           type: control_change
@@ -188,6 +238,11 @@ profiles:
           controller: 100
           value: 5
 ```
+
+The keys of each controller kind are documented in the
+[player configuration reference](player-config.md#a-profile-file); the interfaces themselves in
+[gRPC Control](../interfaces/grpc.md), [OSC Control](../interfaces/osc.md) and
+[MCP Control](../interfaces/mcp.md).
 
 ### Morningstar Integration
 
@@ -240,13 +295,38 @@ controllers:
       value: 7
 ```
 
+### Ambient Light and Auto Play
+
+MIDI controllers can also set the [ambient mode](../lighting/configuration.md#ambient-mode) and
+call off a song waiting to [auto play](../getting-started/playlists.md#auto-play). Each event is
+optional:
+
+```yaml
+controllers:
+  - kind: midi
+    play: { type: control_change, channel: 16, controller: 100, value: 0 }
+    # ... other events ...
+    ambient_on: { type: control_change, channel: 16, controller: 100, value: 8 }
+    ambient_off: { type: control_change, channel: 16, controller: 100, value: 9 }
+    ambient_auto: { type: control_change, channel: 16, controller: 100, value: 10 }
+    cancel_auto_play: { type: control_change, channel: 16, controller: 100, value: 11 }
+```
+
+`ambient_on` holds ambient light up now, over any song; `ambient_off` fades it out and plays
+none; `ambient_auto` gives it back to the player. `cancel_auto_play` leaves the player stopped
+on the waiting song, with ambient light up as after a stop.
+
 ## Status Events
 
 Status events are MIDI events emitted periodically to indicate the player's state. This is
 useful for driving LEDs on MIDI controllers. The statuses are emitted in a repeating cycle:
-Off (1 second) → On (250ms, either idling or playing) → Off → On → ...
+the **on** events (`idling_events` while stopped, `playing_events` while a song plays), held for
+1 second; then the `off_events`, held for 250 ms; then on again. They need a `midi` device in
+the same profile.
 
-Status events are configured per-profile:
+`auto_play_events` (optional) are sent in place of `idling_events` while a song waits out its
+[auto play](../getting-started/playlists.md#auto-play) gap, so an LED can show that the next
+song is about to start by itself. Without them, a waiting auto play shows as idling.
 
 ```yaml
 profiles:
@@ -273,10 +353,16 @@ profiles:
           channel: 16
           controller: 2
           value: 2
+      auto_play_events:
+        - type: control_change
+          channel: 16
+          controller: 2
+          value: 64
 ```
 
-Legacy top-level `status_events` in `mtrack.yaml` are automatically normalized into the
-matched profile at startup.
+A top-level `status_events` block in `mtrack.yaml` is the [legacy
+layout](player-config.md#legacy-layout): it is used only when the matched profile has no
+`status_events` of its own, and mtrack logs a warning asking you to move it into the profile.
 
 ## Notification Audio
 

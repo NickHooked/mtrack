@@ -4,8 +4,9 @@ target
 tarpaulin-report.json
 cobertura.xml
 lcov.info
-src/webui/svelte/node_modules/
+src/webui/svelte/node_modules
 src/webui/svelte/dist/
+src/webui/svelte/dist-stage/
 src/webui/svelte/src/gen/
 src/webui/svelte/playwright-report/
 src/webui/svelte/test-results/
@@ -13,3 +14,4 @@ docs/book/
 .playwright-mcp/
 tests/gdtf-corpus/
 tests/mvr-corpus/
+app/lib/gen/

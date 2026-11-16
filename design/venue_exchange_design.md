@@ -735,6 +735,45 @@ conversion unless it proves cheap.
 4. **MVR export before GDTF export**, the generated minimal GDTF serving both.
 5. **Per-cell control stays out** of P2.
 
+### 16.8 As built: any venue in 3D, and true size (2026-10-01)
+
+**Any venue.** (The page has since gone: 3D is a view on the venue's stage card,
+`#/lighting/venues/<venue>?view=3d` — lighting UI design §13. The source rules below are
+unchanged.) The page's venue was part of its address, `#/lighting/stage/<venue>`; a
+venue's plot linked there. No venue named, or the engine's current venue, is drawn live as
+before. Any other venue is drawn from its file through `GET
+/api/lighting/venues/<name>/scene`, which answers in the shape of the websocket's metadata
+(per fixture: type, mode, position, rotation, rig path; the venue's focus points and
+scenery path), from the files alone, as `/patch` does: loading the system expands every
+venue fixture's (archive, mode) and writes its rig to the store, so the paths it names
+exist. A fixture whose type or mode does not load has no rig and is drawn generically.
+The file view lights every fixture a neutral white at rest; Preview is off for it (it
+evaluates against the engine's venue). An unknown name is a 404 and a message, never the
+current venue.
+
+**True size.** The world is meters throughout. GDTF (DIN SPEC 15800, "Model", table 32):
+"The dimension XML attributes of model (see table 32) are always used, no matter the
+scaling and ratio of the mesh file. The mesh is explicitly scaled to this dimension", with
+"The length defines the dimension of the model on the X axis, the width on the Y axis and
+the height on the Z axis", and a default of 0. Blender DMX (`gdtf.py`, `loadModel`) does
+exactly that, per axis, for glb and 3ds alike: it joins the imported parts with their
+transforms applied, then sets scale to declared ÷ the mesh's dimensions on each axis
+(measured Z-up, after the glTF importer's turn). So the rig's `Model` shape carries the
+Model's `size` (`RIG_VERSION` 3), and the scene fits the mesh's bounding box — in its own
+frame, node transforms applied, after the Y-up→Z-up turn — to it per axis about the
+mesh's origin (`lib/stage/fit.ts`). A Model with any dimension 0 states no size and its
+mesh is drawn as the file has it (Blender DMX would flatten it; the corpus has none).
+`tests/gdtf_model_size_corpus.rs` measures every glb against its declared size: of 51
+(archive, model) pairs across 13 fixture types, 30 agree within 2%, 5 within 10%, and 16
+differ by more — all of them pixel or lens models (Astera Hyperion's pixels share one 2 m
+tube mesh, up to ×40 too long; Robe Tetra2/TetraX pixel plates ×5 too thick). Fixture
+bodies were already true; cells were not.
+
+Two things are conventions, not measurements: a beam's angle is the GDTF's, its length is
+capped by beam type (spot 24 m, wash 8 m, others 0.9 m); and the deck is an extent around
+the fixtures and focus points (at least 8 × 6 m, 1 m margin, widened by MVR scenery), not a
+stored venue size.
+
 ## 17. P3 in detail: per-cell control (draft 1, 2026-09-19)
 
 Every pixel fixture mtrack imports today is ganged: the first cell's channels are the
@@ -1115,3 +1154,304 @@ than a hand-written file, for fixtures that increasingly have manufacturer GDTFs
 channel mapping, and an agent working through mtrack's MCP tools can perform it from OFL's
 JSON export. Manufacturer GDTF first, hand-written or agent-written `.fixture` second,
 mtrack never modelling fixtures itself.
+
+## 21. A fixture type is the fixture, not one of its modes (draft 1, 2026-09-30)
+
+*Superseded in part by §22: there is no default mode, and the type line names none.*
+
+### 21.1 The finding
+
+A referential fixture type pins an archive **and a mode** (§4.1), so what mtrack calls a
+fixture type is one DMX personality of a fixture. The Fixtures page shows it that way:
+`Astera-PixelBrick` is `pb15.gdtf` at "8: RGBS", and nothing on the page says the brick
+has other modes or what they would let a show do. To learn that, the archive has to be
+uploaded again and the import picker read.
+
+That is not how anyone thinks about a fixture, and it is not how MVR states a rig: there
+the fixture type is the `GDTFSpec` and the mode is a property of each patched fixture
+(`GDTFMode`, §6). mtrack folds the two together on import, which is why
+`name_fixture_types` has to invent names like `Name (Mode)` when one file patches a
+fixture in two modes, and why changing a rig's mode means importing a second type and
+re-pointing every venue line at it.
+
+The expectation, as stated: *a fixture type should be clear on what capabilities are
+possible for that fixture.*
+
+### 21.2 What changes
+
+**The type is the archive.** The mode on the type line becomes the type's *default*, and a
+venue fixture may choose its own:
+
+```
+# lighting/fixture_types/astera_pixelbrick.fixture — unchanged, and still valid
+fixture_type "Astera-PixelBrick"
+  from gdtf("lighting/library/pb15.gdtf", mode "8: RGBS")
+{
+}
+
+# a venue: seven bricks in the type's default mode, one in another
+fixture "Brick1" Astera-PixelBrick @ 1:1
+fixture "Brick8" Astera-PixelBrick mode "9: RGBWS" @ 1:29
+```
+
+- `mode "<name>"` on a venue fixture line, after the type. Matched as MVR modes are
+  (§6: exact, then normalized with a warning; never by footprint here, there is no
+  patched count to match against). Absent, the fixture takes the type's default.
+- The mode on the type line stays, and stays optional to *omit* only when every fixture
+  of the type names its own — a type with no default and a fixture with no mode is a
+  load error naming both.
+- A native type has no modes. `mode` on a fixture of one is a load error, not ignored.
+  mtrack does not grow multi-mode syntax for hand-written types (§19: not a
+  fixture-modelling tool).
+- The type's body — movement limits today — applies to every mode. Those are facts about
+  the fixture, which is what the body was for.
+
+Every existing `.fixture` and `.venue` means what it meant. Nothing is migrated.
+
+### 21.3 Underneath
+
+Less than it looks, because the engine already works per fixture:
+
+- **Registry.** `LightingSystem::fixture_types` is keyed by type name and holds one
+  expansion. It becomes type name → the modes in use, each expanded on demand.
+  `FixtureInfo` already carries its own channels and cells, so the effect engine, the
+  resolution layer and the DMX writer do not see the change.
+- **Cache.** `DistillCache::key` already hashes the mode with the archive, the type's name
+  and the overrides; `rig_path` already keys the rig by archive and mode. No format
+  change, no version bump. Prewarm fills the modes the venue uses, not every mode.
+- **Footprint.** The fit report reads a fixture's capabilities from its own mode instead
+  of its type's. Nothing today checks a venue for two fixtures patched over each other;
+  while the footprint was a fact of the type that was a typing mistake, and once a
+  per-fixture choice changes it, it is one click away. A patch-overlap check (load warning
+  and readiness line, naming both fixtures and the addresses) lands with slice 1.
+- **Stage 3D.** The fixture metadata already names a rig per fixture.
+
+### 21.4 Import and export
+
+- **`import-gdtf`.** Writes the same file. `--mode` (and the UI picker) chooses the
+  *default*; it stops being the only mode the type can ever be.
+- **MVR import.** One `.fixture` per embedded GDTF, not per (GDTF, mode). The default is
+  the mode most fixtures of that type use in the file; fixtures in any other mode get
+  `mode "…"` on their venue line. The `Name (Mode)` disambiguation goes; the archive-stem
+  one stays for two different archives with one fixture name. A merge (§4.2) that finds a
+  fixture's mode changed updates the line's `mode`, as it updates an address.
+- **MVR export.** `GDTFMode` is the fixture's mode. One embedded GDTF per type, as now.
+
+### 21.5 Surfaces
+
+- **Fixtures page.** A GDTF type's page is the fixture: 3D render, every mode with its
+  footprint, cells, what a show can do in it and its channel map, the default marked, and
+  which venue fixtures use which mode. The read-only half of this (render, mode list) is
+  built ahead of this section and does not depend on it.
+- **Venue inspector.** A mode select on a fixture of a GDTF type, listing the modes with
+  footprints. Choosing one whose footprint runs over a neighbour's addresses is refused
+  with the neighbour named (the slice 1 check, asked before the save).
+- **Readiness / fit.** Unchanged in shape; per-fixture as they are.
+- **MCP / CLI.** Whatever reports on a fixture type by name gains an optional mode;
+  `import-gdtf --mode` keeps its spelling and now means the default.
+
+### 21.6 Decisions (settled 2026-09-30)
+
+1. **Adopted.** The type is the fixture; the mode is the venue fixture's. The alternative —
+   leave the model alone and let the Fixtures page show the whole archive behind each pinned
+   type — answers "what can this fixture do" and nothing else: a second mode is still a
+   second type.
+2. **The type line keeps a default mode.** Requiring a mode on every venue fixture is the
+   purer model, and it would rewrite every referential `.fixture` and every venue line that
+   uses one for a rig that is nearly always in one mode.
+3. **MVR import's default is the most-used mode in the file**; fixtures in any other mode
+   carry `mode "…"` on their line. A tie goes to the mode that sorts first, so an import is
+   reproducible.
+4. **Nothing folds an older two-types-for-two-modes project.** `.fixture` and `.venue` have
+   not shipped in a release, so there is none to fold; such files keep loading as what
+   they say.
+
+### 21.7 Slices
+
+1. Grammar, parser, `Fixture` gains an optional mode; registry keyed by (type, mode);
+   load errors; fit per fixture; the patch-overlap check. No surface changes.
+2. MVR import, merge and export carry the mode per fixture.
+3. Venue inspector mode select; Fixtures page "used by" per mode; docs.
+
+## 22. A GDTF in the library is a fixture; a venue fixture says its mode (decided 2026-10-01)
+
+### 22.1 The finding
+
+§21 made a fixture type the whole archive, and the surfaces did not follow. Importing a
+GDTF in the web UI still asked for a mode and a name before anything existed; the
+fixture's page showed "Saved as astera_pixelbrick.fixture" and offered the file as text;
+type pickers marked a type "(no default mode)" as though something were unfinished. To a
+user that is a second thing to make — a translation of the GDTF into mtrack's terms — when
+the GDTF already says everything. Stated as the requirement:
+
+- Import a GDTF, then go to a venue and add a fixture in **any** of its modes, having done
+  nothing else.
+- From the UI there is no distinction between the GDTF and a fixture made from it.
+- The `.fixture` file of a GDTF type is an implementation detail and is shown nowhere.
+
+### 22.2 The decision
+
+**A GDTF in the library is a fixture.** mtrack's files are the source of truth everywhere
+else — a directory with a song file is a song — and a `.gdtf` copied into
+`lighting/library/` that was not a fixture until something "imported" it would be the one
+place a file on disk needs a ceremony. So:
+
+- **The archive alone is a type.** At load, every `.gdtf` in `lighting/library/` that no
+  `.fixture` file points at is registered as a fixture type: named from the archive's own
+  fixture name (the importer's rule), with no movement limits. Nothing is written beside
+  it.
+- **Import is a copy.** Choosing an archive in the web UI, or `mtrack import-gdtf <file>`,
+  validates it and puts it in the library. No mode, no name, no second file. The same bytes
+  again change nothing; a file of the same name with other bytes is refused, since venues
+  may already depend on it.
+- **The `.fixture` file is for what a GDTF does not say**, and only then: a different name,
+  a mover's speed limits. Changing one of those on the fixture's page writes
+  the file; a fixture nobody has changed has none. It is mtrack's record — never named,
+  shown or offered as a file. An archive a record points at is the fixture the record
+  names, not a second one.
+- **Names.** Two archives that state the same fixture name, neither with a record: the one
+  whose file name sorts first keeps the name, the other is registered as `Name (stem)`, and
+  both are named in a load warning and in readiness. Renaming either from its page writes a
+  record and pins both. The import surfaces see the collision coming and say what the
+  newcomer will be called, and write a record pinning that name so a file added
+  later cannot rename it under a venue.
+- **Parsing stays at the boundary (§3).** A name is read from an archive once per content
+  hash and kept in the cache; a new or changed archive is parsed at load, loudly, never at
+  a cue. An archive that does not parse is not a fixture and is reported by file name; it
+  does not stop the rest.
+- **There is no default mode.** A venue fixture of a GDTF type always says its mode:
+  `fixture "Brick1" Astera-PixelBrick mode "8: RGBS" @ 1:1`. This replaces §21's default on
+  the type line (§21.6 decisions 2 and 3). A default was the last piece of translation — a
+  thing set on mtrack's side of the GDTF before a venue line meant anything — and it made a
+  line's meaning depend on a file elsewhere: changing it re-moded every fixture that leaned
+  on it, which needed a confirm to be safe. Now a line means what it says. `from gdtf("…")`
+  takes no mode; one that still has it is refused with a message saying where the mode goes;
+  a GDTF-type fixture with no mode is a load error that lists the archive's modes.
+- **Every mode is there in the venue.** The venue form and the inspector offer every mode
+  with nothing to set up; a new row takes the previous row's mode when it is the same type,
+  else the first mode mtrack can drive, so Add Fixture then Save is always a valid line.
+- **MVR import writes the mode on every line** and, having no default to record, no
+  `.fixture` at all — unless a name must be pinned (above).
+- **Delete removes the archive** (and the record, if there is one), unless another record
+  points at the same archive. If venues use the fixture the confirm says which and how
+  many, and that they will stop loading.
+- **CLI and MCP follow.** `import-gdtf <file>` copies into the library; `--name` writes a
+  record with it; `--mode` is gone; listing modes without importing is an explicit flag.
+
+### 22.3 Considered and not done
+
+**Always writing the record at import.** The first cut of this section kept a `.fixture`
+per archive, written at import and hidden. It changed no loader code, and it left a GDTF
+copied into the library by hand as a file that is not a fixture — against how every other
+mtrack file works. Rejected for that.
+
+**No record at all.** The name venues use and a mover's speed limits have to live
+somewhere the user can change them; a file beside the others is where mtrack keeps such
+things. It exists only when there is something in it.
+
+## 23. A fixture's own beam angle, and light on the deck (as built 2026-10-02)
+
+### 23.1 The finding
+
+PixelBricks on the floor, aimed up at the band, with a diffuser fitted. On the real stage
+the floor in front of them takes their colour; in 3D each was a 13° cone into the air and
+the deck stayed dark, with a caveat saying their beams "miss the deck". Two things were
+wrong. The GDTF describes the bare lens, and nothing said a unit had a diffuser on it. And
+the scene asked where a beam's *centre* lands, when a wide beam from floor height puts its
+whole lower half on the floor without its centre ever meeting it.
+
+### 23.2 `beam_angle` on the venue fixture
+
+    fixture "Brick1" Astera-PixelBrick mode "9: RGBWS" @ 1:29 position (1, 0.5, 0.1) rotation (120, 0, 0) beam_angle 60
+
+Degrees, greater than 0 and at most 180; absent is the type's own angle. It is on the venue
+fixture, not the fixture type, because a diffuser is fitted to a unit: the same type can be
+in a rig with and without one. It is a drawing hint and nothing else — the engine carries
+it to the web UI (metadata, the venue's JSON, `/scene`) and reads it nowhere. Like position
+and rotation it makes the venue a `.venue` file. MVR has no place for it: export does not
+write it, and a re-import keeps it on every fixture that survives, without listing it among
+the hand edits to choose (it cannot conflict with the file). The inspector on the Venues
+page edits it.
+
+The field angle follows: the type's own field-to-beam proportion when its GDTF states both
+(trusted up to 2), else 1.6, capped at a half-space. A cone in the air is drawn no wider
+than 120°.
+
+### 23.3 Light on the deck
+
+The cones stay: they are the beam in the air (haze), and they are how a mover's aim reads.
+The deck gains what the same beams do to it (`lib/stage/decklight.ts`). At each point of
+the deck, for each lit beam: full inside the beam angle, fading to nothing at the field
+angle; outside that a 2% spill (lens scatter, the housing's glow), the same for any beam;
+times the cosine of incidence, over distance squared (no nearer than 0.3 m). It is
+part of the deck's own material — three's standard one, with a sum over up to 64 beams from
+a float texture (the strongest are kept past that) added to its shader as the surface's
+glow — real lighting for the one surface that matters, with no per-light cost anywhere
+else. (As first built it was a second, additive surface on the deck's plane. Two surfaces
+on one plane do not agree about which is in front from one camera position to the next, so
+the light broke into stripes whenever the camera moved; one surface cannot.) The formula is also plain TypeScript, tested
+as numbers.
+
+Brightness is relative, not photometric. Every fixture is taken to put out the same light,
+so the same fixture through a wider beam is thinner and a narrow beam is brighter (beams
+under 8° count as 8°); a fixture's lenses share its light. GDTF's `LuminousFlux` is not
+used: too many files leave it at the default. The sum is compressed on its brightest
+channel (level ÷ (level + 0.3)), as an eye adapts, so a strong light saturates without
+changing hue. The unit is a 25° fixture straight down from 4 m.
+
+### 23.4 Not done
+
+- **Bounce.** Light coming back off the band, the backline and a backdrop is not modelled.
+  The spill term tints the whole deck faintly, which reads a little like it and is not it.
+- **Scenery, truss and the band are not lit**, and nothing casts a shadow. Real spot lights
+  would do both and cost per light per pixel on every surface; shadows a render pass each.
+- **The "beams miss the deck" caveat is gone.** A beam aimed up is usually on purpose, and
+  with the deck lit by the cone rather than the centre ray, "misses" no longer describes
+  anything.
+
+## 24. The strobe curve: how a rate in hertz becomes DMX (as built 2026-10-02)
+
+mtrack used to put every strobe rate through one formula: linear in the flash *period* across
+the strobe function's DMX range (10 Hz on the PixelBrick's 0.4–25 Hz over 7–255 → 248). That
+was measured right on real PixelBricks, whose GDTF says otherwise (linear in Hz: 10 Hz → 104),
+and it is wrong for a fixture that does what its file says. Robe's files go further and give
+their strobe a 10–12 step table that is neither. The file cannot tell us which units lie, so
+the curve is a setting of the fixture type.
+
+- **Model.** `StrobeCurve { Period, Linear, Declared }` (`lighting::types`). `FixtureType`
+  holds the stated curve as `Option` (none = automatic) and answers
+  `effective_strobe_curve()`: stated, else `Declared` for a GDTF-sourced type (the GDTF
+  spec's reading: the function's table, linear in Hz when it has only endpoints) and `Period`
+  for a hand-written one (mtrack's behaviour before the setting; nothing declares a curve
+  for it). The venue loader puts the effective curve on `FixtureInfo::strobe_curve`, beside
+  the movement limits.
+- **The table.** `ChannelFunction` gained `steps: Vec<FunctionStep>` (`dmx_from`, `dmx_to`,
+  `from`, `to` in Hz). The GDTF parser keeps each ChannelFunction's ChannelSets; the
+  distiller (`strobe_steps`) turns a `Shutter*Strobe` function's sets into steps — DMXFrom
+  to the next set's DMXFrom − 1 (the last to the function's end), PhysicalFrom..PhysicalTo
+  (a missing PhysicalTo holds PhysicalFrom); sets with no physical value bound their
+  neighbours but are not steps. The cache format grew, so `DISTILLER_VERSION` is 8. The
+  expansion's cache key is unchanged by the curve: it changes no channel, and is set on the
+  expanded type after the cache read.
+- **The one normalisation site** (`engine/processing.rs`, `apply_strobe`). `Declared` with a
+  table: the first step in DMX order whose Hz range holds the rate, interpolated inside it;
+  a rate in a gap or past either end goes to the nearest step end (`declared_dmx`); the byte
+  is rounded and sent at the centre of its bin so truncation lands on it. `Linear`, and
+  `Declared` with only endpoints: one step from the function's own endpoints and DMX range,
+  so a descending function (Martin's 20→1 Hz) is followed in its direction:
+  `DMX = from + (hz − hz_from)/(hz_to − hz_from) × (to − from)`, clamped. A v1 type with no
+  function in hertz keeps the min/max/offset formula. `Period` is the old formula, unchanged.
+- **DSL and record.** `strobe_curve: period | linear | declared` in any fixture type body
+  (`.light`, `.fixture`, a GDTF record). `fixture_patch` adds, changes and removes it like
+  the movement block; a record still exists only once something is set, and automatic is
+  "no statement". MVR import never writes it, the generated GDTF ignores it.
+- **Surfaces.** Settings `GET/POST …/settings` carry `strobe_curve` (null = automatic) and,
+  read from the archive, `strobe: {steps, automatic}` (null when no mode has a strobe rate
+  in Hz); the fixture page's settings show a **Strobe curve** select only then, with the
+  table's own option only when there is a table. MCP's `list_fixture_types` gives each
+  type's `strobe_curve` and `strobe_curve_in_use`.
+- **Corpus** (54 GDTFs in the gdtf.eu MVR samples plus the PB15, 47 distinct;
+  `tests/strobe_curve_corpus.rs`): 9 have a table (Robe 10–12 steps, Prolights 2, Roxx S2
+  1), 13 only endpoints (Astera, Martin, Roxx B-FC, Robe Tetra2/TetraX, SGM), 25 no strobe
+  rate. Under the default every tabled fixture follows its table and every endpoints-only
+  one is linear in Hz — including the PixelBrick, whose record must say `period`.

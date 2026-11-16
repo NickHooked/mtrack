@@ -23,9 +23,15 @@ use tracing::{error, info};
 use crate::{dmx, playsync::CancelHandle, songs::Song};
 
 use super::{
-    decide_cleanup_action, resolve_playback_outcome, CleanupAction, PlayHandles, PlaybackContext,
-    PlaybackResult, Player, ReactiveLoopState,
+    decide_cleanup_action, resolve_playback_outcome, CleanupAction, LoopExit, PlayDeclined,
+    PlayHandles, PlayPosition, PlaybackContext, PlaybackResult, Player, ReactiveLoopState,
 };
+
+/// The entry whose gap the player is in on `playlist`: the one it is on,
+/// but for none after the last song has played to its end.
+fn waiting_entry_at(playlist: &crate::playlist::Playlist, past_last_entry: bool) -> Option<usize> {
+    playlist.entry().filter(|_| !past_last_entry)
+}
 
 impl Player {
     /// Plays the song at the current position. Returns the song if playback started successfully.
@@ -35,8 +41,19 @@ impl Player {
     /// A pending start position (set by seeking while stopped) is consumed
     /// and playback starts there instead of the beginning.
     pub async fn play(&self) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
-        let start_time = self.take_pending_start().unwrap_or(Duration::ZERO);
-        self.play_from(start_time).await
+        self.play_at(None).await
+    }
+
+    /// Why a play returned no song, read from the player's state rather than
+    /// assumed: the one derivation every surface answers with.
+    pub async fn play_declined(&self) -> PlayDeclined {
+        if self.is_playing().await {
+            PlayDeclined::AlreadyPlaying
+        } else if self.get_playlist().songs().is_empty() {
+            PlayDeclined::EmptyPlaylist
+        } else {
+            PlayDeclined::NotStarted
+        }
     }
 
     /// Plays the song starting from a specific time position.
@@ -47,30 +64,59 @@ impl Player {
         &self,
         start_time: Duration,
     ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
-        // Reject playback if hardware hasn't finished initializing.
-        if !*self.init_done_tx.borrow() {
-            return Err("Hardware is still initializing".into());
-        }
+        self.play_at(Some(start_time)).await
+    }
 
+    /// Plays the song from `start_time`, or with none, from the pending
+    /// start position, or the beginning.
+    async fn play_at(
+        &self,
+        start_time: Option<Duration>,
+    ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
         let mut join = self.join.lock().await;
         if join.is_some() {
+            // A looping song ending: stopped a moment from now.
+            if self.loop_exit() == LoopExit::End {
+                info!("The song is ending; play again once it has.");
+                return Ok(None);
+            }
             // If the current song is looping, break out immediately with crossfade.
             // Fade out current audio, then cancel so subsystems exit. The cleanup
-            // task sees loop_broken and auto-plays the next song.
+            // task sees the loop broken and auto-plays the next song.
             if self.is_current_song_looping() {
                 info!("Breaking out of song loop to advance playlist.");
-                self.fade_out_current_audio();
-                self.loop_break.store(true, Ordering::Relaxed);
-                if let Some(ref handles) = *join {
-                    handles.cancel.cancel();
-                }
+                self.break_loop(&join, false);
                 return Ok(None);
             }
             info!("Player is already playing a song.");
             return Ok(None);
         }
 
-        self.play_from_locked(start_time, &mut join).await
+        // Taken under the join lock, as `play_locked` takes it. A pause holds
+        // a hardware reload off by its position, and one that took the lock
+        // after the position was taken found the player idle and reset the
+        // hardware: the resume was refused, its position thrown away.
+        // Play with no position of its own on a paused song resumes it, and
+        // a section loop armed before the pause loops on. The position is
+        // read, not taken: the start clears it once it is under way, so a
+        // start turned down (hardware still initializing) keeps it.
+        let resume = start_time.is_none() && self.is_paused();
+        let start_time =
+            start_time.unwrap_or_else(|| self.pending_start().unwrap_or(Duration::ZERO));
+        self.start_playback(start_time, &mut join, resume).await
+    }
+
+    /// Plays the song at the current position, as [`Player::play`] does,
+    /// with the join lock held and no playback in it: for a song the player
+    /// starts by itself, so that a stop taking the lock after the decision
+    /// to start it stops it rather than coming before it.
+    pub(super) async fn play_locked(
+        &self,
+        join: &mut Option<PlayHandles>,
+    ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
+        // Read, not taken, as by `play_at`: the start clears it.
+        let start_time = self.pending_start().unwrap_or(Duration::ZERO);
+        self.play_from_locked(start_time, join).await
     }
 
     /// Inner implementation of play_from that assumes the caller already holds the join lock
@@ -79,6 +125,46 @@ impl Player {
         &self,
         start_time: Duration,
         join: &mut Option<PlayHandles>,
+    ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
+        self.start_playback(start_time, join, false).await
+    }
+
+    /// [`Player::play_from_locked`], as a fresh start, or as the resume of a
+    /// paused song (`resume`), which keeps the section loop it was in.
+    async fn start_playback(
+        &self,
+        start_time: Duration,
+        join: &mut Option<PlayHandles>,
+        resume: bool,
+    ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
+        // Asked under the join lock, and only here: a hardware reload resets
+        // the hardware under it, and a check made before the lock was taken
+        // could pass for a reload that ran since, leaving this start on
+        // hardware still being brought up.
+        if !*self.init_done_tx.borrow() {
+            return Err("Hardware is still initializing".into());
+        }
+        // The song counts as playing from before the playlist is read for
+        // it: a reload either swaps the playlist in first, so the song read
+        // is the new one's, or sees it playing and keeps it current.
+        {
+            let _moves = self.playlist_moves.lock();
+            self.song_playing.store(true, Ordering::Relaxed);
+            self.transport.lock().past_last_entry = false;
+        }
+        let started = self.start_locked(start_time, join, resume).await;
+        if join.is_none() {
+            self.song_playing.store(false, Ordering::Relaxed);
+            self.reload_deferred_hardware();
+        }
+        started
+    }
+
+    async fn start_locked(
+        &self,
+        start_time: Duration,
+        join: &mut Option<PlayHandles>,
+        resume: bool,
     ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
         let _enter = self.span.enter();
 
@@ -90,9 +176,44 @@ impl Player {
                 return Ok(None);
             }
         };
+        // The song's colours are settled here, once, and travel with the
+        // playback: its own palette overrides, then those of the playlist
+        // entry it plays from, which is none for a song off the list. An
+        // edit to either file takes effect from the next start.
+        let palette = Arc::new(song.palette_for_play(playlist.palette_of(playlist.entry())));
+        if let Err(e) = super::seek::check_start_position(&song, start_time, "play from") {
+            // A kept position the song can no longer play from (a reload
+            // shortened it) goes, or every Play after would fail on it. Only
+            // a start turned down before this, with the hardware still
+            // initializing, keeps it.
+            if self.pending_start() == Some(start_time) {
+                self.clear_pending_start();
+            }
+            return Err(e.into());
+        }
 
-        // Any explicit playback start supersedes a pending seek position.
+        // The song is at its start position from here until its clock
+        // starts (#634): stamped before the pending position goes, so a
+        // status in between reads one or the other, and before the playback
+        // that stamps the running clock goes in. (Out of the span: its guard
+        // cannot be held over an await.)
+        drop(_enter);
+        *self.play_start_time.lock().await = Some(PlayPosition::Starting(start_time));
+        let _enter = self.span.enter();
+        // Any explicit playback start supersedes a pending seek position, and
+        // an auto play waiting to start.
         self.clear_pending_start();
+        self.cancel_auto_play();
+        // A song ending fades on out under this one, as under the song a
+        // loop break moves to; ambient light no longer follows it.
+        self.end_ending();
+        // A fresh start begins with no section loop, and the reactive loop
+        // over. A resume keeps the loop the pause left armed, offered or
+        // looping, as the operator left it; only its count of the jumps due
+        // when it was armed starts over, as the new playback's log goes in.
+        if !resume {
+            self.section_loop.reset();
+        }
 
         // Load samples for this song (if not already loaded)
         self.load_song_samples(&song);
@@ -113,15 +234,21 @@ impl Player {
         let hw = self.hardware.read().clone();
 
         // Validate lighting shows before starting playback
-        if let Some(ref dmx_engine) = hw.dmx_engine {
-            if let Err(e) = dmx_engine.validate_song_lighting(&song) {
-                error!(
-                    song = song.name(),
-                    err = %e,
-                    "Lighting show validation failed, preventing song playback"
-                );
-                return Err(e);
-            }
+        let invalid = hw.dmx_engine.as_ref().and_then(|dmx_engine| {
+            let e = dmx_engine.validate_song_lighting(&song).err()?;
+            error!(
+                song = song.name(),
+                err = %e,
+                "Lighting show validation failed, preventing song playback"
+            );
+            // Its message: the error itself cannot be held over the await.
+            Some(e.to_string())
+        });
+        if let Some(message) = invalid {
+            // Nothing starts: no position.
+            drop(_enter);
+            *self.play_start_time.lock().await = None;
+            return Err(message.into());
         }
 
         // Warn about tracks with no mapping in the config.
@@ -135,16 +262,14 @@ impl Player {
         let cancel_handle_for_cleanup = cancel_handle.clone();
         let (play_tx, play_rx) = oneshot::channel::<Result<(), String>>();
 
-        // Reset loop time consumed for the new song.
-        *self.loop_time_consumed.lock() = Duration::ZERO;
-
         let join_handle = {
+            let clock = hw.clock_source.new_clock();
             let ctx = PlaybackContext {
                 device: hw.device.clone(),
                 mappings: hw.mappings.clone(),
                 midi_device: hw.midi_device.clone(),
                 dmx_engine: hw.dmx_engine.clone(),
-                clock: hw.clock_source.new_clock(),
+                clock: clock.clone(),
                 song: song.clone(),
                 cancel_handle: cancel_handle.clone(),
                 play_tx,
@@ -152,9 +277,27 @@ impl Player {
                 play_start_time: play_start_time.clone(),
                 loop_control: crate::playsync::LoopControl {
                     loop_break: self.loop_break.clone(),
-                    active_section: self.active_section.clone(),
-                    section_loop_break: self.section_loop_break.clone(),
-                    loop_time_consumed: self.loop_time_consumed.clone(),
+                    active_section: self.section_loop.active.clone(),
+                    section_loop_break: self.section_loop.break_requested.clone(),
+                    break_fade: self.break_fade.clone(),
+                    break_fade_ids: self.break_fade_ids.clone(),
+                    start_fade: self.start_fade.clone(),
+                    palette,
+                    section_jumps: {
+                        let log = Arc::new(crate::playsync::SectionJumpLog::default());
+                        log.set_timeline(clock.clone(), start_time);
+                        // Under the log's lock, which an arm counts its jumps
+                        // under: one landing during the resume counts from
+                        // the old log or the new one, never the old log's
+                        // count kept against the new log, which read as not
+                        // yet looping for good.
+                        let mut jumps = self.section_jumps.lock();
+                        *jumps = log.clone();
+                        if resume {
+                            self.section_loop.resume();
+                        }
+                        log
+                    },
                 },
             };
             tokio::task::spawn_blocking(move || {
@@ -166,16 +309,23 @@ impl Player {
             cancel: cancel_handle.clone(),
         });
 
+        // The playback's cleanup cancels this as it goes, however it ends. A
+        // song that ends by itself is never cancelled, and the poller below,
+        // waiting on that alone, outlived it: one more for each song.
+        let playback_done = tokio_util::sync::CancellationToken::new();
+
         // Spawn section boundary polling task for reactive looping.
         {
             let player = self.clone();
             let cancel = cancel_handle.clone();
-            // Reset reactive state for new song.
-            *self.reactive_loop_state.write() = ReactiveLoopState::Idle;
+            let done = playback_done.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(50));
                 loop {
-                    interval.tick().await;
+                    tokio::select! {
+                        _ = done.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
                     if cancel.is_cancelled() {
                         break;
                     }
@@ -190,18 +340,37 @@ impl Player {
             let player = self.clone();
             let song = song.clone();
             tokio::spawn(async move {
+                let _poller = playback_done.drop_guard();
                 let result = match play_rx.await {
                     Ok(Ok(())) => PlaybackResult::Success,
                     Ok(Err(e)) => PlaybackResult::Failed(e),
                     Err(_e) => PlaybackResult::SenderDropped,
                 };
 
+                let succeeded = matches!(result, PlaybackResult::Success);
+                // Whoever took this playback out of `join` -- a stop, a pause,
+                // a seek -- cleaned up after it, and a seek or a play since may
+                // have put its own there. A song ending by itself while one of
+                // them waits for the lock must leave it all alone, or it moves
+                // the playlist on under a seek's restart or a pause's kept
+                // position, and drops the playback that follows. What it ended
+                // by is read under the lock too: a loop break comes in under
+                // it, and the flags belong to whichever playback holds it.
+                // Owned, so that a loop break's next song can start under it.
+                let mut join = player.join.clone().lock_owned().await;
+                if !join
+                    .as_ref()
+                    .is_some_and(|handles| handles.cancel.same_as(&cancel_handle_for_cleanup))
+                {
+                    return;
+                }
                 let cancelled = cancel_handle_for_cleanup.is_cancelled();
                 // Playback that ended itself, as distinct from one that stop()
                 // or a seek ended: only the former has nobody to clean up after
                 // it. See decide_cleanup_action.
                 let self_cancelled = cancel_handle_for_cleanup.cancelled_due_to_failure();
-                let loop_broken = player.loop_break.swap(false, Ordering::Relaxed);
+                let exit = player.take_loop_exit();
+                let loop_broken = exit != LoopExit::None;
 
                 info!(
                     song = song.name(),
@@ -210,18 +379,63 @@ impl Player {
                     "Song finished playing."
                 );
 
+                if exit == LoopExit::End {
+                    // A looping song ending: stopped where it is, as a stop
+                    // leaves it, while its fade plays out.
+                    *player.play_start_time.lock().await = None;
+                    *join = None;
+                    player.section_loop.reset();
+                    player.song_playing.store(false, Ordering::Relaxed);
+                    player.stop_run.store(false, Ordering::Relaxed);
+                    *player.start_fade.lock() = None;
+                    // Stopped, a song an edit took off the list while it
+                    // ended gives way to the entry in its place, as at a
+                    // stop's cut, or Play would start it again (#576).
+                    let (playlist, settled) = player.move_playlist(|playlist| playlist.settle());
+                    if let Some(current) = playlist.current().filter(|_| settled) {
+                        player.emit_song_change(&current);
+                    }
+                    player.reload_deferred_hardware();
+                    return;
+                }
+
                 let action = decide_cleanup_action(result, cancelled, loop_broken, self_cancelled);
                 if action == CleanupAction::StopCancelled {
-                    // stop() already cleared join and play_start_time.
-                    // Touching them here would clobber state from a new play() that
-                    // may have started after stop() returned.
+                    // stop() already cleared join and play_start_time, and
+                    // took the playback out of `join` as it did, so the check
+                    // above has returned already. Kept as a backstop.
                     return;
                 }
 
                 // Natural finish or loop break: advance playlist and clean up.
-                let mut join = player.join.lock().await;
-                if let Some(song) = playlist.next() {
+                // A loop broken by previous goes back instead.
+                // The playlist as it is now, not as it was when the song
+                // started: an edit since replaces it, the place it had got to
+                // carried over (#576).
+                let (playlist, (from, at_end, moved)) = player.move_playlist(|playlist| {
+                    let from = playlist.entry();
+                    let at_end = !playlist.can_move(false);
+                    let moved = if exit == LoopExit::Prev {
+                        playlist.prev()
+                    } else {
+                        playlist.next()
+                    };
+                    // A song taken off the list ending after the last
+                    // entry has nothing to move on to, but no longer plays.
+                    playlist.settle();
+                    (from, at_end, moved.and_then(|_| playlist.current()))
+                });
+                if let Some(song) = moved {
                     player.emit_song_change(&song);
+                }
+                // The last song played to its end: the gap after it. One an
+                // edit took off the list counts too, ending after the last
+                // entry: settled on that entry, the playlist read as having
+                // moved on to it, and the entry's auto play started a song
+                // already played.
+                let past_last = succeeded && !loop_broken && at_end;
+                if past_last {
+                    player.transport.lock().past_last_entry = true;
                 }
 
                 {
@@ -230,19 +444,42 @@ impl Player {
                 }
 
                 *join = None;
+                // A section loop goes with the playback it was armed in.
+                player.section_loop.reset();
+                player.song_playing.store(false, Ordering::Relaxed);
                 player.stop_run.store(false, Ordering::Relaxed);
                 let should_auto_play = action == CleanupAction::LoopBreakAndPlay;
-                drop(join);
+                if !should_auto_play {
+                    // Nothing starts under the fade-out: no fade-in waits.
+                    *player.start_fade.lock() = None;
+                    // A song that ended by itself moves the playlist on: the
+                    // song it reaches may start by itself (its `auto_play`).
+                    // Otherwise, between songs: ambient light, after its delay.
+                    let auto_play = (succeeded && !past_last && playlist.entry() != from)
+                        .then(|| playlist.auto_play())
+                        .flatten();
 
-                // If loop was broken (play/next during loop), auto-play the next song.
-                // Use spawn_blocking + block_on to avoid the non-Send future issue
-                // with tokio::sync::Mutex guards inside play_from.
+                    match auto_play {
+                        Some(gap) => player.schedule_auto_play(gap),
+                        None => {
+                            player.idle_ambient(true);
+                            player.reload_deferred_hardware();
+                        }
+                    }
+                }
+                // A loop broken by play or navigation starts the song it
+                // moved to under this same lock: let go of it first, and a
+                // stop in between finds nothing playing to stop, and the
+                // song starts after it regardless. On a blocking thread,
+                // since this task cannot await the start that spawned it and
+                // still be Send.
                 if should_auto_play {
-                    let player_for_play = player;
                     tokio::task::spawn_blocking(move || {
                         let rt = tokio::runtime::Handle::current();
-                        if let Err(e) = rt.block_on(player_for_play.play()) {
+                        if let Err(e) = rt.block_on(player.play_locked(&mut join)) {
+                            *player.start_fade.lock() = None;
                             error!(err = %e, "Failed to auto-play next song after loop break");
+                            player.reload_deferred_hardware();
                         }
                     });
                 }
@@ -283,6 +520,24 @@ impl Player {
             return;
         }
 
+        // The audio commits to section loop jumps as it plays them; with no
+        // audio, or none that starts, a thread of their own does, for the
+        // notes, lights and beat clock to follow.
+        let subsystems_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let audio_gone = has_audio.then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        {
+            let publisher = crate::section_loop::JumpPublisher {
+                clock: clock.clone(),
+                start_time,
+                cancel: cancel_handle.clone(),
+                done: subsystems_done.clone(),
+                audio_gone: audio_gone.clone(),
+                loop_control: loop_control.clone(),
+                song: Some(song.clone()),
+            };
+            thread::spawn(move || crate::section_loop::publish_jumps(publisher));
+        }
+
         // Each subsystem signals readiness on this channel. Once all have
         // reported ready, we start the clock as the "go" signal.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
@@ -298,9 +553,33 @@ impl Player {
             let ready_tx = crate::playsync::ReadyGuard::new(ready_tx.clone());
             let clock = clock.clone();
             let loop_control = loop_control.clone();
+            let jumps = loop_control.section_jumps.clone();
             expected_ready += 1;
 
             Some(thread::spawn(move || {
+                // Done playing, the audio makes no more jumps: the notes and
+                // lights, following on past their own ends while it played,
+                // end too. (If it never took the jumps on, its stand-in
+                // closes the log when it is done.) On its way out however it
+                // goes, a panic included, so nothing waits on it.
+                struct AudioDone {
+                    jumps: Arc<crate::playsync::SectionJumpLog>,
+                    gone: Option<Arc<std::sync::atomic::AtomicBool>>,
+                }
+                impl Drop for AudioDone {
+                    fn drop(&mut self) {
+                        if self.jumps.claimed_by_audio() {
+                            self.jumps.close();
+                        }
+                        if let Some(gone) = &self.gone {
+                            gone.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                let done = AudioDone {
+                    jumps,
+                    gone: audio_gone,
+                };
                 let song_name = song.name().to_string();
                 let result = device.play_from(
                     song,
@@ -320,6 +599,7 @@ impl Player {
                         "Error while playing song"
                     );
                 }
+                drop(done);
                 let outcome = result.map_err(|e| e.to_string());
                 let mut guard = audio_outcome.lock();
                 *guard = Some(outcome);
@@ -409,8 +689,9 @@ impl Player {
         // Start the clock — this is the "go" signal for all subsystems.
         clock.start();
 
-        // Set play_start_time NOW, at the exact moment playback begins.
-        // Offset backwards by start_time so elapsed() reflects song position.
+        // Set play_start_time NOW, at the exact moment playback begins: it
+        // has read as the start position (Starting) until now. Offset
+        // backwards by start_time so elapsed() reflects song position.
         // We use blocking_lock because we're in a spawn_blocking context.
         //
         // Skip it if this playback was cancelled during startup: stop() and
@@ -421,7 +702,7 @@ impl Player {
         {
             let mut pst = play_start_time.blocking_lock();
             if !cancel_handle.is_cancelled() {
-                *pst = Some(SystemTime::now() - start_time);
+                *pst = Some(PlayPosition::Running(SystemTime::now() - start_time));
             }
         }
 
@@ -443,16 +724,309 @@ impl Player {
             }
         }
 
+        subsystems_done.store(true, Ordering::Relaxed);
+        loop_control.section_jumps.close();
         let outcome = resolve_playback_outcome(has_audio, audio_outcome.lock().take());
         if play_tx.send(outcome).is_err() {
             error!("Error while sending to finish channel (receiver dropped).")
         }
     }
 
-    /// Stop will stop a song if a song is playing.
+    /// Stop will stop a song if a song is playing. Ambient light follows,
+    /// after its delay.
+    ///
+    /// A looping song whose playlist entry has a `fade_out` ends over it
+    /// instead ([`Player::end_looping_song`]); a stop while it does cuts it.
+    /// A stop during a loop break, before it has moved on, stops on the
+    /// song the break was going to.
     pub async fn stop(&self) -> Option<Arc<Song>> {
         let mut join = self.join.lock().await;
+        if let Some(song) = self.end_looping_song(&join) {
+            return Some(song);
+        }
+        self.cut_locked(&mut join).await
+    }
 
+    /// Stops at once, whatever is playing or fading out: a stop's cut, and
+    /// the end of the list without a `fade_out` to end on.
+    pub(super) async fn cut_locked(&self, join: &mut Option<PlayHandles>) -> Option<Arc<Song>> {
+        let ending = self.end_ending();
+        let (song, _) = self.stop_locked(join).await;
+        // A section loop goes with the playback it was armed in, or the
+        // pause it was kept through.
+        self.section_loop.reset();
+        self.song_playing.store(false, Ordering::Relaxed);
+        // A song an edit took off the list is current only while it plays:
+        // stopped, the playlist goes on to the entry that took its place, or
+        // Play would start it again.
+        let (playlist, settled) = self.move_playlist(|playlist| playlist.settle());
+        if let Some(current) = playlist.current().filter(|_| settled) {
+            self.emit_song_change(&current);
+        }
+        if ending {
+            self.cut_break_fade();
+        }
+        // Stopped, or a stop after a pause: between songs either way. A cut
+        // ending is "now": ambient comes in at once, over its lights going
+        // dark, rather than after the rest of its delay.
+        self.idle_ambient(!ending);
+        self.reload_deferred_hardware();
+        song
+    }
+
+    /// Ends the looping song playing, if one is and its playlist entry has
+    /// a `fade_out`: it fades out over it, as a loop break's does, lights
+    /// and all, with nothing after it. The playlist stays where it is, the
+    /// player stops at once, and ambient light follows once the fade is
+    /// over. Returns the song, or `None`, having done nothing, when it does
+    /// not end this way.
+    pub(super) fn end_looping_song(&self, join: &Option<PlayHandles>) -> Option<Arc<Song>> {
+        let handles = join.as_ref()?;
+        // A loop break under way is on its way to another song: a stop then
+        // cuts, and stops on that song, rather than ending this one.
+        if self.loop_exit() != LoopExit::None || !self.is_current_song_looping() {
+            return None;
+        }
+        let playlist = self.get_playlist();
+        let song = playlist.current()?;
+        // Beats and measures count on the grid of the song Next would go to,
+        // as a loop break's do: a prelude often has none of its own (#569).
+        // At the end of the list there is none, and the song's own counts.
+        let handover = playlist.loop_break(false);
+        let next = handover.target.filter(|next| next.name() != song.name());
+        let fade = handover
+            .fade_out
+            .and_then(|fade| song.fade_out_into(&fade, next.as_deref()))?;
+        *self.start_fade.lock() = None;
+        // Between the playback's loop jumps, as a loop break.
+        let jumps = handles.cancel.hold_jumps();
+        self.fade_out_playback(&handles.cancel, Some(&fade));
+        let over = fade.length.max(fade.lights);
+        info!(
+            song = song.name(),
+            fade_ms = fade.length.as_millis() as u64,
+            lights_ms = fade.lights.as_millis() as u64,
+            "Ending the looping song: fading out"
+        );
+        self.begin_ending(song.name(), over);
+        self.set_loop_exit(LoopExit::End);
+        handles.cancel.cancel();
+        drop(jumps);
+        Some(song)
+    }
+
+    /// Notes the song ending over `over`, and brings ambient light up: its
+    /// delay counts from now, so it can come in over the fade's tail rather
+    /// than after a dark gap once the song is out.
+    fn begin_ending(&self, song: &str, over: Duration) {
+        let generation = {
+            let state = &mut self.transport.lock().ending;
+            state.generation += 1;
+            state.fading = Some((song.to_string(), std::time::Instant::now() + over));
+            state.generation
+        };
+        self.idle_ambient(true);
+        let player = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(over).await;
+            let ended = {
+                let state = &mut player.transport.lock().ending;
+                state.generation == generation && state.fading.take().is_some()
+            };
+            if ended {
+                info!("The looping song has ended.");
+                // A hardware reload waited for the fade, which it would
+                // have cut short.
+                player.reload_deferred_hardware();
+            }
+        });
+    }
+
+    /// Forgets a song ending, its fade left to play out unless the caller
+    /// cuts it. Returns whether one was.
+    pub(super) fn end_ending(&self) -> bool {
+        let state = &mut self.transport.lock().ending;
+        state.generation += 1;
+        state.fading.take().is_some()
+    }
+
+    /// The looping song ending, and how long until its fade is over, while
+    /// one is.
+    pub fn ending_status(&self) -> Option<(String, Duration)> {
+        self.transport.lock().ending_status()
+    }
+
+    /// Stops the song playing, if one is, for a pause, with the join lock
+    /// held: the lights hold rather than go to ambient. The song still
+    /// counts as playing until the pause has kept its position, and the
+    /// caller clears `song_playing` then. Returns whether there is a
+    /// position to keep: none when a loop break asked of the song took the
+    /// playlist on to its target.
+    pub(super) async fn stop_for_pause(&self, join: &mut Option<PlayHandles>) -> bool {
+        let (_, moved) = self.stop_locked(join).await;
+        // Paused, the section loop is kept for the resume. Stopped on a loop
+        // break's target instead, there is nothing to resume it in.
+        if moved {
+            self.section_loop.reset();
+        }
+        !moved
+    }
+
+    /// Starts the song at the playlist's position by itself after `gap`,
+    /// unless a play, stop, navigation or playlist switch comes first.
+    pub(super) fn schedule_auto_play(&self, gap: Duration) {
+        let song = self
+            .get_playlist()
+            .current()
+            .map(|song| song.name().to_string())
+            .unwrap_or_default();
+        let generation = {
+            let state = &mut self.transport.lock().auto_play;
+            state.generation += 1;
+            state.waiting = Some((song, std::time::Instant::now() + gap));
+            state.generation
+        };
+        info!(gap = ?gap, "Auto play: the song starts by itself.");
+        // The song before holds its lights through the gap as a segue --
+        // but for ambient Off, which is dark between songs.
+        if self.ambient_mode() == crate::dmx::engine::AmbientMode::Off {
+            self.idle_ambient(true);
+        }
+        let player = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(gap).await;
+            // Whether it is still wanted is asked under the join lock, and
+            // the song starts under it: a stop or a navigation calls an auto
+            // play off under that lock too, so it either comes first and
+            // finds it waiting, or comes after and stops the song it started.
+            let mut join = player.join.lock().await;
+            {
+                let state = &mut player.transport.lock().auto_play;
+                if state.generation != generation || state.waiting.is_none() || join.is_some() {
+                    return;
+                }
+                state.waiting = None;
+            }
+            if let Err(e) = player.play_locked(&mut join).await {
+                error!(err = %e, "Auto play failed to start the song");
+                player.reload_deferred_hardware();
+            }
+        });
+    }
+
+    /// Calls off an auto play waiting out its gap. Returns whether one was.
+    pub(super) fn cancel_auto_play(&self) -> bool {
+        let called_off = {
+            let state = &mut self.transport.lock().auto_play;
+            state.generation += 1;
+            state.waiting.take().is_some()
+        };
+        // A hardware reload deferred for it can run now, unless a start is
+        // what called it off: the reload then waits for that song in turn.
+        if called_off {
+            self.reload_deferred_hardware();
+        }
+        called_off
+    }
+
+    /// The song an auto play is waiting to start, and how long until it
+    /// does, while one is.
+    pub fn auto_play_status(&self) -> Option<(String, Duration)> {
+        self.transport.lock().auto_play_status()
+    }
+
+    /// The player has gone idle: ambient light, if there is any, once its
+    /// delay is up (`hold`) or at once.
+    pub(super) fn idle_ambient(&self, hold: bool) {
+        let past_last_entry = self.transport.lock().past_last_entry;
+        self.idle_ambient_at(hold, past_last_entry);
+    }
+
+    /// [`Player::idle_ambient`] with the transport's `past_last_entry` read
+    /// already, for a caller holding the transport lock.
+    fn idle_ambient_at(&self, hold: bool, past_last_entry: bool) {
+        let dmx_engine = self.hardware.read().dmx_engine.clone();
+        if let Some(dmx_engine) = dmx_engine {
+            // An engine new since the mode was set (a hardware reload) takes
+            // it up.
+            let mode = *self.ambient_mode.lock();
+            if dmx_engine.ambient_mode() != mode {
+                dmx_engine.set_ambient_mode(mode);
+            }
+            let ambient = self.waiting_ambient(past_last_entry);
+            dmx_engine.idle_ambient(ambient.as_ref(), hold);
+        }
+    }
+
+    /// The ambient light for the gap the player is in: the entry it waits
+    /// on's laid over the playlist's, or the playlist's after the last.
+    /// Notes whose settings they are, for the status.
+    fn waiting_ambient(
+        &self,
+        past_last_entry: bool,
+    ) -> Option<crate::config::ambient::PlaylistAmbient> {
+        let playlist = self.get_playlist();
+        let entry = waiting_entry_at(&playlist, past_last_entry);
+        *self.ambient_source.lock() = Some(playlist.ambient_source(entry));
+        playlist.ambient_before(entry)
+    }
+
+    /// The entry whose gap the player is in: the one it is on, but for
+    /// none after the last song has played to its end.
+    pub(super) fn waiting_entry(&self, playlist: &crate::playlist::Playlist) -> Option<usize> {
+        let past_last_entry = self.transport.lock().past_last_entry;
+        waiting_entry_at(playlist, past_last_entry)
+    }
+
+    /// Whose settings the ambient light up plays, while one is.
+    pub fn ambient_source(&self) -> Option<crate::playlist::AmbientSource> {
+        *self.ambient_source.lock()
+    }
+
+    /// Sets ambient light's mode: `On` holds it up now, over any song;
+    /// `Off` fades it out; `Auto` plays it between songs. Not saved: the
+    /// player starts in `Auto`.
+    pub fn set_ambient_mode(&self, mode: crate::dmx::engine::AmbientMode) {
+        *self.ambient_mode.lock() = mode;
+        let dmx_engine = self.hardware.read().dmx_engine.clone();
+        if let Some(dmx_engine) = dmx_engine {
+            dmx_engine.set_ambient_mode(mode);
+        }
+        // Off in an auto play's gap: the song before was holding its lights
+        // as a segue, and goes dark now.
+        if mode == crate::dmx::engine::AmbientMode::Off {
+            // Held through, so the gap cannot end -- and the next song's
+            // lights start -- between the look and the dark.
+            let transport = self.transport.lock();
+            if transport.auto_play.waiting.is_some() {
+                self.idle_ambient_at(true, transport.past_last_entry);
+            }
+        }
+    }
+
+    /// Ambient light's mode.
+    pub fn ambient_mode(&self) -> crate::dmx::engine::AmbientMode {
+        *self.ambient_mode.lock()
+    }
+
+    /// Calls off an auto play waiting out its gap, and nothing else: the
+    /// player stays stopped on its song, and ambient light comes up as
+    /// after a stop. Returns whether one was waiting.
+    pub fn cancel_waiting_auto_play(&self) -> bool {
+        let called_off = self.cancel_auto_play();
+        if called_off {
+            info!("Auto play called off.");
+            self.idle_ambient(true);
+        }
+        called_off
+    }
+
+    /// Stops the playback in `join`, if there is one, with the join lock
+    /// held. Returns the song stopped, and whether a loop break asked of it
+    /// took the playlist on to the break's target.
+    async fn stop_locked(&self, join: &mut Option<PlayHandles>) -> (Option<Arc<Song>>, bool) {
+        // A stop calls off an auto play waiting out its gap.
+        self.cancel_auto_play();
         let play_handles = match join.take() {
             Some(handles) => handles,
             None => {
@@ -461,17 +1035,25 @@ impl Player {
                 // position so the next play begins at zero.
                 self.clear_pending_start();
                 info!("Player is not active, cleared any preserved position.");
-                return None;
+                return (None, false);
             }
         };
+        let broken_to_prev = self.take_loop_break();
 
+        self.cut_break_fade();
         let song = match self.get_playlist().current() {
             Some(song) => song,
             None => {
                 info!("Playlist is empty, nothing to stop.");
-                play_handles.cancel.cancel();
+                // No position either: cancelled under the lock, as below, so
+                // a playback still starting cannot stamp one after (#634).
+                {
+                    let mut play_start_time = self.play_start_time.lock().await;
+                    play_handles.cancel.cancel();
+                    *play_start_time = None;
+                }
                 drop(play_handles.join);
-                return None;
+                return (None, false);
             }
         };
         info!(song = song.name(), "Stopping playback.");
@@ -486,9 +1068,96 @@ impl Player {
         }
 
         drop(play_handles.join);
-        drop(join);
 
-        Some(song)
+        // A loop break asked of this playback has already told whoever asked
+        // for it where it goes (#545), and begun fading toward it. A stop or
+        // pause before its cleanup ran keeps the playlist move, without the
+        // start: the player stops on the break's target, with nothing kept
+        // to resume.
+        let moved = match broken_to_prev {
+            Some(back) => {
+                self.clear_pending_start();
+                let (_, target) = self.move_playlist(|playlist| {
+                    let moved = if back {
+                        playlist.prev()
+                    } else {
+                        playlist.next()
+                    };
+                    playlist.settle();
+                    moved.and_then(|_| playlist.current())
+                });
+                if let Some(target) = &target {
+                    info!(song = target.name(), "Stopped on the loop break's target.");
+                    self.emit_song_change(target);
+                    self.load_song_samples(target);
+                }
+                true
+            }
+            None => false,
+        };
+
+        (Some(song), moved)
+    }
+
+    /// Takes a loop break asked of the playback just taken out of `join`,
+    /// and returns whether it goes back, or `None` when there was none, or
+    /// it was a looping song's ending, which stays where it is. Its cleanup
+    /// finds `join` no longer its own and leaves the flags be, so whoever
+    /// took it clears them. Called with the join lock held.
+    fn take_loop_break(&self) -> Option<bool> {
+        match self.take_loop_exit() {
+            LoopExit::Next => Some(false),
+            LoopExit::Prev => Some(true),
+            LoopExit::None | LoopExit::End => None,
+        }
+    }
+
+    /// Forgets a loop break, or a looping song's ending, asked of the
+    /// playback just taken out of `join`. Its cleanup finds `join` no longer
+    /// its own and leaves the flags be, so whoever took it clears them, or
+    /// the next song played would read the break as its own and leave its
+    /// loop at the end of its pass. Called with the join lock held.
+    pub(super) fn forget_loop_break(&self) {
+        self.set_loop_exit(LoopExit::None);
+    }
+
+    /// What a loop break asked of the song playing does, if one is asked.
+    pub(crate) fn loop_exit(&self) -> LoopExit {
+        self.transport.lock().loop_exit
+    }
+
+    /// Asks the looping song playing to let go of its loop as `exit` says,
+    /// or with [`LoopExit::None`] calls a break off: the engines' flag is
+    /// set with it, under the transport lock.
+    pub(super) fn set_loop_exit(&self, exit: LoopExit) {
+        let mut transport = self.transport.lock();
+        transport.loop_exit = exit;
+        self.loop_break
+            .store(exit != LoopExit::None, Ordering::Relaxed);
+    }
+
+    /// Takes the loop break asked of the song playing, leaving none, the
+    /// engines' flag cleared with it.
+    fn take_loop_exit(&self) -> LoopExit {
+        let mut transport = self.transport.lock();
+        self.loop_break.store(false, Ordering::Relaxed);
+        std::mem::take(&mut transport.loop_exit)
+    }
+
+    /// Breaks the looping song playing in `join` out of its loop, toward
+    /// the song before it (`back`) or after it: fades it out between its
+    /// loop jumps (one already scheduled is made under the fade, and none
+    /// is after it), asks the cleanup to move the playlist that way and
+    /// play what it lands on, and cancels the playback. Returns the song it
+    /// moves to, if there is one.
+    pub(super) fn break_loop(&self, join: &Option<PlayHandles>, back: bool) -> Option<Arc<Song>> {
+        let handles = join.as_ref()?;
+        let jumps = handles.cancel.hold_jumps();
+        let target = self.fade_out_for_loop_break(&handles.cancel, back);
+        self.set_loop_exit(if back { LoopExit::Prev } else { LoopExit::Next });
+        handles.cancel.cancel();
+        drop(jumps);
+        target
     }
 
     /// Returns true if a song is currently playing.
@@ -514,20 +1183,34 @@ impl Player {
     pub async fn elapsed(&self) -> Result<Option<Duration>, Box<dyn Error>> {
         let play_start_time = self.play_start_time.lock().await;
         Ok(match *play_start_time {
-            Some(play_start_time) => {
-                let raw = play_start_time.elapsed()?;
-                let consumed = *self.loop_time_consumed.lock();
-                Some(raw.saturating_sub(consumed))
+            Some(PlayPosition::Starting(start_time)) => Some(start_time),
+            Some(PlayPosition::Running(play_start_time)) => {
+                // On the playback's own clock, once it runs: the timeline the
+                // section loop jumps are on, counted from the log as they fall
+                // due (the counter was bumped up to a monitor poll late, so
+                // just past a loop point the position read past the section's
+                // end; and the wall clock, stamped a moment after the playback
+                // clock starts, read before the section's start at a jump).
+                // A looping song's passes are jumps in the log too, so the
+                // position wraps exactly as each falls due.
+                let log = self.section_jumps.lock().clone();
+                let raw = match log.now() {
+                    Some(now) => now,
+                    None => play_start_time.elapsed()?,
+                };
+                Some(log.song_position(raw))
             }
             None => self.pending_start(),
         })
     }
 
-    /// Adds time consumed by a section loop iteration. Called by subsystems
-    /// when a section loop triggers to keep the reported elapsed time correct.
-    pub fn add_loop_time_consumed(&self, duration: Duration) {
-        let mut consumed = self.loop_time_consumed.lock();
-        *consumed += duration;
+    /// Notes how many of the playing song's loop jumps have been committed,
+    /// due or not, as a section loop is armed: it has looped once more than
+    /// this have fallen due, not a pass committed just before it. Under the
+    /// log's lock, which a resume installs its new log under.
+    fn note_arm(&self) {
+        let log = self.section_jumps.lock();
+        *self.section_loop.jumps_at_arm.lock() = log.committed();
     }
 
     /// Activates section looping for the named section in the current song.
@@ -568,8 +1251,9 @@ impl Player {
             "Activating section loop"
         );
 
+        self.note_arm();
         {
-            let mut active = self.active_section.write();
+            let mut active = self.section_loop.active.write();
             *active = Some(super::SectionBounds {
                 name: section_name.to_string(),
                 start_time,
@@ -577,8 +1261,10 @@ impl Player {
             });
         }
 
-        // Reset section_loop_break so the loop runs.
-        self.section_loop_break.store(false, Ordering::Relaxed);
+        // Clear any break asked of a loop before, so this one runs.
+        self.section_loop
+            .break_requested
+            .store(false, Ordering::Relaxed);
 
         // Play confirmation tone.
         self.play_confirmation_tone();
@@ -593,7 +1279,7 @@ impl Player {
 
         // Update reactive state machine.
         {
-            let mut state = self.reactive_loop_state.write();
+            let mut state = self.section_loop.reactive.write();
             match &*state {
                 ReactiveLoopState::Looping(_) | ReactiveLoopState::BreakRequested(_) => {
                     if let ReactiveLoopState::Looping(bounds) = state.clone() {
@@ -611,20 +1297,22 @@ impl Player {
             }
         }
 
-        self.section_loop_break.store(true, Ordering::Relaxed);
+        self.section_loop
+            .break_requested
+            .store(true, Ordering::Relaxed);
         // Clear active section so the UI stops wrapping elapsed time
         // and shows normal playback state.
-        *self.active_section.write() = None;
+        *self.section_loop.active.write() = None;
     }
 
     /// Returns the currently active section bounds, if any.
     pub fn active_section(&self) -> Option<super::SectionBounds> {
-        self.active_section.read().clone()
+        self.section_loop.active.read().clone()
     }
 
     /// Returns the current reactive loop state.
     pub fn reactive_loop_state(&self) -> ReactiveLoopState {
-        self.reactive_loop_state.read().clone()
+        self.section_loop.reactive.read().clone()
     }
 
     /// Acknowledges the current section in reactive looping mode.
@@ -632,18 +1320,21 @@ impl Player {
     /// When a section has been offered (state is `SectionOffered`), this
     /// arms the loop so it will engage at the section end.
     pub async fn section_ack(&self) -> Result<(), Box<dyn Error>> {
-        let mut state = self.reactive_loop_state.write();
+        let mut state = self.section_loop.reactive.write();
         match state.clone() {
             ReactiveLoopState::SectionOffered(bounds) => {
                 info!(section = bounds.name.as_str(), "Section loop armed via ack");
                 *state = ReactiveLoopState::LoopArmed(bounds.clone());
 
                 // Set active_section to engage the existing loop machinery.
+                self.note_arm();
                 {
-                    let mut active = self.active_section.write();
+                    let mut active = self.section_loop.active.write();
                     *active = Some(bounds);
                 }
-                self.section_loop_break.store(false, Ordering::Relaxed);
+                self.section_loop
+                    .break_requested
+                    .store(false, Ordering::Relaxed);
                 drop(state);
 
                 self.play_notification(crate::notification::NotificationEvent::LoopArmed);
@@ -671,21 +1362,16 @@ impl Player {
             return;
         }
 
-        // Find which section the playhead is currently in.
-        let current_section = sections.iter().find_map(|s| {
-            let (start, end) = song.resolve_section(&s.name)?;
-            if elapsed >= start && elapsed < end {
-                Some(super::SectionBounds {
-                    name: s.name.clone(),
-                    start_time: start,
-                    end_time: end,
-                })
-            } else {
-                None
-            }
-        });
+        // Find which section the playhead is currently in: or, while a
+        // crossfading song's pass crosses out under the next, the one the
+        // outgoing pass is playing, if the playhead is in none (a section in
+        // the crossfade is only ever heard that way). Taken up, it loops the
+        // next time playback reaches it, the song's pass held off for it.
+        let crossing_out = self.section_jumps.lock().crossing_out();
+        let section_at = |at: Duration| super::SectionBounds::at(&song, at);
+        let current_section = section_at(elapsed).or_else(|| crossing_out.and_then(section_at));
 
-        let mut state = self.reactive_loop_state.write();
+        let mut state = self.section_loop.reactive.write();
 
         match (&*state, current_section) {
             // Idle + entered a section → offer it.
@@ -732,13 +1418,40 @@ impl Player {
                 *state = ReactiveLoopState::Idle;
             }
 
+            // BreakRequested + straight into the next section (sections back
+            // to back) → loop exited, and the next one offered. Waiting for a
+            // gap between sections that never comes left the state broken for
+            // the rest of the song, and no section offered.
+            (ReactiveLoopState::BreakRequested(broken), Some(bounds))
+                if broken.name != bounds.name =>
+            {
+                info!(
+                    old = broken.name.as_str(),
+                    new = bounds.name.as_str(),
+                    "Section loop exited after break into the next section"
+                );
+                self.play_notification(crate::notification::NotificationEvent::LoopExited);
+                self.play_notification(crate::notification::NotificationEvent::SectionEntering {
+                    section_name: bounds.name.clone(),
+                });
+                *state = ReactiveLoopState::SectionOffered(bounds);
+            }
+
             // LoopArmed → Looping transition happens when the audio engine
             // actually begins looping. We detect this by checking if
             // active_section is set and we've wrapped around.
             (ReactiveLoopState::LoopArmed(bounds), Some(_)) => {
-                // Check if the audio engine has started looping.
-                let loop_consumed = *self.loop_time_consumed.lock();
-                if loop_consumed > Duration::ZERO {
+                // Check if the audio engine has started looping: one of its
+                // own jumps due since it was armed (any before is an earlier
+                // loop's, and a whole-song pass committed as it was armed is
+                // not this section going round).
+                let armed_at = *self.section_loop.jumps_at_arm.lock();
+                let start = bounds.start_time;
+                let looped = self
+                    .section_jumps
+                    .lock()
+                    .due_since(armed_at, |jump| !jump.pass && jump.to == start);
+                if looped {
                     *state = ReactiveLoopState::Looping(bounds.clone());
                 }
             }
@@ -780,27 +1493,147 @@ impl Player {
         self.play_notification(crate::notification::NotificationEvent::LoopArmed);
     }
 
-    /// Sets fade-out envelopes on all current audio sources for a smooth
-    /// crossfade transition when breaking out of a loop.
-    pub(super) fn fade_out_current_audio(&self) {
-        let hw = self.hardware.read();
-        if let Some(ref device) = hw.device {
-            if let Some(mixer) = device.mixer() {
-                let crossfade_samples =
-                    crate::audio::crossfade::default_crossfade_samples(mixer.sample_rate());
-                let source_ids: Vec<u64> = {
-                    let sources = mixer.get_active_sources();
-                    let guard = sources.read();
-                    guard.iter().map(|s| s.lock().id).collect()
-                };
-                if !source_ids.is_empty() {
-                    let fade_out = Arc::new(crate::audio::crossfade::GainEnvelope::fade_out(
-                        crossfade_samples,
-                        crate::audio::crossfade::CrossfadeCurve::Linear,
-                    ));
-                    mixer.set_gain_envelope(&source_ids, fade_out);
-                }
+    /// Fades out the looping song a loop break leaves, as it gives way to
+    /// the song before it (`back`) or after it, and returns that song: over
+    /// the playlist's `fade_out` for the entry, from the gain each source
+    /// has now, its excluded tracks cut at once -- or, without one, all of it
+    /// over the short default crossfade. The lights cross into the next
+    /// song's over the fade's `lights`, and the next song fades in over its
+    /// entry's `fade_in`, if it has one. Only `playback`'s sources fade.
+    pub(super) fn fade_out_for_loop_break(
+        &self,
+        playback: &CancelHandle,
+        back: bool,
+    ) -> Option<Arc<Song>> {
+        let playlist = self.get_playlist();
+        let handover = playlist.loop_break(back);
+        let target = handover.target;
+        let song = playlist.current()?;
+        let fade = handover
+            .fade_out
+            .as_ref()
+            .and_then(|fade| song.fade_out_into(fade, target.as_deref()));
+        *self.start_fade.lock() = match (&fade, &target, &handover.fade_in) {
+            (Some(_), Some(target), Some(fade_in)) => {
+                target
+                    .fade_in(fade_in)
+                    .map(|fade| crate::playsync::StartFade {
+                        song: target.name().to_string(),
+                        fade,
+                    })
             }
+            _ => None,
+        };
+        self.fade_out_playback(playback, fade.as_ref());
+        if let Some(fade) = &fade {
+            info!(
+                song = song.name(),
+                fade_ms = fade.length.as_millis() as u64,
+                lights_ms = fade.lights.as_millis() as u64,
+                fade_in_ms = self
+                    .start_fade
+                    .lock()
+                    .as_ref()
+                    .map_or(0, |f| f.fade.length.as_millis() as u64),
+                "Loop break: fading out under the next song"
+            );
+        }
+        target
+    }
+
+    /// Fades out `playback`'s sources over `fade`, from the gain each has
+    /// now, its excluded tracks cut at once -- or, without one, all of it
+    /// over the short default crossfade -- and the lights out of its show
+    /// over the fade's `lights`.
+    fn fade_out_playback(
+        &self,
+        playback: &CancelHandle,
+        fade: Option<&crate::songs::ResolvedFade>,
+    ) {
+        let hw = self.hardware.read();
+        if let Some(mixer) = hw.device.as_ref().and_then(|device| device.mixer()) {
+            let rate = mixer.sample_rate();
+            let cut_samples = crate::audio::crossfade::default_crossfade_samples(rate);
+            let (fade_samples, curve) = match &fade {
+                Some(fade) => (
+                    crate::audio::duration_to_samples(fade.length, rate),
+                    fade.curve,
+                ),
+                None => (cut_samples, crate::audio::crossfade::CrossfadeCurve::Linear),
+            };
+            let exclude = fade.map(|f| f.exclude.as_slice()).unwrap_or_default();
+            let ids =
+                mixer.fade_out_playback(playback, fade_samples, curve, cut_samples, |labels| {
+                    crate::audio::song_loop::only_tracks_in(labels, exclude)
+                });
+            // An earlier song may still be fading out under this one: a stop
+            // cuts it too.
+            let active: std::collections::HashSet<u64> = {
+                let sources = mixer.get_active_sources();
+                let guard = sources.read();
+                guard.iter().map(|s| s.lock().id).collect()
+            };
+            let mut fading = self.break_fade_ids.lock();
+            fading.retain(|id| active.contains(id));
+            if fade.is_some() {
+                fading.extend(ids);
+            }
+        }
+        self.transport.lock().fading_until =
+            fade.map(|f| std::time::Instant::now() + f.length.max(f.lights));
+        *self.break_fade.lock() = fade.map(|f| crate::playsync::BreakFade {
+            started: std::time::Instant::now(),
+            length: f.length,
+            curve: f.curve,
+            exclude: f.exclude.clone(),
+        });
+        if let (Some(dmx), Some(fade)) = (hw.dmx_engine.as_ref(), fade) {
+            // Lights of zero switch at once: the next song's show takes over
+            // as it starts, as without a fade.
+            if !fade.lights.is_zero() {
+                dmx.begin_break_fade(fade.lights);
+            }
+        }
+    }
+
+    /// Cuts a looping song still fading out after a loop break, for a stop,
+    /// pause or seek that ends whatever is playing: its audio at once, its
+    /// lights the rest of the way out over ambient's `fade_out`, rather
+    /// than holding where they were (#572).
+    pub(super) fn cut_break_fade(&self) {
+        let ids = std::mem::take(&mut *self.break_fade_ids.lock());
+        *self.break_fade.lock() = None;
+        self.transport.lock().fading_until = None;
+        *self.start_fade.lock() = None;
+        let hw = self.hardware.read();
+        if let Some(dmx) = hw.dmx_engine.as_ref() {
+            dmx.cut_break_fade_lights();
+        }
+        if ids.is_empty() {
+            return;
+        }
+        if let Some(mixer) = hw.device.as_ref().and_then(|device| device.mixer()) {
+            let samples = crate::audio::crossfade::default_crossfade_samples(mixer.sample_rate());
+            mixer.fade_out_sources(&ids, samples);
+        }
+    }
+
+    /// Fades `playback`'s audio out over the short default crossfade, for
+    /// a seek: from where each source is, anchored to the mixer's samples,
+    /// so a source scheduled to start after it (a loop's next pass or time
+    /// round) never does, rather than starting later with a blip. Other
+    /// playbacks' sources (triggered samples, notifications) are left alone.
+    pub(super) fn fade_out_current_audio(&self, playback: &CancelHandle) {
+        let hw = self.hardware.read();
+        if let Some(mixer) = hw.device.as_ref().and_then(|device| device.mixer()) {
+            let samples = crate::audio::crossfade::default_crossfade_samples(mixer.sample_rate());
+            mixer.fade_out_playback(
+                playback,
+                samples,
+                crate::audio::crossfade::CrossfadeCurve::Linear,
+                samples,
+                |_| false,
+            );
         }
     }
 }

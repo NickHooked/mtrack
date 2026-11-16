@@ -13,8 +13,14 @@
      *
      * -->
 <script lang="ts">
-  import { wsConnected, playbackStore } from "../lib/ws/stores";
-  import { healthStore } from "../lib/ws/status";
+  import { watchConnected, playbackStore } from "../lib/ws/stores";
+  import {
+    healthStore,
+    testOutput,
+    uiUpdated,
+    venueFailure,
+  } from "../lib/ws/status";
+  import TestOutputLine from "./lighting/TestOutputLine.svelte";
   import { setLocked } from "../lib/api/config";
   import { showConfirm } from "../lib/dialog.svelte";
   import { themeChoice, cycleTheme } from "../lib/theme";
@@ -55,6 +61,7 @@
     { hash: "#/", labelKey: "nav.dashboard" },
     { hash: "#/songs", labelKey: "nav.songs" },
     { hash: "#/playlists", labelKey: "nav.playlists" },
+    { hash: "#/lighting", labelKey: "nav.lighting" },
     { hash: "#/config", labelKey: "nav.config" },
     { hash: "#/status", labelKey: "nav.status" },
   ];
@@ -68,9 +75,9 @@
     drawerOpen = false;
   }
 
-  let health = $derived($wsConnected ? $healthStore : ("unknown" as const));
+  let health = $derived($watchConnected ? $healthStore : ("unknown" as const));
   let healthLabelKey = $derived.by(() => {
-    if (!$wsConnected) return "nav.connection.disconnected";
+    if (!$watchConnected) return "nav.connection.disconnected";
     if (health === "ok") return "nav.health.ok";
     if (health === "warn") return "nav.health.warn";
     if (health === "error") return "nav.health.error";
@@ -242,10 +249,10 @@
     </button>
     <a
       class="topnav__conn"
-      class:topnav__conn--off={!$wsConnected}
-      class:topnav__conn--warn={$wsConnected && health === "warn"}
-      class:topnav__conn--error={$wsConnected && health === "error"}
-      class:topnav__conn--unknown={$wsConnected && health === "unknown"}
+      class:topnav__conn--off={!$watchConnected}
+      class:topnav__conn--warn={$watchConnected && health === "warn"}
+      class:topnav__conn--error={$watchConnected && health === "error"}
+      class:topnav__conn--unknown={$watchConnected && health === "unknown"}
       href="#/status"
       title={$t(healthLabelKey)}
       aria-label={$t(healthLabelKey)}
@@ -291,9 +298,42 @@
   </div>
 {/if}
 
-{#if !$wsConnected}
+{#if !$watchConnected}
   <div class="disconnect-banner" role="alert">
     {$t("nav.connection.banner")}
+  </div>
+{/if}
+
+{#if $uiUpdated}
+  <!-- Persistent: a reload is the user's call, not ours. -->
+  <div class="update-banner" role="status" data-testid="ui-updated">
+    <span>{$t("nav.uiUpdated")}</span>
+    <button
+      class="btn btn-sm update-banner__reload"
+      type="button"
+      data-testid="ui-updated-reload"
+      onclick={() => location.reload()}>{$t("nav.uiUpdatedReload")}</button
+    >
+  </div>
+{/if}
+
+{#if $testOutput}
+  <!-- A test is lighting a fixture: say so on every page, with a way out. -->
+  <div class="test-banner" role="status" data-testid="test-output-banner">
+    <TestOutputLine />
+  </div>
+{/if}
+
+{#if $venueFailure}
+  <!-- Not dismissible: the rig is dark until the venue is fixed. -->
+  <div class="venue-banner" role="alert" data-testid="venue-failed-banner">
+    {$t("nav.venueFailed", {
+      values: {
+        venue: $venueFailure.name ?? "",
+        error: $venueFailure.error ?? "",
+      },
+    })}
+    <a href="#/lighting/venues">{$t("nav.venueFailedLink")}</a>
   </div>
 {/if}
 
@@ -563,6 +603,50 @@
     50% {
       opacity: 0.45;
     }
+  }
+
+  .update-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 8px 12px;
+    padding: 6px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    background: var(--accent-subtle);
+    color: var(--text);
+    border-bottom: 1px solid var(--accent);
+  }
+
+  .venue-banner {
+    background: rgba(232, 75, 75, 0.16);
+    color: var(--nc-error);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    border-bottom: 1px solid rgba(232, 75, 75, 0.5);
+    overflow-wrap: anywhere;
+  }
+
+  .test-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    background: var(--accent-subtle, rgba(56, 189, 248, 0.15));
+    color: var(--nc-fg-1, inherit);
+    padding: 8px 16px;
+    font-size: 13px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--accent);
+    overflow-wrap: anywhere;
+  }
+
+  .venue-banner a {
+    color: inherit;
+    margin-left: 8px;
+    text-decoration: underline;
   }
 
   .disconnect-banner {

@@ -1,0 +1,1262 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use crate::lighting::effects::*;
+use crate::lighting::engine::EffectEngine;
+use crate::testutil::lighting::create_test_fixture;
+use std::collections::HashMap;
+use std::time::Duration;
+
+fn create_fixture_with_strobe_offset(
+    name: &str,
+    universe: u16,
+    address: u16,
+    max_freq: f64,
+    min_freq: f64,
+    dmx_offset: u8,
+) -> FixtureInfo {
+    let mut channels = HashMap::new();
+    channels.insert("dimmer".to_string(), 1);
+    channels.insert("red".to_string(), 2);
+    channels.insert("green".to_string(), 3);
+    channels.insert("blue".to_string(), 4);
+    channels.insert("white".to_string(), 5);
+    channels.insert("strobe".to_string(), 6);
+
+    let mut fixture = FixtureInfo::new(
+        name.to_string(),
+        universe,
+        address,
+        "RGBW_Strobe".to_string(),
+        channels,
+        Some(max_freq),
+    );
+    fixture.min_strobe_frequency = Some(min_freq);
+    fixture.strobe_dmx_offset = Some(dmx_offset);
+    fixture
+}
+
+#[test]
+fn test_strobe_boundary_at_duty_cycle_transition() {
+    // Test strobe behavior at exactly the 50% duty cycle boundary
+    // strobe_phase < 0.5 means ON, >= 0.5 means OFF
+    let mut engine = EffectEngine::new();
+
+    // Create a fixture WITHOUT hardware strobe capability to test software strobe
+    let mut channels = HashMap::new();
+    channels.insert("dimmer".to_string(), 1);
+    channels.insert("red".to_string(), 2);
+    channels.insert("green".to_string(), 3);
+    channels.insert("blue".to_string(), 4);
+
+    let fixture = FixtureInfo::new(
+        "test_fixture".to_string(),
+        1,
+        1,
+        "RGB".to_string(),
+        channels,
+        None,
+    );
+    engine.register_fixture(fixture);
+
+    // 2 Hz strobe = 500ms period, so 50% duty cycle transition at 250ms
+    let effect = EffectInstance::new(
+        "test_effect".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(2.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+
+    engine.start_effect(effect).unwrap();
+
+    // At t=0ms: strobe_phase=0, which is < 0.5, so ON (dimmer=255)
+    let commands = engine.update(Duration::from_millis(0), None).unwrap();
+    let dimmer_cmd = commands.iter().find(|cmd| cmd.channel == 1).unwrap();
+    assert_eq!(dimmer_cmd.value, 255, "At t=0ms strobe should be ON");
+
+    // At t=249ms: still in first half of period, should be ON
+    let commands = engine.update(Duration::from_millis(249), None).unwrap();
+    let dimmer_cmd = commands.iter().find(|cmd| cmd.channel == 1).unwrap();
+    assert_eq!(
+        dimmer_cmd.value, 255,
+        "At t=249ms strobe should still be ON"
+    );
+
+    // At t=251ms: just past 50% of period, should be OFF
+    let commands = engine.update(Duration::from_millis(2), None).unwrap();
+    let dimmer_cmd = commands.iter().find(|cmd| cmd.channel == 1).unwrap();
+    assert_eq!(dimmer_cmd.value, 0, "At t=251ms strobe should be OFF");
+
+    // At t=500ms: start of new period, should be ON again
+    let commands = engine.update(Duration::from_millis(249), None).unwrap();
+    let dimmer_cmd = commands.iter().find(|cmd| cmd.channel == 1).unwrap();
+    assert_eq!(
+        dimmer_cmd.value, 255,
+        "At t=500ms strobe should be ON again"
+    );
+}
+
+#[test]
+fn test_strobe_effect() {
+    let mut engine = EffectEngine::new();
+    let fixture = create_test_fixture("test_fixture", 1, 1);
+    engine.register_fixture(fixture);
+
+    let effect = EffectInstance::new(
+        "test_effect".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(2.0), // 2 Hz
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+
+    engine.start_effect(effect).unwrap();
+
+    // Update the engine
+    let commands = engine.update(Duration::from_millis(16), None).unwrap();
+
+    // Should have strobe command since fixture has dedicated strobe channel
+    assert_eq!(commands.len(), 1);
+
+    // Check strobe command (frequency 2.0 / max 20.0 = 0.1 = 25.5, rounded to 26 in DMX)
+    let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 6).unwrap();
+    assert_eq!(strobe_cmd.value, 26);
+}
+
+#[test]
+fn test_clear_layer_resets_strobe_channel() {
+    // Test that clearing a layer with a strobe effect resets the strobe channel to 0
+    let mut engine = EffectEngine::new();
+    let fixture = create_test_fixture("test_fixture", 1, 1);
+    engine.register_fixture(fixture);
+
+    // Start a strobe effect on foreground layer
+    let mut strobe_effect = EffectInstance::new(
+        "strobe_effect".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(5.0), // 5 Hz
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+    strobe_effect.layer = EffectLayer::FOREGROUND;
+
+    engine.start_effect(strobe_effect).unwrap();
+
+    // Update to process the strobe effect
+    let commands_before = engine.update(Duration::from_millis(16), None).unwrap();
+
+    // Verify strobe channel has a non-zero value
+    let strobe_cmd_before = commands_before.iter().find(|cmd| cmd.channel == 6);
+    assert!(
+        strobe_cmd_before.is_some(),
+        "Should have strobe command before clear"
+    );
+    let strobe_value_before = strobe_cmd_before.unwrap().value;
+    assert!(
+        strobe_value_before > 0,
+        "Strobe channel should be non-zero before clear: {}",
+        strobe_value_before
+    );
+
+    // Clear the foreground layer
+    engine.clear_layer(EffectLayer::FOREGROUND);
+
+    // Verify the effect is stopped
+    assert_eq!(engine.active_effects_count(), 0);
+    assert!(!engine.has_effect("strobe_effect"));
+
+    // Update again - no active effects, so no strobe commands
+    let commands_after = engine.update(Duration::from_millis(16), None).unwrap();
+
+    // The strobe channel latches in the fixture, so the frame after the
+    // clear sends it off rather than leaving the last rate in the universe.
+    let strobe_cmd_after = commands_after.iter().find(|cmd| cmd.channel == 6);
+    assert_eq!(
+        strobe_cmd_after.map(|cmd| cmd.value),
+        Some(0),
+        "strobe channel should be sent off after the clear"
+    );
+}
+
+#[test]
+fn test_clear_all_layers_resets_strobe_channel() {
+    // Test that clearing all layers removes strobe effects
+    let mut engine = EffectEngine::new();
+    let fixture = create_test_fixture("test_fixture", 1, 1);
+    engine.register_fixture(fixture);
+
+    // Start strobe effects on multiple layers
+    let mut bg_strobe = EffectInstance::new(
+        "bg_strobe".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(3.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+    bg_strobe.layer = EffectLayer::BACKGROUND;
+
+    let mut fg_strobe = EffectInstance::new(
+        "fg_strobe".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(4.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+    fg_strobe.layer = EffectLayer::FOREGROUND;
+
+    engine.start_effect(bg_strobe).unwrap();
+    engine.start_effect(fg_strobe).unwrap();
+
+    // Update to process the strobe effects
+    let commands_before = engine.update(Duration::from_millis(16), None).unwrap();
+
+    // Verify strobe channel has a non-zero value
+    let strobe_cmd_before = commands_before.iter().find(|cmd| cmd.channel == 6);
+    assert!(
+        strobe_cmd_before.is_some(),
+        "Should have strobe command before clear"
+    );
+    let strobe_value_before = strobe_cmd_before.unwrap().value;
+    assert!(
+        strobe_value_before > 0,
+        "Strobe channel should be non-zero before clear: {}",
+        strobe_value_before
+    );
+
+    // Clear all layers
+    engine.clear_all_layers();
+
+    // Verify all effects are stopped
+    assert_eq!(engine.active_effects_count(), 0);
+
+    // Update again - no active effects, so no strobe commands
+    let commands_after = engine.update(Duration::from_millis(16), None).unwrap();
+
+    // The strobe channel latches in the fixture, so the frame after the
+    // clear sends it off rather than leaving the last rate in the universe.
+    let strobe_cmd_after = commands_after.iter().find(|cmd| cmd.channel == 6);
+    assert_eq!(
+        strobe_cmd_after.map(|cmd| cmd.value),
+        Some(0),
+        "strobe channel should be sent off after the clear"
+    );
+}
+
+#[test]
+fn an_expired_strobe_sends_the_strobe_channel_off() {
+    // A hardware strobe that runs out its duration must not leave its rate
+    // latched in the universe: the next frame sends the channel off, and
+    // nothing writes it after that.
+    let mut engine = EffectEngine::new();
+    engine.register_fixture(create_test_fixture("test_fixture", 1, 1));
+
+    let mut strobe = EffectInstance::new(
+        "strobe".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(10.0),
+            duration: Duration::from_millis(100),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+    strobe.layer = EffectLayer::FOREGROUND;
+    engine.start_effect(strobe).unwrap();
+
+    let during = engine.update(Duration::from_millis(16), None).unwrap();
+    assert!(during.iter().any(|cmd| cmd.channel == 6 && cmd.value > 0));
+
+    let after = engine
+        .update(Duration::from_millis(200), None)
+        .unwrap()
+        .iter()
+        .find(|cmd| cmd.channel == 6)
+        .map(|cmd| cmd.value);
+    assert_eq!(engine.active_effects_count(), 0);
+    assert_eq!(
+        after,
+        Some(0),
+        "an expired strobe should send the strobe channel off"
+    );
+}
+
+#[test]
+fn a_new_song_sends_a_latched_strobe_off() {
+    // The Esaweg -> So Willingly Deceived transition: the outgoing song is
+    // strobing when the next one starts (stop_all_effects), and the next
+    // song's first look never touches the strobe channel. The strobe must
+    // still be sent off, or the new song's colors strobe in hardware.
+    let mut engine = EffectEngine::new();
+    engine.register_fixture(create_pixelbrick_fixture("Brick1", 1, 1));
+
+    let mut strobe = EffectInstance::new(
+        "strobe".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(10.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    strobe.layer = EffectLayer::FOREGROUND;
+    strobe.blend_mode = BlendMode::Overlay;
+    engine.start_effect(strobe).unwrap();
+    engine.update(Duration::from_millis(23), None).unwrap();
+
+    // Next song.
+    engine.stop_all_effects();
+    let mut teal = EffectInstance::new(
+        "teal".to_string(),
+        EffectType::Static {
+            parameters: {
+                let mut p = HashMap::new();
+                p.insert("red".to_string(), 0.09);
+                p.insert("green".to_string(), 0.48);
+                p.insert("blue".to_string(), 0.5);
+                p
+            },
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    teal.layer = EffectLayer::BACKGROUND;
+    teal.blend_mode = BlendMode::Replace;
+    engine.start_effect(teal).unwrap();
+
+    let commands = engine.update(Duration::from_millis(23), None).unwrap();
+    assert_eq!(
+        commands
+            .iter()
+            .find(|cmd| cmd.channel == 4)
+            .map(|cmd| cmd.value),
+        Some(0),
+        "the next song's first frame should send the strobe channel off"
+    );
+}
+
+#[test]
+fn test_strobe_with_dmx_offset() {
+    // Test that strobe normalization accounts for DMX offset and min frequency
+    // PixelBrick: max=25Hz, min=0.4Hz, dmx_offset=7
+    // At 10Hz: min_norm = 7/255 = 0.027, normalized = 0.027 + (9.6/24.6) * 0.973 = 0.407
+    // DMX = 0.407 * 255 = ~104
+    let mut engine = EffectEngine::new();
+    let fixture = create_fixture_with_strobe_offset("test_fixture", 1, 1, 25.0, 0.4, 7);
+    engine.register_fixture(fixture);
+
+    let effect = EffectInstance::new(
+        "test_effect".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(10.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+
+    engine.start_effect(effect).unwrap();
+
+    let commands = engine.update(Duration::from_millis(16), None).unwrap();
+    let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 6).unwrap();
+
+    // Period-linear interpolation:
+    // max_period = 1/0.4 = 2.5s, min_period = 1/25 = 0.04s
+    // desired_period = 1/10 = 0.1s
+    // period_fraction = (2.5 - 0.1) / (2.5 - 0.04) = 2.4/2.46 = 0.97561
+    // min_normalized = 7/255 = 0.02745
+    // normalized = 0.02745 + 0.97561 * 0.97255 = 0.97628
+    // DMX = 0.97628 * 255 = 248.95, rounded to 249
+    assert_eq!(
+        strobe_cmd.value, 249,
+        "10Hz strobe with offset should produce DMX 249"
+    );
+}
+
+#[test]
+fn test_strobe_without_offset_unchanged() {
+    // Verify that fixtures without offset still work as before
+    // Fixture with max=20Hz, no offset: 2Hz → 2/20 = 0.1 → DMX 25.5, rounded to 26
+    let mut engine = EffectEngine::new();
+    let fixture = create_test_fixture("test_fixture", 1, 1);
+    engine.register_fixture(fixture);
+
+    let effect = EffectInstance::new(
+        "test_effect".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(2.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["test_fixture".to_string()],
+        None,
+        None,
+        None,
+    );
+
+    engine.start_effect(effect).unwrap();
+
+    let commands = engine.update(Duration::from_millis(16), None).unwrap();
+    let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 6).unwrap();
+    assert_eq!(
+        strobe_cmd.value, 26,
+        "2Hz strobe without offset should still produce DMX 26"
+    );
+}
+
+/// Create a fixture matching the Astera PixelBrick: RGB + Strobe, no dimmer.
+fn create_pixelbrick_fixture(name: &str, universe: u16, address: u16) -> FixtureInfo {
+    let mut channels = HashMap::new();
+    channels.insert("red".to_string(), 1);
+    channels.insert("green".to_string(), 2);
+    channels.insert("blue".to_string(), 3);
+    channels.insert("strobe".to_string(), 4);
+
+    let mut fixture = FixtureInfo::new(
+        name.to_string(),
+        universe,
+        address,
+        "Astera-PixelBrick".to_string(),
+        channels,
+        Some(25.0),
+    );
+    fixture.min_strobe_frequency = Some(0.4);
+    fixture.strobe_dmx_offset = Some(7);
+    fixture
+}
+
+#[test]
+fn test_pixelbrick_strobe_with_concurrent_effects() {
+    // Reproduce the Esaweg @236/1 scenario:
+    // - Background: color cycle (replace)
+    // - Midground: chase (add)
+    // - Foreground: two chases (screen), pulse (overlay), strobe (overlay)
+    // Verify the strobe channel appears in the DMX output.
+    let mut engine = EffectEngine::new();
+    let fixture = create_pixelbrick_fixture("Brick1", 1, 1);
+    engine.register_fixture(fixture);
+
+    // Background: color cycle
+    let mut bg_cycle = EffectInstance::new(
+        "bg_cycle".to_string(),
+        EffectType::ColorCycle {
+            colors: vec![Color::new(255, 255, 255), Color::new(255, 68, 0)],
+            speed: TempoAwareSpeed::Fixed(0.5),
+            direction: CycleDirection::Forward,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    bg_cycle.layer = EffectLayer::BACKGROUND;
+    bg_cycle.blend_mode = BlendMode::Replace;
+    engine.start_effect(bg_cycle).unwrap();
+
+    // Midground: chase
+    let mut mid_chase = EffectInstance::new(
+        "mid_chase".to_string(),
+        EffectType::Chase {
+            pattern: ChasePattern::Random,
+            speed: TempoAwareSpeed::Fixed(1.0),
+            direction: ChaseDirection::LeftToRight,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    mid_chase.layer = EffectLayer::MIDGROUND;
+    mid_chase.blend_mode = BlendMode::Add;
+    engine.start_effect(mid_chase).unwrap();
+
+    // Foreground: chase (screen)
+    let mut fg_chase = EffectInstance::new(
+        "fg_chase".to_string(),
+        EffectType::Chase {
+            pattern: ChasePattern::Random,
+            speed: TempoAwareSpeed::Fixed(2.0),
+            direction: ChaseDirection::LeftToRight,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    fg_chase.layer = EffectLayer::FOREGROUND;
+    fg_chase.blend_mode = BlendMode::Screen;
+    engine.start_effect(fg_chase).unwrap();
+
+    // Foreground: pulse (overlay)
+    let mut fg_pulse = EffectInstance::new(
+        "fg_pulse".to_string(),
+        EffectType::Pulse {
+            base_level: 0.5,
+            pulse_amplitude: 0.5,
+            frequency: TempoAwareFrequency::Fixed(3.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    fg_pulse.layer = EffectLayer::FOREGROUND;
+    fg_pulse.blend_mode = BlendMode::Overlay;
+    engine.start_effect(fg_pulse).unwrap();
+
+    // Foreground: strobe 10Hz (overlay) — the effect under test
+    let mut fg_strobe = EffectInstance::new(
+        "fg_strobe".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(10.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    fg_strobe.layer = EffectLayer::FOREGROUND;
+    fg_strobe.blend_mode = BlendMode::Overlay;
+    engine.start_effect(fg_strobe).unwrap();
+
+    // Run several frames and verify strobe channel is always present
+    for frame in 0..10 {
+        let commands = engine.update(Duration::from_millis(16), None).unwrap();
+
+        // Find the strobe DMX command: Brick1 address=1, strobe offset=4, so DMX channel = 1+4-1 = 4
+        let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 4);
+        assert!(
+            strobe_cmd.is_some(),
+            "Frame {}: strobe DMX channel 4 missing from output (got {} commands: {:?})",
+            frame,
+            commands.len(),
+            commands
+                .iter()
+                .map(|c| (c.channel, c.value))
+                .collect::<Vec<_>>()
+        );
+
+        let strobe_value = strobe_cmd.unwrap().value;
+        // 10Hz with PixelBrick params (period-linear) should give DMX 249
+        assert_eq!(
+            strobe_value, 249,
+            "Frame {}: strobe DMX value should be 249, got {}",
+            frame, strobe_value
+        );
+
+        // Also verify RGB channels are present (from other effects)
+        let has_red = commands.iter().any(|cmd| cmd.channel == 1);
+        let has_green = commands.iter().any(|cmd| cmd.channel == 2);
+        let has_blue = commands.iter().any(|cmd| cmd.channel == 3);
+        assert!(has_red, "Frame {}: red channel missing", frame);
+        assert!(has_green, "Frame {}: green channel missing", frame);
+        assert!(has_blue, "Frame {}: blue channel missing", frame);
+    }
+}
+
+#[test]
+fn test_esaweg_timeline_strobe_sequence() {
+    // Full timeline simulation of the Esaweg show's final section:
+    // @221/1: clear + cycle bg + chases fg + chase mid
+    // @228/1: pulse fg (added alongside existing effects)
+    // @236/1: strobe fg (added alongside existing effects)
+    // @236/4.75: clear + black static
+    //
+    // This verifies the strobe is visible for the 1.4s window between
+    // @236/1 and @236/4.75.
+    let mut engine = EffectEngine::new();
+    let fixture = create_pixelbrick_fixture("Brick1", 1, 1);
+    engine.register_fixture(fixture);
+
+    let dt = Duration::from_millis(23); // ~44Hz
+
+    // --- @221/1: Start climax section ---
+    engine.clear_all_layers();
+
+    // Background: color cycle (replace)
+    let mut bg_cycle = EffectInstance::new(
+        "bg_cycle".to_string(),
+        EffectType::ColorCycle {
+            colors: vec![Color::new(255, 255, 255), Color::new(255, 68, 0)],
+            speed: TempoAwareSpeed::Fixed(0.5),
+            direction: CycleDirection::Forward,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    bg_cycle.layer = EffectLayer::BACKGROUND;
+    bg_cycle.blend_mode = BlendMode::Replace;
+    engine.start_effect(bg_cycle).unwrap();
+
+    // Foreground: left chase (screen)
+    let mut left_chase = EffectInstance::new(
+        "left_chase".to_string(),
+        EffectType::Chase {
+            pattern: ChasePattern::Random,
+            speed: TempoAwareSpeed::Fixed(2.0),
+            direction: ChaseDirection::LeftToRight,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    left_chase.layer = EffectLayer::FOREGROUND;
+    left_chase.blend_mode = BlendMode::Screen;
+    engine.start_effect(left_chase).unwrap();
+
+    // Foreground: right chase (screen)
+    let mut right_chase = EffectInstance::new(
+        "right_chase".to_string(),
+        EffectType::Chase {
+            pattern: ChasePattern::Random,
+            speed: TempoAwareSpeed::Fixed(2.0),
+            direction: ChaseDirection::RightToLeft,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    right_chase.layer = EffectLayer::FOREGROUND;
+    right_chase.blend_mode = BlendMode::Screen;
+    engine.start_effect(right_chase).unwrap();
+
+    // Midground: all_wash chase (add)
+    let mut mid_chase = EffectInstance::new(
+        "mid_chase".to_string(),
+        EffectType::Chase {
+            pattern: ChasePattern::Random,
+            speed: TempoAwareSpeed::Fixed(1.0),
+            direction: ChaseDirection::LeftToRight,
+            transition: CycleTransition::Fade,
+            duration: Duration::from_secs(10),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    mid_chase.layer = EffectLayer::MIDGROUND;
+    mid_chase.blend_mode = BlendMode::Add;
+    engine.start_effect(mid_chase).unwrap();
+
+    // Run for several frames (simulating @221/1 to @228/1)
+    for _ in 0..20 {
+        let commands = engine.update(dt, None).unwrap();
+        // No strobe channel should be present yet
+        let strobe = commands.iter().find(|c| c.channel == 4);
+        assert!(
+            strobe.is_none(),
+            "Strobe channel should not be present before @228/1"
+        );
+    }
+
+    // --- @228/1: Add pulse on foreground ---
+    let mut fg_pulse = EffectInstance::new(
+        "fg_pulse".to_string(),
+        EffectType::Pulse {
+            base_level: 0.5,
+            pulse_amplitude: 0.5,
+            frequency: TempoAwareFrequency::Fixed(3.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    fg_pulse.layer = EffectLayer::FOREGROUND;
+    fg_pulse.blend_mode = BlendMode::Overlay;
+    engine.start_effect(fg_pulse).unwrap();
+
+    // Run for several frames (simulating @228/1 to @236/1)
+    for _ in 0..40 {
+        let commands = engine.update(dt, None).unwrap();
+        // Still no strobe channel
+        let strobe = commands.iter().find(|c| c.channel == 4);
+        assert!(
+            strobe.is_none(),
+            "Strobe channel should not be present before @236/1"
+        );
+    }
+
+    // --- @236/1: Add strobe on foreground (the critical moment) ---
+    let mut fg_strobe = EffectInstance::new(
+        "fg_strobe".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(10.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    fg_strobe.layer = EffectLayer::FOREGROUND;
+    fg_strobe.blend_mode = BlendMode::Overlay;
+    engine.start_effect(fg_strobe).unwrap();
+
+    // Verify: all 6 effects should be active (pulse doesn't conflict with strobe)
+    assert_eq!(
+        engine.active_effects_count(),
+        6,
+        "All 6 effects should be active: bg_cycle, left_chase, right_chase, mid_chase, fg_pulse, fg_strobe"
+    );
+
+    // Run for ~1.4 seconds (61 frames at 23ms = 1403ms)
+    // This simulates the strobe window from @236/1 to @236/4.75
+    let mut strobe_present_count = 0;
+    for frame in 0..61 {
+        let commands = engine.update(dt, None).unwrap();
+
+        // Strobe channel (Brick1 addr=1, strobe offset=4, DMX channel = 4) should be present
+        let strobe_cmd = commands.iter().find(|c| c.channel == 4);
+        assert!(
+            strobe_cmd.is_some(),
+            "Frame {} after strobe start: strobe channel 4 should be present (got {:?})",
+            frame,
+            commands
+                .iter()
+                .map(|c| (c.channel, c.value))
+                .collect::<Vec<_>>()
+        );
+
+        let strobe_value = strobe_cmd.unwrap().value;
+        assert_eq!(
+            strobe_value, 249,
+            "Frame {} after strobe start: strobe should be DMX 249, got {}",
+            frame, strobe_value
+        );
+        strobe_present_count += 1;
+
+        // RGB channels should also be present
+        assert!(
+            commands.iter().any(|c| c.channel == 1),
+            "Frame {}: red missing",
+            frame
+        );
+    }
+    assert_eq!(
+        strobe_present_count, 61,
+        "Strobe should be present on all 61 frames"
+    );
+
+    // --- @236/4.75: Clear all + black static ---
+    engine.clear_all_layers();
+
+    // Add black static
+    let mut black_static = EffectInstance::new(
+        "black_static".to_string(),
+        EffectType::Static {
+            parameters: {
+                let mut p = HashMap::new();
+                p.insert("red".to_string(), 0.0);
+                p.insert("green".to_string(), 0.0);
+                p.insert("blue".to_string(), 0.0);
+                p
+            },
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    black_static.layer = EffectLayer::BACKGROUND;
+    black_static.blend_mode = BlendMode::Replace;
+    engine.start_effect(black_static).unwrap();
+
+    // After clear: the strobe is sent off (left alone it would latch at
+    // 10 Hz into the next song), RGB should be 0 from the black static effect
+    let commands = engine.update(dt, None).unwrap();
+
+    let strobe_cmd = commands.iter().find(|c| c.channel == 4);
+    assert_eq!(
+        strobe_cmd.map(|c| c.value),
+        Some(0),
+        "Strobe channel should be sent off after clear"
+    );
+
+    let red_cmd = commands.iter().find(|c| c.channel == 1);
+    assert!(
+        red_cmd.is_some(),
+        "Red channel should be present after clear"
+    );
+    assert_eq!(red_cmd.unwrap().value, 0, "Red should be 0 (black)");
+}
+
+#[test]
+fn test_pixelbrick_orange_static_with_strobe_dmx_values() {
+    // Verify the exact DMX values sent for a PixelBrick fixture with:
+    // - Static orange color (R=255, G=102, B=0) on the background
+    // - Strobe at 10Hz on the foreground (overlay)
+    //
+    // PixelBrick channel map: red=1, green=2, blue=3, strobe=4
+    // PixelBrick address=1, universe=1, so DMX channels are 1,2,3,4
+    let mut engine = EffectEngine::new();
+    let fixture = create_pixelbrick_fixture("Brick1", 1, 1);
+    engine.register_fixture(fixture);
+
+    // Background: static orange (R=1.0, G=0.4, B=0.0)
+    let orange_static = EffectInstance::new(
+        "orange_static".to_string(),
+        EffectType::Static {
+            parameters: {
+                let mut p = HashMap::new();
+                p.insert("red".to_string(), 1.0);
+                p.insert("green".to_string(), 0.4);
+                p.insert("blue".to_string(), 0.0);
+                p
+            },
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    engine.start_effect(orange_static).unwrap();
+
+    // Foreground: strobe at 10Hz (overlay)
+    let mut strobe = EffectInstance::new(
+        "strobe_10hz".to_string(),
+        EffectType::Strobe {
+            frequency: TempoAwareFrequency::Fixed(10.0),
+            duration: Duration::from_secs(5),
+        },
+        vec!["Brick1".to_string()],
+        None,
+        None,
+        None,
+    );
+    strobe.layer = EffectLayer::FOREGROUND;
+    strobe.blend_mode = BlendMode::Overlay;
+    engine.start_effect(strobe).unwrap();
+
+    // Update and collect all DMX commands
+    let commands = engine.update(Duration::from_millis(16), None).unwrap();
+
+    // Sort commands by channel for deterministic inspection
+    let mut sorted: Vec<(u16, u8)> = commands.iter().map(|c| (c.channel, c.value)).collect();
+    sorted.sort_by_key(|&(ch, _)| ch);
+
+    // Print all DMX commands for diagnostic visibility
+    eprintln!("DMX commands for PixelBrick orange+strobe: {:?}", sorted);
+
+    // Verify we have exactly 4 commands (red, green, blue, strobe)
+    assert_eq!(
+        sorted.len(),
+        4,
+        "Expected 4 DMX commands (R,G,B,strobe), got {}: {:?}",
+        sorted.len(),
+        sorted
+    );
+
+    // Channel 1 = red: 1.0 * 255 = 255
+    let red = sorted.iter().find(|&&(ch, _)| ch == 1).unwrap();
+    assert_eq!(red.1, 255, "Red channel should be 255, got {}", red.1);
+
+    // Channel 2 = green: 0.4 * 255 = 102
+    let green = sorted.iter().find(|&&(ch, _)| ch == 2).unwrap();
+    assert_eq!(green.1, 102, "Green channel should be 102, got {}", green.1);
+
+    // Channel 3 = blue: 0.0 * 255 = 0
+    let blue = sorted.iter().find(|&&(ch, _)| ch == 3).unwrap();
+    assert_eq!(blue.1, 0, "Blue channel should be 0, got {}", blue.1);
+
+    // Channel 4 = strobe: 10Hz with PixelBrick params (period-linear, max=25, min=0.4, offset=7) → DMX 249
+    let strobe_val = sorted.iter().find(|&&(ch, _)| ch == 4).unwrap();
+    assert_eq!(
+        strobe_val.1, 249,
+        "Strobe channel should be 249, got {}",
+        strobe_val.1
+    );
+}
+
+/// The strobe byte a PixelBrick-shaped fixture (0.4–25 Hz over DMX 7..255)
+/// gets at `hz` under `curve`; 0 Hz is off.
+fn pixelbrick_strobe_byte(curve: crate::lighting::types::StrobeCurve, hz: f64) -> u8 {
+    let mut engine = EffectEngine::new();
+    let mut fixture = create_pixelbrick_fixture("Brick", 1, 1);
+    fixture.strobe_curve = curve;
+    engine.register_fixture(fixture);
+    engine
+        .start_effect(EffectInstance::new(
+            "s".to_string(),
+            EffectType::Strobe {
+                frequency: TempoAwareFrequency::Fixed(hz),
+                duration: Duration::from_secs(5),
+            },
+            vec!["Brick".to_string()],
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    let commands = engine.update(Duration::from_millis(16), None).unwrap();
+    commands
+        .iter()
+        .find(|cmd| cmd.channel == 4)
+        .map(|cmd| cmd.value)
+        .unwrap_or(0)
+}
+
+#[test]
+fn the_strobe_curve_maps_a_rate_through_period_or_hertz() {
+    use crate::lighting::types::StrobeCurve::{Linear, Period};
+    // 10 Hz: period space (measured on the unit) vs hertz (the GDTF's word).
+    assert_eq!(pixelbrick_strobe_byte(Period, 10.0), 249);
+    let linear = pixelbrick_strobe_byte(Linear, 10.0);
+    // 7 + (10 − 0.4)/(25 − 0.4) × 248 = 103.8
+    assert!((103..=104).contains(&linear), "{linear}");
+    // The ends and off are the same under both.
+    for curve in [Period, Linear] {
+        assert_eq!(pixelbrick_strobe_byte(curve, 0.4), 7, "{curve:?}");
+        assert_eq!(pixelbrick_strobe_byte(curve, 25.0), 255, "{curve:?}");
+        assert_eq!(pixelbrick_strobe_byte(curve, 0.0), 0, "{curve:?}");
+        // Out of range clamps to the ends.
+        assert_eq!(pixelbrick_strobe_byte(curve, 0.1), 7, "{curve:?}");
+        assert_eq!(pixelbrick_strobe_byte(curve, 40.0), 255, "{curve:?}");
+    }
+}
+
+#[test]
+fn a_fixture_without_a_strobe_channel_ignores_the_curve() {
+    use crate::lighting::types::StrobeCurve::{Linear, Period};
+    let frame = |curve| {
+        let mut engine = EffectEngine::new();
+        let mut fixture = create_test_fixture("rgb", 1, 1);
+        fixture.strobe_curve = curve;
+        engine.register_fixture(fixture);
+        engine
+            .start_effect(EffectInstance::new(
+                "s".to_string(),
+                EffectType::Strobe {
+                    frequency: TempoAwareFrequency::Fixed(10.0),
+                    duration: Duration::from_secs(5),
+                },
+                vec!["rgb".to_string()],
+                None,
+                None,
+                None,
+            ))
+            .unwrap();
+        let mut commands: Vec<(u16, u8)> = engine
+            .update(Duration::from_millis(16), None)
+            .unwrap()
+            .iter()
+            .map(|c| (c.channel, c.value))
+            .collect();
+        commands.sort();
+        commands
+    };
+    assert_eq!(frame(Period), frame(Linear));
+}
+
+/// A fixture of the "8: RGBS" mode of `description`, as the venue loader
+/// registers it: the strobe curve the type states, or the automatic one.
+fn gdtf_fixture(
+    description: &str,
+    curve: Option<crate::lighting::types::StrobeCurve>,
+) -> FixtureInfo {
+    let description = crate::lighting::gdtf::parse_description(description).unwrap();
+    let mut fixture_type = crate::lighting::gdtf::distill(&description, "8: RGBS", "Brick")
+        .unwrap()
+        .fixture_type;
+    // A GDTF fixture, as the loader sets it.
+    fixture_type.set_source(crate::lighting::types::GdtfSource {
+        path: "lighting/library/brick.gdtf".to_string(),
+    });
+    fixture_type.set_strobe_curve(curve);
+    let mut info = FixtureInfo::new(
+        "Brick".to_string(),
+        1,
+        1,
+        "Brick".to_string(),
+        fixture_type.channels().clone(),
+        fixture_type.max_strobe_frequency(),
+    );
+    info.min_strobe_frequency = fixture_type.min_strobe_frequency();
+    info.strobe_dmx_offset = fixture_type.strobe_dmx_offset();
+    info.channel_defs = fixture_type.channel_defs().clone();
+    info.strobe_curve = fixture_type.effective_strobe_curve();
+    info
+}
+
+/// The strobe byte `fixture` gets at `hz`.
+fn strobe_byte(fixture: FixtureInfo, hz: f64) -> u8 {
+    let channel = fixture.channels["strobe"];
+    let mut engine = EffectEngine::new();
+    engine.register_fixture(fixture);
+    engine
+        .start_effect(EffectInstance::new(
+            "s".to_string(),
+            EffectType::Strobe {
+                frequency: TempoAwareFrequency::Fixed(hz),
+                duration: Duration::from_secs(5),
+            },
+            vec!["Brick".to_string()],
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    let commands = engine.update(Duration::from_millis(16), None).unwrap();
+    commands
+        .iter()
+        .find(|cmd| cmd.channel == channel)
+        .map(|cmd| cmd.value)
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_declared_table_is_followed_step_by_step() {
+    use crate::lighting::types::StrobeCurve;
+    let robe = crate::lighting::gdtf::robe_strobe_description();
+    let fixture = gdtf_fixture(&robe, None);
+    // Twelve steps, and the automatic curve follows them.
+    let steps = &crate::lighting::types::strobe_function(&fixture.channel_defs)
+        .unwrap()
+        .steps;
+    assert_eq!(steps.len(), 12);
+    assert_eq!(fixture.strobe_curve, StrobeCurve::Declared);
+
+    let ten = strobe_byte(fixture.clone(), 10.0);
+    assert!((89..=91).contains(&ten), "10 Hz -> {ten}");
+    let half = strobe_byte(fixture.clone(), 0.5);
+    assert!((71..=74).contains(&half), "0.5 Hz -> {half}");
+    // Past either end: the table's ends.
+    assert_eq!(strobe_byte(fixture.clone(), 0.1), 64);
+    assert_eq!(strobe_byte(fixture.clone(), 40.0), 95);
+    assert_eq!(strobe_byte(fixture, 0.0), 0, "off");
+
+    // An explicit period on the tabled fixture is honoured: not the table.
+    let period = gdtf_fixture(&robe, Some(StrobeCurve::Period));
+    assert_eq!(period.strobe_curve, StrobeCurve::Period);
+    assert_ne!(strobe_byte(period, 10.0), ten);
+}
+
+#[test]
+fn an_endpoints_only_archive_is_linear_by_default_and_period_when_set() {
+    use crate::lighting::types::StrobeCurve;
+    let synthetic = crate::lighting::gdtf::SYNTHETIC_DESCRIPTION;
+    // The spec's rule: declared, which with only endpoints is linear in Hz.
+    let automatic = gdtf_fixture(synthetic, None);
+    assert_eq!(automatic.strobe_curve, StrobeCurve::Declared);
+    let linear = strobe_byte(automatic, 10.0);
+    assert!((103..=104).contains(&linear), "{linear}");
+    // Set to period (as the PixelBrick's record is): the measured curve.
+    assert_eq!(
+        strobe_byte(gdtf_fixture(synthetic, Some(StrobeCurve::Period)), 10.0),
+        249
+    );
+    for hz in [0.4, 2.0, 10.0, 25.0] {
+        assert_eq!(
+            strobe_byte(gdtf_fixture(synthetic, Some(StrobeCurve::Declared)), hz),
+            strobe_byte(gdtf_fixture(synthetic, Some(StrobeCurve::Linear)), hz),
+            "{hz} Hz"
+        );
+    }
+}
+
+#[test]
+fn declared_steps_pick_the_first_containing_step_else_the_nearest_end() {
+    use crate::lighting::types::FunctionStep;
+    let step = |dmx_from, dmx_to, from, to| FunctionStep {
+        dmx_from,
+        dmx_to,
+        from,
+        to,
+    };
+    // A descending "pulse close" bottom, overlapping the next step.
+    let steps = [
+        step(10, 19, 5.0, 1.0),
+        step(20, 29, 2.0, 10.0),
+        step(30, 30, 12.0, 12.0),
+    ];
+    let dmx = |hz| crate::lighting::effects::declared_dmx(&steps, hz);
+    assert_eq!(dmx(5.0), 10.0);
+    assert_eq!(dmx(3.0), 14.5, "first step in DMX order wins an overlap");
+    assert_eq!(dmx(6.0), 20.0 + 4.0 / 8.0 * 9.0);
+    assert_eq!(dmx(11.0), 29.0, "a gap: the nearest end (10 Hz)");
+    assert_eq!(dmx(12.0), 30.0, "a held step");
+    assert_eq!(dmx(50.0), 30.0);
+    assert_eq!(dmx(0.2), 19.0, "below: the 1 Hz end, at DMX 19");
+}
+
+#[test]
+fn a_descending_function_is_followed_in_its_direction() {
+    use crate::lighting::types::StrobeCurve;
+    // Fast at the bottom, slow at the top (as Martin's and Roxx's files say).
+    let descending = crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.replace(
+        r#"Attribute="Shutter1Strobe" DMXFrom="7/1" PhysicalFrom="0.4" PhysicalTo="25""#,
+        r#"Attribute="Shutter1Strobe" DMXFrom="7/1" PhysicalFrom="25" PhysicalTo="0.4""#,
+    );
+    assert_ne!(descending, crate::lighting::gdtf::SYNTHETIC_DESCRIPTION);
+    let fixture = gdtf_fixture(&descending, None);
+    assert_eq!(fixture.strobe_curve, StrobeCurve::Declared);
+    assert_eq!(strobe_byte(fixture.clone(), 25.0), 7);
+    assert_eq!(strobe_byte(fixture.clone(), 0.4), 255);
+    let ten = strobe_byte(fixture, 10.0);
+    // 7 + (10 − 25)/(0.4 − 25) × 248 = 158.2
+    assert_eq!(ten, 158);
+}
+
+/// The state stream says the rate a fixture with a strobe channel is
+/// strobing at — its byte read back through the fixture's own rule, the
+/// reading the stage views flash at — and nothing once the strobe is
+/// over. A software strobe's rate is not on the stream: its bytes flip
+/// there frame by frame already. A single instant carries both (an
+/// evaluation; see `an_evaluation_reports_a_software_strobes_rate`).
+#[test]
+fn the_state_stream_reports_the_rate_a_fixture_strobes_at() {
+    let mut engine = EffectEngine::new();
+    engine.register_fixture(create_pixelbrick_fixture("Brick", 1, 1));
+    let mut rgb = HashMap::new();
+    rgb.insert("red".to_string(), 1);
+    rgb.insert("green".to_string(), 2);
+    rgb.insert("blue".to_string(), 3);
+    engine.register_fixture(FixtureInfo::new(
+        "Par".to_string(),
+        1,
+        10,
+        "RGB".to_string(),
+        rgb,
+        None,
+    ));
+    let strobe = |id: &str, target: &str, hz: f64| {
+        EffectInstance::new(
+            id.to_string(),
+            EffectType::Strobe {
+                frequency: TempoAwareFrequency::Fixed(hz),
+                duration: Duration::from_secs(1),
+            },
+            vec![target.to_string()],
+            None,
+            None,
+            None,
+        )
+    };
+    engine.start_effect(strobe("hw", "Brick", 10.0)).unwrap();
+    engine.start_effect(strobe("sw", "Par", 7.0)).unwrap();
+    engine.update(Duration::from_millis(16), None).unwrap();
+
+    use crate::state::StrobeRates;
+    let rate_in = |engine: &EffectEngine, name: &str, rates: StrobeRates| {
+        let registry = engine.get_fixture_registry();
+        crate::state::fixture_snapshots_with_cells(
+            engine.shown_fixture_states(),
+            &HashMap::new(),
+            registry,
+            engine.wire(),
+            rates,
+        )
+        .into_iter()
+        .find(|s| s.name == name)
+        .and_then(|s| s.strobe_hz)
+    };
+    let rate = |engine: &EffectEngine, name: &str| rate_in(engine, name, StrobeRates::Live);
+    // The PixelBrick's period curve puts 10 Hz at byte 249 (248.95,
+    // rounded), which reads back at the byte itself: 10.05 Hz (the curve is
+    // steep up here; byte 248 is 9.1 Hz).
+    let brick = rate(&engine, "Brick").expect("the Brick strobes");
+    let registry = engine.get_fixture_registry();
+    assert_eq!(registry["Brick"].strobe_hz(249), Some(brick));
+    assert!((9.1..=10.05).contains(&brick), "{brick} Hz");
+    assert_eq!(
+        rate(&engine, "Par"),
+        None,
+        "a software strobe: not on the stream"
+    );
+    assert_eq!(
+        rate_in(&engine, "Par", StrobeRates::Instant),
+        Some(7.0),
+        "the effect's own rate, on a single instant"
+    );
+    assert_eq!(rate_in(&engine, "Brick", StrobeRates::Instant), Some(brick));
+
+    // Over: the Brick's channel is sent off (byte 0), the Par's state goes.
+    engine.update(Duration::from_secs(2), None).unwrap();
+    assert_eq!(rate(&engine, "Brick"), None);
+    assert_eq!(rate(&engine, "Par"), None);
+}
+
+/// #633: a period curve with a DMX offset and no minimum frequency wrote
+/// `hz / max` of the whole channel, so a slow strobe landed below the
+/// offset, where the fixture does not strobe, and read back as none. The
+/// offset holds there as everywhere: any rate over 0 writes a byte in
+/// `offset..=255`, and that byte reads back to about the rate.
+#[test]
+fn a_dmx_offset_holds_without_a_minimum_frequency() {
+    for hz in [0.3, 1.0, 2.0, 5.0] {
+        let fixture = create_fixture_with_strobe_offset("Brick", 1, 1, 20.0, 0.0, 64);
+        let byte = strobe_byte(fixture.clone(), hz);
+        assert!(byte >= 64, "{hz} Hz wrote {byte}, below the offset");
+        let back = fixture
+            .strobe_hz(byte)
+            .unwrap_or_else(|| panic!("{hz} Hz: byte {byte} reads back as no strobe"));
+        // One byte of the 191 above the offset is 20/191 Hz.
+        assert!(
+            (back - hz).abs() <= 20.0 / 191.0 / 2.0 + 1e-9,
+            "{hz} Hz: byte {byte} reads back as {back} Hz"
+        );
+    }
+    // Under the offset is not a strobe rate.
+    let fixture = create_fixture_with_strobe_offset("Brick", 1, 1, 20.0, 0.0, 64);
+    assert_eq!(fixture.strobe_hz(63), None);
+    assert_eq!(fixture.strobe_hz(255), Some(20.0));
+}

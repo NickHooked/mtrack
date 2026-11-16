@@ -14,6 +14,7 @@
      * -->
 <script lang="ts">
   import { t } from "svelte-i18n";
+  import { audioAccept } from "../../lib/util/paths";
   import { get } from "svelte/store";
   import { uploadTrack, type SongFile } from "../../lib/api/songs";
   import FilePicker from "./FilePicker.svelte";
@@ -51,12 +52,8 @@
     uploading = true;
     uploadMsg = "";
     try {
-      const res = await uploadTrack(songName, dropped[0]);
-      if (!res.ok) {
-        throw new Error(`Upload failed (${res.status})`);
-      }
-      const data = await res.json();
-      onchange((data.file as string) ?? dropped[0].name);
+      const data = await uploadTrack(songName, dropped[0]);
+      onchange(data.file ?? dropped[0].name);
       uploadMsg = get(t)("songFile.uploaded", {
         values: { name: dropped[0].name },
       });
@@ -94,7 +91,7 @@
     {/if}
   </div>
   <FileUpload
-    accept=".wav,.flac,.mp3,.ogg,.aac,.m4a,.mp4,.aiff,.aif"
+    accept={audioAccept()}
     label={uploading ? $t("common.uploading") : $t("samples.dropAudio")}
     onupload={handleUpload}
   />

@@ -12,300 +12,208 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+import type {
+  FixtureMetadata,
+  LogLine,
+  Playback,
+  PoseSnapshot,
+  ShowReload,
+  StageMetadata,
+  StageState,
+  StageValues,
+  StageVenue,
+  Waveform,
+} from "../../gen/rules/mtrack_rules";
 import { writable } from "svelte/store";
-import { connect, on, onConnectionStatus } from "./connection";
+import type { FeedLease } from "../stage/grpc-feed";
+import { stageTiming } from "../stage/timing";
+import { openWatch, type WatchMessage } from "../grpc/watch";
+import { statusStore } from "./status";
 
-// --- Types ---
-
-export interface TrackInfo {
-  name: string;
-  output_channels: number[];
-  /** Output track gain in dB; absent on older backends (treat as 0). */
-  gain_db?: number;
-  /** Whether the track is muted (independently of the gain); absent on
-   * older backends (treat as false). */
-  muted?: boolean;
-}
-
-export interface BeatGrid {
-  beats: number[];
-  measure_starts: number[];
-  /** Per-beat accent levels (0 silent, 1 normal, 2 half, 3 accent);
-   * present when the song has a metronome. */
-  accent_levels?: number[];
-}
-
-export interface SectionInfo {
-  name: string;
-  /** 1-indexed, inclusive. */
-  start_measure: number;
-  /** 1-indexed, exclusive. */
-  end_measure: number;
-  /** Beat within `start_measure` (1-based, fractional); absent = the
-   *  measure line. */
-  start_beat?: number | null;
-  /** Beat within `end_measure` (1-based, fractional); absent = the
-   *  measure line, keeping the bound exclusive. */
-  end_beat?: number | null;
-  /** Explicit display color; absent = UI palette rotation. */
-  color?: string | null;
-}
-
-export interface ActiveSection {
-  name: string;
-  start_ms: number;
-  end_ms: number;
-}
-
-export interface PilotHintInfo {
-  label: string;
-  at_ms: number;
-  start_ms: number;
-  end_ms: number;
-  has_audio: boolean;
-}
-
-export interface ReactiveLoopState {
-  state:
-    | "idle"
-    | "section_offered"
-    | "loop_armed"
-    | "looping"
-    | "break_requested";
-  section_name?: string;
-}
-
-export interface PlaybackState {
-  is_playing: boolean;
-  elapsed_ms: number;
-  song_name: string;
-  song_duration_ms: number;
-  playlist_name: string;
-  playlist_position: number;
-  playlist_songs: string[];
-  tracks: TrackInfo[];
-  available_playlists: string[];
-  persisted_playlist_name: string;
-  locked: boolean;
-  beat_grid: BeatGrid | null;
-  looping: boolean;
-  available_sections: SectionInfo[];
-  active_section: ActiveSection | null;
-  /** Start position for the next play, set by seeking while stopped. */
-  pending_start_ms: number | null;
-  /** Reactive section-loop state machine. */
-  reactive_loop_state: ReactiveLoopState | null;
-  /** Pilot hints resolved to song times. */
-  pilot_hints: PilotHintInfo[];
-  /** Current tempo/meter from the song's tempo map, sampled at the playhead. */
-  tempo: { bpm: number; time_signature: [number, number] } | null;
-  /** performance.now() when this frame was received; lets consumers
-   *  extrapolate elapsed_ms smoothly between the 5Hz frames. */
-  received_at: number;
-}
-
-export interface FixtureChannels {
-  [channel: string]: number;
-}
-
-export type Vec3 = [number, number, number];
-
-export interface FixtureMetadata {
-  tags: string[];
-  type: string;
-  /** Stage position in meters, when the venue places the fixture. */
-  position?: Vec3 | null;
-  /** Mounting rotation in degrees about X, Y, Z, when the venue states it. */
-  rotation?: Vec3 | null;
-  /**
-   * The fixture type's rig model, as a path under /api/lighting/assets/,
-   * when the type was distilled from a GDTF; the 3D view draws a generic
-   * body without one.
-   */
-  rig?: string | null;
-  /**
-   * The cells of a pixel fixture, in the manufacturer's order, with their
-   * offsets in the fixture's frame (meters); empty for a one-colour
-   * fixture. The plot draws one segment each.
-   */
-  cells?: { name: string; offset: Vec3 }[];
-}
-
-/** Per-cell channel values, by fixture then cell (design §17.4). */
-export type CellChannels = Record<string, Record<string, FixtureChannels>>;
-
-/** The current venue as the stage view needs it. */
-export interface VenueMetadata {
-  name: string;
-  /** The configured venues directory, for saving edits back. */
-  dir: string | null;
-  focus_points: Record<string, Vec3>;
-  /**
-   * The venue's scenery file under /api/lighting/assets/, when the venue
-   * was seeded from an MVR; the 3D view draws it.
-   */
-  scenery?: string | null;
-  /** Why the scenery is missing, when the venue should have had some. */
-  scenery_error?: string | null;
-}
-
-export interface LogLine {
-  level: string;
-  target: string;
-  message: string;
-}
-
-export interface WaveformData {
-  song_name: string;
-  tracks: { name: string; peaks: number[] }[];
-}
-
-export interface ReloadEvent {
-  status: "ok" | "error";
-  error?: string;
-}
+/** The playback status, with `received_at`: performance.now() when the
+ *  frame was received, so consumers extrapolate `elapsed_ms` smoothly
+ *  between the 5Hz frames. */
+export type PlaybackState = Playback & { received_at: number };
 
 // --- Stores ---
 
-export const wsConnected = writable(false);
+/** Whether the tab's `Watch` stream is up: it has delivered, and not
+ *  ended since. */
+export const watchConnected = writable(false);
 
-export const playbackStore = writable<PlaybackState>({
+/** Why the stream last failed; null while it is up, and before it has
+ *  failed. */
+export const watchError = writable<string | null>(null);
+
+/** Before the first frame; a frame's missing fields keep these too. */
+const IDLE: PlaybackState = {
   is_playing: false,
   elapsed_ms: 0,
   song_name: "",
   song_duration_ms: 0,
   playlist_name: "",
   playlist_position: 0,
+  playlist_off_list: false,
+  playlist_at_first: true,
+  playlist_at_last: true,
   playlist_songs: [],
   tracks: [],
   available_playlists: [],
   persisted_playlist_name: "",
   locked: true,
+  hardware_reload_started: 0,
+  hardware_reload_refused: [],
+  process_id: "",
   beat_grid: null,
   looping: false,
   available_sections: [],
   active_section: null,
   pending_start_ms: null,
-  reactive_loop_state: null,
+  reactive_loop_state: { state: "idle" },
   pilot_hints: [],
   tempo: null,
+  auto_play: null,
+  ending: null,
+  ambient: null,
+  next: null,
   received_at: 0,
-});
+};
 
-export const fixtureStore = writable<Record<string, FixtureChannels>>({});
+export const playbackStore = writable<PlaybackState>(IDLE);
+
+// The stage's stores are filled by the gRPC stream `WatchStage`
+// (lib/stage/grpc-feed.ts), which one lease shares between everything that
+// shows the stage: the stream opens when one of these first has a
+// subscriber and closes a while after the last leaves. The app provides the
+// lease (main.ts); a page fed another way (the stage-only page, which is
+// handed the stream by its host) provides none and opens nothing.
+let stageLease: FeedLease | null = null;
+
+/** Says where the stage's stores are filled from. Call once, as the app
+ *  starts. */
+export function provideStageFeed(lease: FeedLease): void {
+  stageLease = lease;
+}
+
+/** A store of the stage: watching it holds the stage stream open. */
+function stageStore<T>(initial: T) {
+  return writable<T>(initial, () => stageLease?.acquire());
+}
+
+export const fixtureStore = stageStore<StageValues["fixtures"]>({});
+export const strobeRateStore = stageStore<StageValues["strobe_rates"]>({});
 /**
  * Per-cell values for fixtures a per-cell effect is driving this frame;
  * a fixture absent here shows its own channels on every cell.
  */
-export const cellStore = writable<CellChannels>({});
+export const cellStore = stageStore<StageValues["cells"]>({});
 
 /** Where a mover points, from the engine's pose memory. */
-export interface FixturePose {
-  pan: number;
-  tilt: number;
-  /** Beam direction in stage space, unit length. */
-  aim: Vec3;
-  /** Where the beam meets the deck, when it points down. */
-  floor: [number, number] | null;
-}
+export const poseStore = stageStore<Record<string, PoseSnapshot>>({});
+/**
+ * Venue fixtures a fixture test's output covers: their channels, cells and
+ * poses in the stores above are the test's bytes, what leaves for olad.
+ */
+export const underTestStore = stageStore<string[]>([]);
+export const metadataStore = stageStore<Record<string, FixtureMetadata>>({});
+export const venueStore = stageStore<StageVenue | null>(null);
 
-export const poseStore = writable<Record<string, FixturePose>>({});
-export const metadataStore = writable<Record<string, FixtureMetadata>>({});
-export const venueStore = writable<VenueMetadata | null>(null);
-
-export const effectsStore = writable<string[]>([]);
+export const effectsStore = stageStore<string[]>([]);
 
 const MAX_LOG_LINES = 200;
 export const logStore = writable<LogLine[]>([]);
 
-export const waveformStore = writable<WaveformData>({
+export const waveformStore = writable<Waveform>({
   song_name: "",
   tracks: [],
 });
 
-export const reloadStore = writable<ReloadEvent | null>(null);
+export const reloadStore = writable<ShowReload | null>(null);
 
 // --- Wire up ---
 
-onConnectionStatus((connected) => {
-  wsConnected.set(connected);
-});
+/** Puts what the stream said in the stores. */
+export function applyWatchMessage(m: WatchMessage): void {
+  switch (m.type) {
+    case "playback":
+      playbackStore.set({
+        ...IDLE,
+        ...m.playback,
+        received_at: performance.now(),
+      });
+      break;
+    case "logs":
+      logStore.update((prev) => {
+        const next = [...prev, ...m.lines];
+        return next.length > MAX_LOG_LINES
+          ? next.slice(next.length - MAX_LOG_LINES)
+          : next;
+      });
+      break;
+    case "waveform":
+      waveformStore.set(m.waveform);
+      break;
+    case "reload":
+      reloadStore.set(m.reload);
+      // Clear after 3 seconds
+      setTimeout(() => reloadStore.set(null), 3000);
+      break;
+    case "hardware":
+      statusStore.set(m.status);
+      break;
+    case "config_changed":
+      // Nothing on the page reads it yet.
+      break;
+  }
+}
 
-on("playback", (msg) => {
-  const m = msg as PlaybackState & { type: string };
-  playbackStore.set({
-    is_playing: m.is_playing,
-    elapsed_ms: m.elapsed_ms,
-    song_name: m.song_name,
-    song_duration_ms: m.song_duration_ms,
-    playlist_name: m.playlist_name,
-    playlist_position: m.playlist_position,
-    playlist_songs: m.playlist_songs,
-    tracks: m.tracks ?? [],
-    available_playlists: m.available_playlists ?? [],
-    persisted_playlist_name: m.persisted_playlist_name ?? "",
-    locked: m.locked ?? true,
-    beat_grid: m.beat_grid ?? null,
-    looping: m.looping ?? false,
-    available_sections: m.available_sections ?? [],
-    active_section: m.active_section ?? null,
-    pending_start_ms: m.pending_start_ms ?? null,
-    reactive_loop_state: m.reactive_loop_state ?? null,
-    pilot_hints: m.pilot_hints ?? [],
-    tempo: m.tempo ?? null,
-    received_at: performance.now(),
-  });
-});
-
-on("state", (msg) => {
-  const m = msg as {
-    type: string;
-    fixtures: Record<string, FixtureChannels>;
-    active_effects: string[];
-    poses?: Record<string, FixturePose>;
-    cells?: CellChannels;
-  };
+/**
+ * Puts the stage's state in the stores: a frame of the gRPC stage stream
+ * read against its layout (lib/stage/feed.ts).
+ */
+export function applyStageState(m: Partial<StageState>): void {
+  // Before the channels: a plot redraws on them and reads these.
+  underTestStore.set(m.under_test ?? []);
+  strobeRateStore.set(m.strobe_rates ?? {});
   fixtureStore.set(m.fixtures ?? {});
   effectsStore.set(m.active_effects ?? []);
   poseStore.set(m.poses ?? {});
   cellStore.set(m.cells ?? {});
-});
+  stageTiming.applied();
+}
 
-on("metadata", (msg) => {
-  const m = msg as {
-    type: string;
-    fixtures: Record<string, FixtureMetadata>;
-    venue?: VenueMetadata | null;
-  };
+/**
+ * Puts what is on the stage in the stores: a layout of the gRPC stage
+ * stream.
+ */
+export function applyStageMetadata(m: Partial<StageMetadata>): void {
   metadataStore.set(m.fixtures ?? {});
-  venueStore.set(
-    m.venue ? { ...m.venue, focus_points: m.venue.focus_points ?? {} } : null,
-  );
-});
+  venueStore.set(m.venue ?? null);
+}
 
-on("logs", (msg) => {
-  const m = msg as { type: string; lines: LogLine[] };
-  logStore.update((prev) => {
-    const next = [...prev, ...m.lines];
-    return next.length > MAX_LOG_LINES
-      ? next.slice(next.length - MAX_LOG_LINES)
-      : next;
+let closeWatch: (() => void) | null = null;
+
+/**
+ * Opens the `Watch` stream that fills these stores, and keeps it open. The
+ * app calls this once as it starts (main.ts). Importing this module opens
+ * nothing: a page fed another way (the stage-only page, which is given the
+ * gRPC stage stream) imports the stores and never calls it. Called again, it
+ * closes the stream and opens a new one, which opens as every stream does:
+ * with the player's playback, waveform and hardware as they are now.
+ */
+export function connect(): void {
+  closeWatch?.();
+  closeWatch = openWatch({
+    message: applyWatchMessage,
+    connected: () => {
+      watchError.set(null);
+      watchConnected.set(true);
+    },
+    disconnected: (error) => {
+      watchConnected.set(false);
+      if (error !== null) {
+        watchError.set(error instanceof Error ? error.message : String(error));
+      }
+    },
   });
-});
-
-on("waveform", (msg) => {
-  const m = msg as WaveformData & { type: string };
-  waveformStore.set({
-    song_name: m.song_name,
-    tracks: m.tracks ?? [],
-  });
-});
-
-on("reload", (msg) => {
-  reloadStore.set(msg as ReloadEvent);
-  // Clear after 3 seconds
-  setTimeout(() => reloadStore.set(null), 3000);
-});
-
-// Connect on module load
-connect();
+}

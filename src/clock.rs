@@ -17,6 +17,105 @@ use std::time::{Duration, Instant};
 
 use crate::playsync::CancelHandle;
 
+/// The wall clock: [`Instant::now`], except on a test's thread that has set
+/// its own ([`TestClock`]), or been handed one ([`WallClock`]), and moves it
+/// on by hand, so what is timed on it -- a loop break's fade frames (#654),
+/// how long an audio stream lasted -- takes the times the test chose.
+pub(crate) fn wall_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = TEST_CLOCK.with(|clock| clock.borrow().as_ref().map(|c| *c.now.lock())) {
+        return now;
+    }
+    Instant::now()
+}
+
+/// Waits on `condvar` for `duration` to pass, unless it is notified first:
+/// a pause, as a retry's backoff, rather than a wait for what the notify
+/// says. On a test's clock each is noted with the time it asked for
+/// ([`TestClock::pauses`]), for a test of what may or may not pause.
+pub(crate) fn pause<T>(
+    condvar: &parking_lot::Condvar,
+    guard: &mut parking_lot::MutexGuard<'_, T>,
+    duration: Duration,
+) {
+    #[cfg(test)]
+    TEST_CLOCK.with(|clock| {
+        if let Some(clock) = clock.borrow().as_ref() {
+            clock.pauses.lock().push(duration);
+        }
+    });
+    condvar.wait_for(guard, duration);
+}
+
+/// A test's clock: the time it reads, and the pauses asked for on it.
+#[cfg(test)]
+struct TestTime {
+    now: parking_lot::Mutex<Instant>,
+    pauses: parking_lot::Mutex<Vec<Duration>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCK: std::cell::RefCell<Option<Arc<TestTime>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The wall clock a thread reads, to carry onto a thread it spawns: a
+/// test's own, if it has one. Outside tests, there is only [`Instant::now`].
+pub(crate) struct WallClock {
+    #[cfg(test)]
+    test: Option<Arc<TestTime>>,
+}
+
+impl WallClock {
+    /// The clock this thread reads.
+    pub(crate) fn current() -> WallClock {
+        WallClock {
+            #[cfg(test)]
+            test: TEST_CLOCK.with(|clock| clock.borrow().clone()),
+        }
+    }
+
+    /// Reads it on this thread from now on.
+    pub(crate) fn install(self) {
+        #[cfg(test)]
+        TEST_CLOCK.with(|clock| *clock.borrow_mut() = self.test);
+    }
+}
+
+/// A test's own wall clock, on this thread and those it hands it to, until
+/// it is dropped: it stands still between [`TestClock::advance`]s.
+#[cfg(test)]
+pub(crate) struct TestClock(Arc<TestTime>);
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn start() -> TestClock {
+        let time = Arc::new(TestTime {
+            now: parking_lot::Mutex::new(Instant::now()),
+            pauses: parking_lot::Mutex::new(Vec::new()),
+        });
+        TEST_CLOCK.with(|clock| *clock.borrow_mut() = Some(time.clone()));
+        TestClock(time)
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *self.0.now.lock() += by;
+    }
+
+    /// The pauses asked for on this clock so far ([`pause`]).
+    pub(crate) fn pauses(&self) -> Vec<Duration> {
+        self.0.pauses.lock().clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestClock {
+    fn drop(&mut self) {
+        TEST_CLOCK.with(|clock| *clock.borrow_mut() = None);
+    }
+}
+
 /// A playback clock that provides elapsed time since playback started.
 ///
 /// When an audio device is present, the clock derives time from the audio
@@ -33,6 +132,10 @@ pub struct PlaybackClock {
 
 struct ClockShared {
     source: ClockSource,
+    /// When `start()` was called, on the wall clock, whatever the source: for
+    /// a thread that times itself on the wall clock and must count from the
+    /// start, not from when it noticed it.
+    started_at: parking_lot::Mutex<Option<Instant>>,
     /// Condvar+Mutex used to wake threads waiting for `start()`.
     start_condvar: Condvar,
     start_mutex: Mutex<bool>,
@@ -64,6 +167,7 @@ impl PlaybackClock {
                     sample_rate,
                     start_sample: AtomicU64::new(u64::MAX),
                 },
+                started_at: parking_lot::Mutex::new(None),
                 start_condvar: Condvar::new(),
                 start_mutex: Mutex::new(false),
             }),
@@ -77,6 +181,7 @@ impl PlaybackClock {
                 source: ClockSource::Wall {
                     start_instant: parking_lot::Mutex::new(None),
                 },
+                started_at: parking_lot::Mutex::new(None),
                 start_condvar: Condvar::new(),
                 start_mutex: Mutex::new(false),
             }),
@@ -87,6 +192,8 @@ impl PlaybackClock {
     /// Called by `play_files` once all subsystems have signaled readiness.
     /// Subsystems wait for `elapsed() > Duration::ZERO` as the "go" signal.
     pub fn start(&self) {
+        let now = Instant::now();
+        *self.inner.started_at.lock() = Some(now);
         match &self.inner.source {
             ClockSource::Audio {
                 sample_counter,
@@ -98,7 +205,7 @@ impl PlaybackClock {
             }
             ClockSource::Wall { start_instant } => {
                 let mut guard = start_instant.lock();
-                *guard = Some(Instant::now());
+                *guard = Some(now);
             }
         }
         // Wake any threads blocked in wait_for_start_or_cancel.
@@ -107,6 +214,30 @@ impl PlaybackClock {
             *started = true;
         }
         self.inner.start_condvar.notify_all();
+    }
+
+    /// A wall clock that started at `at`, which may be in the past: a clock
+    /// counting from another's start (see [`PlaybackClock::started_at`]).
+    pub fn wall_from(at: Instant) -> Self {
+        let clock = Self::wall();
+        *clock.inner.started_at.lock() = Some(at);
+        if let ClockSource::Wall { start_instant } = &clock.inner.source {
+            *start_instant.lock() = Some(at);
+        }
+        *clock.inner.start_mutex.lock().unwrap() = true;
+        clock
+    }
+
+    /// When [`PlaybackClock::start`] was called, on the wall clock; `None`
+    /// before it has been.
+    pub fn started_at(&self) -> Option<Instant> {
+        *self.inner.started_at.lock()
+    }
+
+    /// Whether it counts an audio interface's samples, rather than reading
+    /// the wall clock.
+    pub fn is_audio(&self) -> bool {
+        matches!(self.inner.source, ClockSource::Audio { .. })
     }
 
     /// Whether [`PlaybackClock::start`] has been called.

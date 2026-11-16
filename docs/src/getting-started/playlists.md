@@ -10,13 +10,9 @@ sorted alphabetically. It cannot be deleted or manually edited.
 
 ## Active Playlist
 
-The active playlist determines which songs are available for playback. Switch between playlists
-using:
-
-- The **dashboard playlist dropdown** in the web UI
-- The **playlist editor's Activate button**
-- The `SwitchToPlaylist` gRPC RPC
-- MIDI/OSC `Playlist` and `AllSongs` events
+The active playlist determines which songs are available for playback. In the web UI, switch
+between playlists with the **dashboard playlist dropdown** or the **playlist editor's Activate
+button**. Other control interfaces can switch too; see [See also](#see-also).
 
 The active playlist choice is persisted in `mtrack.yaml` (via the `active_playlist` field)
 and restored on restart. Switching to `all_songs` is session-only — on restart, the player
@@ -31,7 +27,15 @@ files on disk to prevent broken references.
 
 Playlists are YAML files stored in a `playlists/` directory (configurable via `playlists_dir`
 in `mtrack.yaml`). Each playlist is named after its filename stem — `my_setlist.yaml` becomes
-the playlist "my_setlist".
+the playlist "my_setlist". The extension is `.yaml` or `.yml`, lowercase. A name has one file:
+with both `my_setlist.yaml` and `my_setlist.yml`, mtrack reads `my_setlist.yaml`, logs a warning
+that `my_setlist.yml` is not read, and the web UI and MCP save to `my_setlist.yaml` too. A
+playlist kept only as `my_setlist.yml` is saved into that file. A new playlist whose file would
+differ only in case from one already there (`setlist` beside `Setlist.yaml`) is refused, since a
+case-insensitive filesystem would write into that file. A new playlist's file is created with
+the filesystem refusing one already there, so one made meanwhile, or one differing only by
+Unicode normalization, is never written over. No file holds `all_songs`: an
+`all_songs.yaml` is ignored, and the web UI and MCP refuse to write one.
 
 ```yaml
 kind: playlist
@@ -53,3 +57,233 @@ For backward compatibility, mtrack also supports a single legacy `playlist.yaml`
 the playlist named "playlist" if no file with that name exists in the `playlists/` directory.
 
 If no playlist file is provided at all, mtrack falls back to the `all_songs` playlist.
+
+## Transitions
+
+Breaking out of a looping song (Play, Next or Previous) normally cuts it in 10 ms. A playlist
+entry can instead have its song play on and fade out under the song it gives way to -- a prelude
+carrying the room into the song it introduces -- and an entry can have its song fade in.
+
+```yaml
+kind: playlist
+songs:
+- song: Walk-in loop
+  fade_out:
+    length: 2measures
+    curve: linear
+    exclude: [click, cues]
+    lights: 1measure
+- song: Opener
+  fade_in: {length: 4beats, exclude: [click]}
+- The slow one
+```
+
+An entry is a song's name, or a map with `song` and its own `fade_out` and `fade_in`; an entry
+without them cuts and starts as usual. The same song can fade differently in different
+playlists, or at different places in one. A misspelt setting is an error, as is an `exclude`
+naming a track the entry's song does not have.
+
+- **`fade_out`** applies when a loop break leaves the entry's song: the next song starts at once,
+  as always, while the looping song plays on from where it was and fades out underneath it.
+  It applies only to loop breaks; a song that ends by itself just ends.
+- **`fade_in`** applies when the entry's song starts under a song fading out: it has no effect
+  otherwise.
+
+Either can be a length alone or a map:
+
+- **`length`**: `3s`, `1.5s`, `500ms`, `2m` (minutes), `6beats` or `1measure`. A `fade_out`'s beats
+  and measures count on the **next** song's grid from its first bar -- any lead-in before it
+  included -- so `1measure` fades out exactly over the next song's count-in, whatever its tempo and
+  meter. A song with no grid of its own (a prelude usually has none) needs the next song to have
+  one; failing both, the song cuts. A `fade_in`'s count on its own song's grid.
+- **`curve`**: `equal_power` (the default) holds the level up and falls away late on a
+  fade-out, and comes up quickly on a fade-in; `linear` is a straight ramp.
+- **`exclude`**: tracks that do not fade. On a fade-out they cut at once; on a fade-in they start
+  at full level -- usually the click and cues, so the count-in is heard once and clearly. A
+  `fade_out` defaults to the song's `loop_crossfade_cut` tracks, a `fade_in` to none.
+- **`lights`** (`fade_out` only): how long the lights take to cross from the looping song's show
+  into the next song's, `0s` to switch at once. Defaults to the length.
+
+A source part way through a loop crossfade fades out from where it is. A fade that outlasts the
+pass it began in carries on into as many more passes as it takes, crossing pass to pass over the
+song's `loop_crossfade` as its loop does. MIDI from the looping song stops
+at the break. The fading song's lights cross out over whatever plays after them at their own
+length, whatever that does meanwhile -- loops, ends, or breaks out again. A Stop, pause or seek
+cuts the fading song's audio at once; its lights go the rest of the way out over the ambient
+light's `fade_out` (1 s by default), so nothing it lit is left holding.
+
+### Ending a looping song
+
+Stop on a looping song whose entry has a `fade_out` ends it over that fade, as a loop break
+would -- the same length, curve, `exclude` and `lights` -- with nothing after it. The player
+stops at once and the playlist stays where it is, and the lights cross toward dark. Beats and
+measures count on the grid of the song Next would go to, as for a loop break, so a prelude with
+no grid of its own still fades; on the last entry they count on the song's own. Ambient light's
+delay counts from the Stop, so it comes in over the tail of the fade rather than after a dark
+gap. Without a `fade_out`, Stop cuts at once, as it does any song that is not looping.
+
+- **Stop again** while the song fades out cuts the audio at once. Its lights go the rest of the
+  way to dark over the ambient light's `fade_out` (1 s by default), unless they were already
+  closer to dark than that, and ambient light comes in at once rather than after the rest of its
+  `delay`.
+- **Play** while it fades out starts the song again from the top, the fade playing on under it;
+  **Next** and **Previous** move the playlist as on a stopped player, and the fade plays out.
+- **The end of the list.** Next on the last entry, or Previous on the first, has no song to
+  break into: it ends the looping song as Stop does, rather than starting it over. Play still
+  breaks the loop and starts the song again.
+- While it fades out, the dashboard's playback card says so ("Walk-in loop is fading out (4s)")
+  with Stop left live, and the MCP `status` tool reports `ending: {song, remaining_seconds}`.
+
+Fades can also be set in the web UI's playlist editor, under each song's **Transitions**; it
+refuses what the player would refuse, writes an entry left with no settings as its name alone,
+and will not overwrite a playlist file that does not read. Auto play and ambient light (below)
+can be set in the editor too. The dashboard's playback card says what a loop break will do
+("Next breaks the loop: fades out over 1 measure into Opener").
+
+## Auto play
+
+An entry with `auto_play` starts by itself when the playlist reaches it, rather than waiting
+for Play: an intro tape after the line check, a song segued from the one before.
+
+```yaml
+kind: playlist
+songs:
+- Line check
+- song: Walk-on tape
+  auto_play: true      # starts as soon as it is reached
+- song: Opener
+  auto_play: 2s        # waits two seconds first
+- The slow one
+```
+
+- **What reaches it.** The song before it ending by itself, or Next or Previous while stopped.
+  Stop never moves the playlist, so it never starts one; nor does switching playlists or
+  starting the player.
+- **The gap.** `true` starts the song at once; a length (`2s`, `1.5s`, `500ms`, `2m`, or a bare
+  number of seconds) waits that long first. The song before it holds its lights through the gap, as a
+  segue -- unless ambient light is Off, which is dark between songs: then they fade to dark over
+  its `fade_out`, as at any other end (with no gap, the song crosses in from them over it, as
+  after a Stop), and setting Off during a gap takes them dark too. Play,
+  Stop, Next, Previous or a playlist switch during the gap calls it off.
+- **The end of the list.** Next on the last song does not move, so does not start it again.
+- A song that failed does not lead into one that auto plays.
+- **Seeing it coming.** While a gap runs, the dashboard's playback card counts it down
+  ("Opener starts in 2s"), the MCP `status` tool reports the song and how long until it
+  starts, as `auto_play: {song, starts_in_seconds}`, and the gRPC `Status` as `auto_play`. A
+  MIDI controller's LED can show it too, with the profile's `status_events.auto_play_events`
+  (see [Hardware Profiles](../configuration/hardware-profiles.md)).
+- **Calling it off from a controller.** Cancel auto play calls off the wait and nothing else:
+  the player stays stopped on the song, and ambient light comes up as after a stop. It is the
+  gRPC `CancelAutoPlay` RPC, the OSC address `/mtrack/auto_play/cancel`, a MIDI controller's
+  `cancel_auto_play` event, and the MCP `cancel_auto_play` tool.
+- **In the web UI.** The playlist editor has an **Auto play** box on each song. Once it is
+  ticked, the gap is set under **Before this song** in the song's transitions panel: empty
+  starts the song at once.
+
+![The playlist editor: two songs set to auto play, one with its transitions panel open on a 2s
+gap, and the playlist's own ambient show](../images/playlist-auto-play.png)
+
+## Ambient light
+
+The profile's ambient light -- the show the rig plays between songs, see
+[Lighting Configuration](../lighting/configuration.md#ambient-light) -- can be set per playlist
+with a top-level `ambient:`. Its settings override the profile's one by one, so a playlist
+can swap the show and keep the timings:
+
+```yaml
+kind: playlist
+ambient:
+  show: lighting/festival_ambient.light
+  fade_in: 6s
+songs:
+- Opener
+- The slow one
+```
+
+`ambient: false` turns it off for the playlist. Switching playlists while nothing plays crosses
+straight into the new playlist's ambient light, or fades the old one out.
+
+### Per entry
+
+An entry can set the ambient light for the gap before its song with an `ambient:` of its own, in
+the same form. Its settings override the playlist's one by one, which override the profile's:
+
+```yaml
+kind: playlist
+ambient:
+  show: lighting/house.light
+songs:
+- Opener
+- Shieldbrother
+- song: Drink to Glory
+  ambient: false            # no ambient light while waiting for the encore
+- song: The Old Mead Hall
+  ambient:
+    show: lighting/encore_wash.light
+    fade_in: 6s
+```
+
+- **Which gap.** The entry's ambient light plays while the player waits on it, the gap its
+  `auto_play` covers: after the song before it ends, or Next or Previous lands on it while stopped;
+  after a stop, the stopped song's own, since a stop never moves the playlist. After the last song
+  plays to its end, the playlist's ambient light plays, not the last entry's.
+- **Navigating while stopped** onto an entry with other ambient light crosses into it.
+- **`false`** turns it off for that gap: what the song before left holds, as with a playlist's
+  `ambient: false`. For a dark stage, give the entry a show of its own that lights nothing, or set
+  the mode to `off`.
+- **Turning it back on.** Under a playlist's `ambient: false`, an entry naming a `show` plays it,
+  with the profile's timings for any it leaves out. Timings alone leave it off.
+- **The mode still wins**: `on` holds the waiting entry's ambient light up over a song, and `off`
+  is dark between songs, whatever the entry says.
+- **Whose light is up.** The dashboard, the MCP `status` tool and the gRPC `Status` give the
+  ambient light's `source`: `profile`, `playlist` or `entry`.
+
+In the web UI's playlist editor, each entry's transitions button opens what happens **before this
+song** (the auto play gap, ambient light and fade in) and **after this song** (fade out). The
+button sums up what the entry sets; one that sets nothing reads **Transitions**.
+
+The ambient **mode** -- `auto`, `on` (hold it now, over any song) or `off` -- is set while the
+player runs, from the dashboard or a controller; see
+[Ambient mode](../lighting/configuration.md#ambient-mode). `on` with a playlist that has
+`ambient: false` lights nothing.
+
+In the web UI's playlist editor, **Ambient light** picks the profile's, none, or the playlist's
+own; its own shows the show and timing fields, each left empty to keep the profile's.
+
+## Palette overrides
+
+A show's [palette](../lighting/cueing.md#palettes) names its colours in slots. An entry can
+recolour them for this song in this playlist only, with a `palette:` beside its other settings:
+
+```yaml
+songs:
+- song: Red Song
+  palette:
+    primary: "#2040ff"
+    secondary: cyan
+- Another Red Song
+```
+
+- Each key is a slot and each value a colour: `"#2040ff"`, `rgb(32, 64, 255)`, `cmy(0%, 25%, 20%)`
+  (or `cmyk(...)`) or a colour name.
+  A slot not named keeps its colour, whether the show's or the song's own.
+- **Order.** A slot is the show's default, then the song's own `palette:` over it, then the
+  entry's over that. The later wins, slot by slot.
+- A colour that does not read is an error naming the song and the slot: the playlist is not
+  loaded, and a save of it is refused.
+- A slot that none of the song's shows declares is a warning, not an error: it is logged when
+  the playlist loads, and changes nothing, so editing a show does not stop a playlist loading.
+- The colours are decided as the song starts and do not change while it plays; editing the
+  playlist or the song while it plays recolours it from the next start. The `all_songs` playlist
+  has no entry settings, so a song there plays in its own colours.
+- In gRPC, an entry's `settings.palette` is this map. `SavePlaylist` with `set_settings`
+  keeps an entry's palette when its settings carry none (a client that does not know palettes
+  loses none), replaces it when they carry one, and clears it when they carry one with no slots.
+
+## See also
+
+Playlists can also be switched from outside the web UI:
+
+- [gRPC Control](../interfaces/grpc.md) — the `SwitchToPlaylist` RPC and the `mtrack` CLI client
+- [OSC Control](../interfaces/osc.md) — OSC `playlist` and `all_songs` events
+- [Hardware Profiles](../configuration/hardware-profiles.md) — mapping MIDI `playlist` and `all_songs` events in a MIDI controller

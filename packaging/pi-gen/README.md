@@ -13,6 +13,7 @@ Raspberry Pi OS Lite (arm64), plus:
 | `avahi-daemon` | `http://mtrack.local:8080` on a machine with no monitor. |
 | `ola` | The Open Lighting daemon mtrack talks to for DMX output. |
 | hostname `mtrack` | What avahi answers to. |
+| `mtrack-unblock-bluetooth.service` | Raspberry Pi OS blocks every radio until told otherwise; this unblocks Bluetooth, and only Bluetooth, once, the first time an adapter appears, for the Bluetooth controller. |
 
 The image ships **no default username or password**. pi-gen leaves the account
 locked and runs the setup wizard on first boot, so an image that leaks onto the
@@ -38,15 +39,40 @@ has nothing to act on at build time and would fail the build. Its `postinst`
 has already run `update-rc.d`, and systemd's sysv generator synthesises the unit
 at boot.
 
+## Why Bluetooth needs a unit of its own
+
+`raspberrypi-sys-mods` ships `/etc/modprobe.d/rfkill_default.conf` (`options rfkill
+default_state=0`), which blocks every radio at boot so that wifi does not radiate before a
+regulatory country is set. That is why the config here sets no `WPA_COUNTRY` and wifi stays
+blocked until Imager's customisation sets one. Bluetooth is blocked by the same line, though it
+has no country to wait for. pi-gen knows: its `stage2/02-net-tweaks/01-run.sh` seeds
+`/var/lib/systemd/rfkill/platform-<address>:bluetooth` with `0` for five on-board adapter
+addresses (`107d50c000.serial`, `3f215040.serial`, `20215040.serial`, `fe215040.serial` and
+`soc`). An adapter at any other address (the Pi 4's and Pi 3's default is the PL011 UART, not
+the mini UART) or a USB one comes up blocked, and systemd-rfkill then saves `1` for it, so it
+stays blocked on every later boot. `bluetoothctl show` says `PowerState: off-blocked`, and the
+Bluetooth controller fails with a message about the blocked radio.
+
+The stage installs `mtrack-unblock-bluetooth.service`, enabled, which runs `rfkill unblock
+bluetooth` once: the first time a Bluetooth adapter appears, which is what starts
+`bluetooth.target`. systemd-rfkill saves the unblocked state and restores it on later boots. It
+runs once (it leaves a stamp in `/var/lib/misc`) so that an owner who blocks Bluetooth afterwards
+is not overruled at the next boot. It touches Bluetooth only: wifi stays blocked until a country
+is set, exactly as on stock Raspberry Pi OS. An adapter added after that first run, a USB one
+say, comes up blocked and needs `sudo rfkill unblock bluetooth` once. The unit is skipped where
+there is no `/dev/rfkill`, as in a container.
+
 ## Building
 
 CI builds this on every published release (`.github/workflows/pi-image.yaml`),
 on a native arm64 runner so pi-gen's chroot needs no emulation.
 
-It also builds on pull requests that touch `packaging/`, `src/cli.rs` or the
-workflow itself, and attaches the image as a run artifact. Those three paths are
-the ones that can break an image without touching the stage: the stage leans on
-the package's `postinst` behaviour, and `src/cli.rs` holds the unit template.
+It also builds on pull requests that touch `packaging/`, `src/cli.rs`,
+`tests/pi-image/` or the workflow itself, and attaches the image as a run
+artifact. `packaging/` and `src/cli.rs` are the ones that can break an image
+without touching the stage: the stage leans on the package's `postinst`
+behaviour, and `src/cli.rs` holds the unit template. The checks and the workflow
+are there so that a change to either proves itself on a real image.
 
 A pull request has no release to draw a package from, and taking the last
 release's would test the previous version rather than the change in hand, so a
@@ -117,6 +143,42 @@ runs it on every image it builds; by hand:
 ```
 $ make test-pi-image IMAGE=mtrack-0.16.0-raspberrypi-arm64.img.xz
 ```
+
+`tests/pi-image/boot.sh` goes one step further and starts it: the image's root
+filesystem boots under its own systemd in a container, and the check asks what
+only a running system can answer — that `mtrack.service` came up inside its
+sandbox and stayed up, that the web UI answers and can save a fixture type and
+a venue into `/var/lib/mtrack`, that avahi is running, and that olad's SysV
+script became a unit that runs. It works on a copy of the image, so the file
+you hand it is unchanged. CI runs it on every image too. It needs an arm64 host
+(a Pi will do; nothing is emulated), `systemd-container` and root, and takes
+about four minutes, two of which are the image waiting for a network that a
+container does not have:
+
+```
+$ make test-pi-image-boot IMAGE=mtrack-0.16.0-raspberrypi-arm64.img.xz
+```
+
+The container runs on the host's kernel. The image's own kernel, firmware, boot
+partition and device tree, Raspberry Pi Imager's first-boot customisation, wifi,
+Bluetooth, audio and DMX are not exercised by either check: those need a card in a Pi. For
+Bluetooth the checks prove the unblock unit is installed, enabled, does not touch wifi, and
+loads without failing (nothing starts it in a container, which has no adapter); they cannot
+prove that a radio comes up unblocked.
+
+## An image of something unreleased
+
+A release's image is built from that release's package, so before a release
+there is no image of what is about to ship. The workflow can be run by hand to
+build one from source instead:
+
+```
+$ gh workflow run pi-image.yaml -f from_source=true -f ref=main
+```
+
+It builds the package at that ref, builds and checks the image as above, and
+attaches it to the run (`mtrack-src-<commit>-raspberrypi-arm64.img.xz`). It is
+never uploaded to a release: a published image always carries a released binary.
 
 The enable symlink is the reason this exists. The package's `postinst` declines
 to enable the service in a chroot, so the stage does it; if that step is ever

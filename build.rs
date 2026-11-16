@@ -34,6 +34,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
             check_lib("alsa", "libasound2-dev");
             check_lib("libudev", "libudev-dev");
+            // Only the Bluetooth controller links it (the `ble` feature).
+            if env::var_os("CARGO_FEATURE_BLE").is_some() {
+                check_lib("dbus-1", "libdbus-1-dev");
+            }
         }
         check_lib("openssl", "libssl-dev");
     }
@@ -42,7 +46,19 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     tonic_prost_build::configure()
         .file_descriptor_set_path(out_dir.join("player_descriptor.bin"))
+        // A `Watch` event is one message of a stream, made and sent; its
+        // largest case is the playback.
+        .type_attribute(
+            "player.v1.WatchEvent.event",
+            "#[allow(clippy::large_enum_variant)]",
+        )
         .compile_protos(&["src/proto/player/v1/player.proto"], &["src/proto"])?;
+
+    // The Bluetooth envelope: messages only, no service.
+    tonic_prost_build::configure()
+        .build_client(false)
+        .build_server(false)
+        .compile_protos(&["src/proto/ble/v1/ble.proto"], &["src/proto"])?;
 
     // Embed git hash.
     let git_hash = Command::new("git")
@@ -60,6 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Re-run when the proto definition changes.
     println!("cargo:rerun-if-changed=src/proto/player/v1/player.proto");
+    println!("cargo:rerun-if-changed=src/proto/ble/v1/ble.proto");
 
     // Re-run when git HEAD changes.
     println!("cargo:rerun-if-changed=.git/HEAD");

@@ -12,7 +12,39 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-export const SONGS = {
+import type {
+  AudioDeviceInfo,
+  AudioProbe,
+  ChannelCalibration,
+  FitReport,
+  FixtureTypeEntry,
+  GdtfInspection,
+  LightingGroup,
+  MidiDeviceInfo,
+  MvrExportSummary,
+  MvrInspection,
+  NoiseFloor,
+  PlaylistDetail,
+  PlaylistInfo,
+  ProfileFileInfo,
+  Profile,
+  FixtureMetadata,
+  Readiness,
+  RigModel,
+  SceneryModel,
+  SongFile,
+  SongList,
+  Status,
+  StoreSnapshot,
+  Waveform,
+} from "../../src/gen/rules/mtrack_rules";
+import type {
+  StageMetadataMessage,
+  StageStateMessage,
+} from "../support/stage-stream";
+import type { TypedWatchPush } from "../support/watch-stream";
+
+export const SONGS: SongList = {
   songs: [
     {
       name: "Test Song Alpha",
@@ -30,6 +62,9 @@ export const SONGS = {
       beat_grid: null,
       has_tempo_map: false,
       loop_playback: false,
+      loop_crossfade_ms: null,
+      loop_crossfade_cut: [],
+      palette: { slots: [], overrides: {} },
       sections: [],
     },
     {
@@ -61,6 +96,9 @@ export const SONGS = {
       },
       has_tempo_map: false,
       loop_playback: true,
+      loop_crossfade_ms: null,
+      loop_crossfade_cut: [],
+      palette: { slots: [], overrides: {} },
       sections: [
         { name: "verse", start_measure: 1, end_measure: 4 },
         { name: "chorus", start_measure: 5, end_measure: 8 },
@@ -94,6 +132,9 @@ export const SONGS = {
       },
       has_tempo_map: false,
       loop_playback: false,
+      loop_crossfade_ms: null,
+      loop_crossfade_cut: [],
+      palette: { slots: [], overrides: {} },
       sections: [
         {
           name: "stab",
@@ -115,31 +156,55 @@ export const SONGS = {
   ],
 };
 
-export const PLAYLISTS = [
-  { name: "all_songs", song_count: 2, is_active: false },
-  { name: "setlist", song_count: 1, is_active: true },
-  { name: "rehearsal", song_count: 2, is_active: false },
+export const PLAYLISTS: PlaylistInfo[] = [
+  { name: "all_songs", song_count: 2, is_active: false, reserved: true },
+  { name: "setlist", song_count: 1, is_active: true, reserved: false },
+  { name: "rehearsal", song_count: 2, is_active: false, reserved: false },
 ];
 
-export const PLAYLIST_DETAILS: Record<
-  string,
-  { name: string; songs: string[]; available_songs: string[] }
-> = {
-  all_songs: {
-    name: "all_songs",
-    songs: ["Test Song Alpha", "Test Song Beta"],
-    available_songs: [],
-  },
-  setlist: {
-    name: "setlist",
-    songs: ["Test Song Alpha"],
-    available_songs: ["Test Song Beta"],
-  },
-  rehearsal: {
-    name: "rehearsal",
-    songs: ["Test Song Alpha", "Test Song Beta"],
-    available_songs: [],
-  },
+const SONG_TRACKS: Record<string, string[]> = {
+  "Test Song Alpha": ["kick", "snare", "bass"],
+  "Test Song Beta": ["guitar", "vocals"],
+};
+
+/** A playlist as the server answers it, its entries with no settings. */
+function playlistDetail(
+  name: string,
+  songs: string[],
+  available_songs: string[],
+  song_tracks: Record<string, string[]> = {},
+): PlaylistDetail {
+  return {
+    name,
+    songs,
+    auto_play: songs.map(() => null),
+    fades: songs.map(() => ({ fade_out: null, fade_in: null })),
+    ambient: null,
+    entry_ambient: songs.map(() => null),
+    entry_palette: songs.map(() => ({})),
+    available_songs,
+    song_tracks,
+    song_palettes: {},
+  };
+}
+
+export const PLAYLIST_DETAILS: Record<string, PlaylistDetail> = {
+  all_songs: playlistDetail(
+    "all_songs",
+    ["Test Song Alpha", "Test Song Beta"],
+    [],
+  ),
+  setlist: playlistDetail(
+    "setlist",
+    ["Test Song Alpha"],
+    ["Test Song Beta"],
+    SONG_TRACKS,
+  ),
+  rehearsal: playlistDetail(
+    "rehearsal",
+    ["Test Song Alpha", "Test Song Beta"],
+    [],
+  ),
 };
 
 export const CONFIG_YAML = `songs: songs
@@ -150,7 +215,7 @@ profiles:
 samples: {}
 `;
 
-export const CONFIG_STORE = {
+export const CONFIG_STORE: StoreSnapshot = {
   yaml: CONFIG_YAML,
   checksum: "abc123def456",
 };
@@ -160,11 +225,13 @@ export const STATUS = {
     version: "0.1.0-test",
     git_hash: "deadbeef",
     build_time: "2026-01-01T00:00:00Z",
+    ui_build: null,
   },
   hardware: {
     init_done: true,
     hostname: "test-host",
     profile: "test-host",
+    profile_file: "test-host.yaml",
     audio: { status: "connected", name: "Default Audio Device" },
     audio_output: {
       status: "healthy",
@@ -180,15 +247,16 @@ export const STATUS = {
     midi: { status: "not_connected", name: null },
     dmx: { status: "not_connected", name: null },
     trigger: { status: "not_connected", name: null },
+    lighting_venue: { name: null, status: "none", error: null },
+    test_output: null,
   },
   controllers: [
     { kind: "osc", status: "running", detail: "0.0.0.0:9000", error: null },
   ],
-  capabilities: { video_preview: true },
   locked: false,
-};
+} satisfies Status;
 
-export const AUDIO_DEVICES = [
+export const AUDIO_DEVICES: AudioDeviceInfo[] = [
   {
     name: "Default Audio Device",
     max_channels: 8,
@@ -227,15 +295,7 @@ export const AUDIO_DEVICES = [
 
 // One canned probe result per device, so the result panel's branches can be
 // driven without audio hardware. Keyed by the name the editor sends.
-export const AUDIO_PROBE_RESULTS: Record<
-  string,
-  {
-    outcome: string;
-    ok: boolean;
-    reason?: string | null;
-    callbacks?: number | null;
-  }
-> = {
+export const AUDIO_PROBE_RESULTS: Record<string, AudioProbe> = {
   default: { outcome: "streaming", ok: true, reason: null, callbacks: 3 },
   "USB Interface": {
     outcome: "streaming",
@@ -255,17 +315,42 @@ export const AUDIO_PROBE_RESULTS: Record<
     outcome: "in_use",
     ok: true,
     callbacks: 4821,
+    health: null,
   },
 };
 
-export const MIDI_DEVICES = [
+// What a calibration measures and derives, for the trigger wizard.
+export const NOISE_FLOOR = {
+  peak: 0.01,
+  rms: 0.005,
+  low_freq_energy: 0.002,
+  channel: 0,
+  sample_rate: 48000,
+  device_channels: 2,
+} satisfies NoiseFloor;
+
+export const CALIBRATION = {
+  channel: 0,
+  threshold: 0.1,
+  gain: 1.0,
+  scan_time_ms: 50,
+  retrigger_time_ms: 200,
+  num_hits_detected: 5,
+  noise_floor_peak: 0.01,
+  max_hit_amplitude: 0.8,
+} satisfies ChannelCalibration;
+
+export const MIDI_DEVICES: MidiDeviceInfo[] = [
   { name: "MIDI Through Port-0", has_input: true, has_output: true },
   { name: "USB MIDI Controller", has_input: true, has_output: false },
 ];
 
 export const PROFILE_FILES = [
   {
-    filename: "test-host.yaml",
+    file: "test-host.yaml",
+    filename: "test-host",
+    addressable: true,
+    error: null,
     hostname: "test-host",
     has_audio: true,
     has_midi: false,
@@ -273,14 +358,14 @@ export const PROFILE_FILES = [
     has_trigger: false,
     has_controllers: true,
   },
-];
+] satisfies ProfileFileInfo[];
 
 export const PROFILE_FILE_DETAIL = {
   profile: {
     hostname: "test-host",
     audio: { device: "Default Audio Device" },
     controllers: [{ kind: "osc", address: "0.0.0.0:9000" }],
-  },
+  } satisfies Profile,
   yaml: 'hostname: test-host\naudio:\n  device: "Default Audio Device"\ncontrollers:\n  - kind: osc\n    address: "0.0.0.0:9000"\n',
 };
 
@@ -292,46 +377,285 @@ export const PLAYBACK_STATE = {
   song_duration_ms: 180000,
   playlist_name: "setlist",
   playlist_position: 0,
+  playlist_at_first: true,
+  playlist_at_last: false,
+  playlist_off_list: false,
   playlist_songs: ["Test Song Alpha", "Test Song Beta"],
   tracks: [
-    { name: "kick", output_channels: [0, 1], gain_db: 0 },
-    { name: "snare", output_channels: [2, 3], gain_db: -6 },
-    { name: "bass", output_channels: [4, 5], gain_db: -60 },
+    { name: "kick", output_channels: [0, 1], gain_db: 0, muted: false },
+    { name: "snare", output_channels: [2, 3], gain_db: -6, muted: false },
+    { name: "bass", output_channels: [4, 5], gain_db: -60, muted: false },
   ],
   available_playlists: ["all_songs", "setlist"],
   persisted_playlist_name: "setlist",
   locked: false,
+  hardware_reload_started: 0,
+  hardware_reload_refused: [],
+  process_id: "process-a",
   beat_grid: null,
   looping: false,
   available_sections: [],
   active_section: null,
+  reactive_loop_state: { state: "idle" },
+  pending_start_ms: null,
+  pilot_hints: [],
+  tempo: null,
+  auto_play: null,
+  ending: null,
+  ambient: null,
+  next: null,
+} satisfies TypedWatchPush;
+
+/** The groups a cue can target in the mock rig. */
+export const LIGHTING_GROUPS: LightingGroup[] = [
+  { name: "front_wash", fixtures: ["par1", "par2"] },
+  { name: "back_wash", fixtures: ["par3"] },
+];
+
+/** The readiness of a rig where everything lines up, its facts and the
+ *  player's verdicts on them. Specs that need a problem route their own copy
+ *  of this with `page.route`; nothing mutates it. */
+export const READINESS = {
+  dmx: true,
+  venue: {
+    name: "test-venue",
+    fixtures: 8,
+    placed: 8,
+    focus_points: ["center"],
+  },
+  venue_error: null,
+  patch_warnings: [],
+  fixture_types: { in_use: ["par", "mover"], unresolved: [], library: [] },
+  groups: [{ name: "front_wash", fixtures: 4, songs: ["Test Song Alpha"] }],
+  shows: [
+    {
+      song: "Test Song Alpha",
+      files: ["show.light"],
+      warnings: [],
+    },
+  ],
+  output: {
+    universes: [1],
+    unconfigured: [],
+    olad: { reachable: true, unpatched: [] },
+  },
+  checks: [
+    {
+      key: "fixtures",
+      state: "ready",
+      summary: [{ kind: "typesReady", count: 2 }],
+      findings: [],
+    },
+    {
+      key: "venue",
+      state: "ready",
+      summary: [
+        {
+          kind: "venueAllPlaced",
+          venue: "test-venue",
+          fixtures: 8,
+          unplaced: 0,
+        },
+      ],
+      findings: [],
+    },
+    {
+      key: "groups",
+      state: "ready",
+      summary: [{ kind: "groupsReady", count: 1 }],
+      findings: [],
+    },
+    {
+      key: "shows",
+      state: "ready",
+      summary: [{ kind: "showsReady", count: 1 }],
+      findings: [],
+    },
+    {
+      key: "output",
+      state: "ready",
+      summary: [{ kind: "outputReady", count: 1 }],
+      findings: [],
+    },
+  ],
+} satisfies Readiness;
+
+/** The Fit shows page's facts: an imported venue with no tags, three groups
+ *  (one with a suggestion and an alternative, one nothing fits, one that
+ *  already finds a fixture), a focus point the venue lacks and a universe
+ *  with no output. Tests serve their own copy with `page.route`. */
+export const FIT: FitReport = {
+  venue: {
+    name: "fit-venue",
+    fixtures: [
+      {
+        name: "viper1",
+        type: "Viper",
+        tags: [] as string[],
+        position: [-2, 6, 5],
+        capabilities: ["color", "pan_tilt"],
+      },
+      {
+        name: "viper2",
+        type: "Viper",
+        tags: [] as string[],
+        position: [0, 6, 5],
+        capabilities: ["color", "pan_tilt"],
+      },
+      {
+        name: "viper3",
+        type: "Viper",
+        tags: [] as string[],
+        position: [2, 6, 5],
+        capabilities: ["color", "pan_tilt"],
+      },
+      {
+        name: "esprite1",
+        type: "Esprite",
+        tags: ["spot"],
+        position: [0, 1, 1.5],
+        capabilities: ["color", "pan_tilt"],
+      },
+      {
+        name: "par1",
+        type: "Par",
+        tags: ["wash"],
+        position: [-3, 3, 3],
+        capabilities: ["color"],
+      },
+    ],
+    focus_points: ["center"],
+    error: null,
+  },
+  groups: [
+    {
+      name: "back_wash",
+      defined: true,
+      needs: {
+        all_of: ["wash"],
+        any_of: [] as string[],
+        prefer: [] as string[],
+      },
+      tags: ["wash"],
+      fixtures: ["par1"],
+      songs: ["Test Song Alpha"],
+      wants: ["color"],
+      suggestion: null,
+      others: [],
+      unmet: [],
+      unmet_together: false,
+    },
+    {
+      name: "movers",
+      defined: true,
+      needs: {
+        all_of: ["moving_head"],
+        any_of: [] as string[],
+        prefer: [] as string[],
+      },
+      tags: ["moving_head"],
+      fixtures: [] as string[],
+      songs: ["Test Song Alpha"],
+      wants: ["move", "color"],
+      suggestion: {
+        fixtures: ["viper1", "viper2", "viper3"],
+        tags: ["moving_head"],
+        reason: {
+          count: 3,
+          type: "Viper",
+          where: "upstage truss",
+          height: "truss",
+          depth: "upstage",
+          can: ["move", "color"],
+        },
+      },
+      others: [
+        {
+          fixtures: ["esprite1"],
+          type: "Esprite",
+          where: "downstage low rig",
+          height: "low",
+          depth: "downstage",
+        },
+      ],
+      unmet: [],
+      unmet_together: false,
+    },
+    {
+      name: "strobes",
+      defined: true,
+      needs: {
+        all_of: ["strobe"],
+        any_of: [] as string[],
+        prefer: [] as string[],
+      },
+      tags: ["strobe"],
+      fixtures: [] as string[],
+      songs: ["Test Song Alpha"],
+      wants: ["strobe"],
+      suggestion: null,
+      others: [],
+      unmet: ["strobe"],
+      unmet_together: false,
+    },
+  ],
+  focus_points_wanted: [{ name: "drummer", songs: ["Test Song Alpha"] }],
+  output: {
+    unconfigured: [11],
+    unpatched: [1],
+    reachable: true,
+    ola_http_port: 9090,
+  },
 };
+
+/** A fixture as the stage's metadata carries it, unplaced. */
+function metadataFixture(
+  type: string,
+  tags: string[],
+  more: Partial<FixtureMetadata> = {},
+): FixtureMetadata {
+  return {
+    tags,
+    type,
+    position: null,
+    rotation: null,
+    beam_angle: null,
+    rig: null,
+    capabilities: [],
+    cells: [],
+    ...more,
+  };
+}
 
 export const METADATA_STATE = {
   type: "metadata",
   fixtures: {
-    "front-left": { tags: ["front", "left"], type: "par" },
-    "front-right": { tags: ["front", "right"], type: "par" },
+    "front-left": metadataFixture("par", ["front", "left"], {
+      capabilities: ["color"],
+    }),
+    "front-right": metadataFixture("par", ["front", "right"], {
+      capabilities: ["color"],
+    }),
   },
-};
+  venue: null,
+} satisfies StageMetadataMessage;
 
 /** The same venue with a three-cell pixel bar beside the pars. */
 export const PIXEL_METADATA_STATE = {
   type: "metadata",
   fixtures: {
-    "front-left": { tags: ["front", "left"], type: "par" },
-    "front-right": { tags: ["front", "right"], type: "par" },
-    bar: {
-      tags: ["bar"],
-      type: "PixelBar",
+    "front-left": metadataFixture("par", ["front", "left"]),
+    "front-right": metadataFixture("par", ["front", "right"]),
+    bar: metadataFixture("PixelBar", ["bar"], {
       cells: [
         { name: "1", offset: [-0.3, 0, 0] },
         { name: "2", offset: [0, 0, 0] },
         { name: "3", offset: [0.3, 0, 0] },
       ],
-    },
+    }),
   },
-};
+  venue: null,
+} satisfies StageMetadataMessage;
 
 /** A state frame in which a per-cell effect drives the bar: red, green,
  *  blue along its cells over a white bed. */
@@ -343,6 +667,7 @@ export const PIXEL_STATE = {
     bar: { red: 255, green: 255, blue: 255, dimmer: 255, strobe: 0 },
   },
   active_effects: ["rainbow"],
+  poses: {},
   cells: {
     bar: {
       "1": { red: 255, green: 0, blue: 0 },
@@ -350,11 +675,13 @@ export const PIXEL_STATE = {
       "3": { red: 0, green: 0, blue: 255 },
     },
   },
-};
+  strobe_rates: {},
+  under_test: [],
+} satisfies StageStateMessage;
 
 /** A mover's rig as the asset store writes it: base, yoke (pan), head
  *  (tilt), one beam. */
-export const TEST_RIG = {
+export const TEST_RIG: RigModel = {
   version: 1,
   fixture_type: "Test Mover",
   mode: "Mode 1",
@@ -427,7 +754,7 @@ export const TEST_RIG = {
 
 /** A venue's scenery as the store writes it: a 7.5 × 4 × 0.8 m deck
  *  (a unit box scaled by its transform) and a truss whose mesh is .3ds. */
-export const TEST_SCENERY = {
+export const TEST_SCENERY: SceneryModel = {
   version: 1,
   objects: [
     {
@@ -478,7 +805,11 @@ export const FIXTURE_STATE = {
     "front-right": { red: 0, green: 255, blue: 64, dimmer: 180, strobe: 0 },
   },
   active_effects: ["color_wash", "strobe_pulse"],
-};
+  poses: {},
+  cells: {},
+  strobe_rates: {},
+  under_test: [],
+} satisfies StageStateMessage;
 
 export const WAVEFORM_DATA = {
   type: "waveform",
@@ -488,7 +819,7 @@ export const WAVEFORM_DATA = {
     { name: "snare", peaks: [0.1, 0.4, 0.7, 0.2, 0.6] },
     { name: "bass", peaks: [0.6, 0.5, 0.4, 0.7, 0.3] },
   ],
-};
+} satisfies TypedWatchPush;
 
 export const LOG_LINES = {
   type: "logs",
@@ -500,6 +831,277 @@ export const LOG_LINES = {
       level: "INFO",
       target: "mtrack::webui",
       message: "Web UI listening on 0.0.0.0:8080",
+    },
+  ],
+} satisfies TypedWatchPush;
+
+/** An MVR as the inspect endpoint reports it (lighting UI design section 11):
+ *  a three-fixture rig over a deck 6 m wide and 4 m deep, whose front edge is
+ *  at y = 1000 mm and whose top is 500 mm up. One fixture has no usable GDTF. */
+export const MVR_INSPECTION: MvrInspection = {
+  file_name: "Kellys.mvr",
+  report: {
+    venue_name: "Kellys",
+    venue_file: "lighting/venues/kellys.venue",
+    archive: "lighting/library/Kellys.mvr",
+    merge: false,
+    origin: [0, 0, 0],
+    fixture_types: [
+      {
+        name: "Astera PB15",
+        archive: "lighting/library/Astera_PB15.gdtf",
+        // One type per GDTF; every fixture line names its own mode.
+        modes: ["8: RGBS", "9: RGBWS"],
+        existing: false,
+        fixture_file: null,
+      },
+    ],
+    fixtures: [
+      {
+        name: "Brick 1",
+        layer: "Front",
+        fixture_type: "Astera PB15",
+        mode: "8: RGBS",
+        patch: [1, 1],
+        position: [-2, 2.5, 4.2],
+        rotation: null,
+        tags: [],
+        todo: null,
+        change: null,
+        overwrites: [],
+        kept_edits: [],
+      },
+      {
+        name: "Brick 2",
+        layer: "Front",
+        fixture_type: "Astera PB15",
+        mode: "9: RGBWS",
+        patch: [1, 5],
+        position: [2, 2.5, 4.2],
+        rotation: null,
+        tags: [],
+        todo: null,
+        change: null,
+        overwrites: [],
+        kept_edits: [],
+      },
+      {
+        name: "Lost",
+        layer: "Front",
+        fixture_type: null,
+        mode: null,
+        patch: [2, 1],
+        position: null,
+        rotation: null,
+        tags: [],
+        todo: 'GDTF "Missing.gdtf" is not embedded in the MVR',
+        change: null,
+        overwrites: [],
+        kept_edits: [],
+      },
+    ],
+    removed_fixtures: [],
+    kept_fixtures: [],
+    focus_points: [
+      {
+        name: "Drummer",
+        point: [0, 5.3, 1.4],
+        change: null,
+        overwrites: [],
+        kept_edit: false,
+      },
+    ],
+    removed_focus_points: [],
+    kept_focus_points: [],
+    scenery_objects: 2,
+    scenery_meshes_undrawn: 1,
+    warnings: ["1 scenery mesh(es) are in formats the 3D view does not draw"],
+  },
+  scene: {
+    fixtures: [
+      { name: "Brick 1", layer: "Front", position_mm: [-2000, 3500, 4200] },
+      { name: "Brick 2", layer: "Front", position_mm: [2000, 3500, 4200] },
+      { name: "Lost", layer: "Front", position_mm: null },
+    ],
+    focus_points: [{ name: "Drummer", position_mm: [0, 6300, 1400] }],
+    scenery: [
+      {
+        name: "Main Stage",
+        kind: "SceneObject",
+        deck: true,
+        bounds_mm: { min: [-3000, 1000, 0], max: [3000, 5000, 500] },
+      },
+      { name: "Screen", kind: "VideoScreen", deck: false, bounds_mm: null },
+    ],
+    deck_mm: { min: [-3000, 1000, 0], max: [3000, 5000, 500] },
+  },
+};
+
+/** The export summary of a venue with two fixed fixtures, one unlinked. */
+export const MVR_EXPORT_SUMMARY: MvrExportSummary = {
+  venue: "kellys",
+  file_name: "kellys.mvr",
+  output: "kellys.mvr",
+  fixtures: 2,
+  positioned_fixtures: 2,
+  focus_points: 1,
+  embedded_gdtfs: ["Astera_PB15.gdtf"],
+  generated_gdtfs: {},
+  fixed_fixtures: [
+    { name: "Brick 1", focus: "Drummer" },
+    { name: "Brick 2", focus: null },
+  ],
+  warnings: [],
+};
+
+/** A song's config file as the mock serves it, made from the song list's
+ *  fixture. */
+export function songConfigYaml(song: (typeof SONGS.songs)[number]): string {
+  let yaml = `name: ${song.name}\ntracks:\n  - kick\n  - snare\n  - bass\n`;
+  if (song.has_midi) {
+    yaml += `midi_playback:\n  file: song.mid\n  exclude_midi_channels:\n    - 10\n`;
+  }
+  if (song.loop_playback) {
+    yaml += `loop_playback: true\n`;
+  }
+  if (song.sections && song.sections.length > 0) {
+    yaml += `sections:\n`;
+    for (const s of song.sections) {
+      yaml += `  - name: ${s.name}\n    start_measure: ${s.start_measure}\n    end_measure: ${s.end_measure}\n`;
+      // Beat offsets are what make a boundary sub-measure accurate. Omitting
+      // them here made the section editor's clamping paths unreachable from a
+      // test, since a boundary can only invert when the beats are in play.
+      if (s.start_beat !== undefined) {
+        yaml += `    start_beat: ${s.start_beat}\n`;
+      }
+      if (s.end_beat !== undefined) {
+        yaml += `    end_beat: ${s.end_beat}\n`;
+      }
+    }
+  }
+  if (song.lighting_files && song.lighting_files.length > 0) {
+    yaml += `lighting:\n`;
+    for (const f of song.lighting_files) {
+      yaml += `  - file: ${f}\n`;
+    }
+  }
+  return yaml;
+}
+
+/** A song's waveform as the mock serves it. */
+export function songWaveform(name: string): Waveform {
+  return {
+    song_name: name,
+    tracks: [
+      { name: "kick", peaks: [0.5, 0.8, 0.3, 0.9, 0.2] },
+      { name: "snare", peaks: [0.1, 0.4, 0.7, 0.2, 0.6] },
+    ],
+  };
+}
+
+/** The files in any song's folder, as the mock serves them. */
+export const SONG_FILES: SongFile[] = [
+  { name: "kick.wav", type: "audio" },
+  { name: "snare.wav", type: "audio" },
+  { name: "bass.wav", type: "audio" },
+];
+
+// The three forms a fixture type comes in: a v1 `.light` channel map, a
+// hand-written rich `.fixture`, and one distilled from a GDTF archive —
+// which has no channels of its own until the lighting system expands it.
+export const FIXTURE_TYPES: Record<string, FixtureTypeEntry> = {
+  par: {
+    fixture_type: {
+      name: "par",
+      channels: { red: 1, green: 2, blue: 3, dimmer: 4 },
+      max_strobe_frequency: null,
+      min_strobe_frequency: null,
+      strobe_dmx_offset: null,
+    },
+    file: "par.light",
+    owner: { file: "par.light", editable: true, reason: null },
+    form_editable: true,
+    extension: "light",
+    referential: false,
+    rich: false,
+    dsl: 'fixture_type "par" { red: 1, green: 2, blue: 3, dimmer: 4 }',
+  },
+  mover: {
+    fixture_type: {
+      name: "mover",
+      channels: { pan: 1, tilt: 3, dimmer: 5 },
+      max_strobe_frequency: null,
+      min_strobe_frequency: null,
+      strobe_dmx_offset: null,
+    },
+    file: "mover.fixture",
+    owner: { file: "mover.fixture", editable: true, reason: null },
+    form_editable: false,
+    extension: "fixture",
+    referential: false,
+    rich: true,
+    dsl: 'fixture_type "mover" {\n  channel "pan" @ 1 fine 2 range -270deg..270deg\n}\n',
+  },
+  pixelbrick: {
+    fixture_type: {
+      name: "pixelbrick",
+      channels: {},
+      max_strobe_frequency: null,
+      min_strobe_frequency: null,
+      strobe_dmx_offset: null,
+    },
+    file: "pixelbrick.fixture",
+    owner: { file: "pixelbrick.fixture", editable: true, reason: null },
+    form_editable: false,
+    extension: "fixture",
+    referential: true,
+    rich: false,
+    dsl: 'fixture_type "pixelbrick" from gdtf("library/pb15.gdtf") {\n}\n',
+    gdtf: {
+      fixture: "PB15 PixelBrick",
+      manufacturer: "Astera LED Technology",
+      modes: 2,
+      beam: { type: "Wash", angle: 13 },
+      thumbnail: null,
+      used_by: 3,
+      in_use: [
+        { mode: "8: RGBS", count: 2 },
+        { mode: "1: RGB", count: 1 },
+      ],
+    },
+  },
+};
+
+// (The fixture types' calls are LightingService's: below, with the others.)
+
+// The PB15's modes, as the inspect endpoint and the details view answer them.
+export const GDTF_INSPECTION: GdtfInspection = {
+  modes: [
+    {
+      name: "1: RGB",
+      footprint: 3,
+      capabilities: ["color", "strobe"],
+      wants: ["color", "dimmer", "strobe"],
+      cells: 0,
+      channels: [
+        [1, "red"],
+        [2, "green"],
+        [3, "blue"],
+      ],
+    },
+    {
+      name: "8: RGBS",
+      footprint: 4,
+      capabilities: ["color", "strobe"],
+      wants: ["color", "dimmer", "strobe"],
+      cells: 0,
+      strobe_range: { min_hz: 0.4, max_hz: 25 },
+      channels: [
+        [1, "red"],
+        [2, "green"],
+        [3, "blue"],
+        [4, "strobe"],
+      ],
     },
   ],
 };

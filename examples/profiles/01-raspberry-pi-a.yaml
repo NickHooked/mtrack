@@ -18,9 +18,6 @@ audio:
 midi:
   device: "Behringer WING"
   playback_delay: 500ms
-  midi_to_dmx:
-    - midi_channel: 15
-      universe: light-show
 dmx:
   dim_speed_modifier: 0.25
   universes:
@@ -31,10 +28,6 @@ dmx:
   lighting:
     # Current venue selection - determines which physical fixtures to use
     current_venue: "main_stage"
-
-    # Simple inline fixture definitions (for basic cases)
-    fixtures:
-      emergency_light: "Emergency @ 1:500"
 
     # Logical groups with role-based constraints
     groups:

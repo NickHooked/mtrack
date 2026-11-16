@@ -16,14 +16,14 @@ use std::{any::Any, error::Error, fmt, sync::Arc};
 use midly::live::LiveEvent;
 use tokio::sync::mpsc::Sender;
 
-use crate::{config, dmx::engine::Engine, playsync::PlaybackSync, songs::Song};
+use crate::{config, playsync::PlaybackSync, songs::Song};
 
-pub(crate) mod beat_clock;
 pub(crate) mod midir;
 pub(crate) mod mock;
 pub mod morningstar;
-pub(crate) mod playback;
-mod transform;
+#[cfg(test)]
+pub(crate) use mtrack_core::midi::beat_clock;
+pub(crate) use mtrack_core::midi::playback;
 
 /// Typed errors for the MIDI subsystem.
 #[derive(Debug, thiserror::Error)]
@@ -49,12 +49,26 @@ impl From<Box<dyn Error + Send + Sync>> for MidiError {
 
 /// A MIDI device that can play MIDI files and listen for inputs.
 pub trait Device: Any + fmt::Display + std::marker::Send + std::marker::Sync {
-    /// Watches MIDI input for events and sends them to the given sender. If a DMX engine
-    /// is loaded, the events may be passed through to the engine.
+    /// Watches MIDI input for events and sends them to the given sender.
     fn watch_events(&self, sender: Sender<Vec<u8>>) -> Result<(), Box<dyn Error>>;
 
     /// Stops watching events.
     fn stop_watch_events(&self);
+
+    /// Opens the device afresh in place, keeping a watch going on the fresh
+    /// one. A hardware reload of an unchanged MIDI config does this rather
+    /// than open a new device, which would restart every MIDI controller.
+    /// A device unplugged and plugged back in is heard again only once
+    /// opened afresh, and may come back under the same port. Fails if the
+    /// device cannot be opened, as when it is gone, for a new one to be
+    /// opened instead.
+    fn reopen(&self) -> Result<(), Box<dyn Error>>;
+
+    /// The tempo its beat clock holds between songs, if it holds one: what a
+    /// device opened in its place carries on with.
+    fn held_tempo(&self) -> Option<std::time::Duration> {
+        None
+    }
 
     /// Plays the given song through the MIDI interface, starting from a specific time.
     /// The `ready_tx` sender signals that setup is complete. The implementation should
@@ -84,9 +98,15 @@ pub fn list_devices() -> Result<Vec<Box<dyn Device>>, Box<dyn Error>> {
 }
 
 /// Gets a device with the given name.
-pub fn get_device(
+pub fn get_device(config: Option<config::Midi>) -> Result<Option<Arc<dyn Device>>, Box<dyn Error>> {
+    get_device_holding(config, None)
+}
+
+/// [`get_device`], its beat clock holding `held` until a song sets another
+/// tempo.
+pub fn get_device_holding(
     config: Option<config::Midi>,
-    dmx_engine: Option<Arc<Engine>>,
+    held: Option<std::time::Duration>,
 ) -> Result<Option<Arc<dyn Device>>, Box<dyn Error>> {
     let config = match config {
         Some(config) => config,
@@ -98,7 +118,9 @@ pub fn get_device(
         return Ok(Some(Arc::new(mock::Device::get(device))));
     };
 
-    Ok(Some(Arc::new(midir::get(&config, dmx_engine)?)))
+    Ok(Some(Arc::new(midir::Reopenable::open_holding(
+        config, held,
+    )?)))
 }
 
 #[cfg(test)]
@@ -114,14 +136,14 @@ mod test {
 
     #[test]
     fn get_device_none_config_returns_none() {
-        let result = get_device(None, None).unwrap();
+        let result = get_device(None).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn get_device_mock_returns_some() {
         let config = config::Midi::new("mock-midi", None);
-        let result = get_device(Some(config), None).unwrap();
+        let result = get_device(Some(config)).unwrap();
         assert!(result.is_some());
         assert!(format!("{}", result.unwrap()).contains("mock-midi"));
     }

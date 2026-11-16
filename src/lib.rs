@@ -19,26 +19,29 @@ pub mod cli;
 pub(crate) mod clock;
 pub mod config;
 pub mod controller;
+pub mod device_info;
 pub mod dmx;
+#[cfg(test)]
+mod docs_tests;
+#[cfg(feature = "hub")]
+pub mod hub;
 pub mod lighting;
+pub mod logging;
 pub mod midi;
 pub mod notification;
 pub mod player;
-pub mod playlist;
 pub mod playsync;
 pub mod proto;
 pub mod samples;
 pub mod section_loop;
-pub mod song_cache;
 pub mod songs;
 pub mod state;
-pub mod tempo;
 #[cfg(test)]
 pub mod testutil;
 pub(crate) mod thread_priority;
 pub mod trigger;
 pub mod tui;
-pub mod util;
 pub mod verify;
 pub mod video;
+pub use mtrack_core::{playlist, position, song_cache, tempo, util};
 pub mod webui;

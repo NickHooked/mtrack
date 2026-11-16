@@ -12,87 +12,43 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+import type { Status } from "../../gen/rules/mtrack_rules";
 import { derived, writable } from "svelte/store";
-import { wsConnected } from "./stores";
-
-export interface SubsystemStatus {
-  status:
-    | "connected"
-    | "initializing"
-    | "failed"
-    | "not_connected"
-    | "not_configured";
-  name: string | null;
-  /** Why init gave up. Present only for `failed`. */
-  error?: string | null;
-}
-
-export interface ControllerStatus {
-  kind: string;
-  status: string;
-  detail: string | null;
-  error: string | null;
-}
-
-export interface StatusData {
-  build: {
-    version: string;
-    git_hash: string;
-    build_time: string;
-  };
-  hardware: {
-    init_done: boolean;
-    hostname: string | null;
-    profile: string | null;
-    audio: SubsystemStatus;
-    midi: SubsystemStatus;
-    dmx: SubsystemStatus;
-    trigger: SubsystemStatus;
-  };
-  controllers: ControllerStatus[];
-  capabilities: {
-    video_preview: boolean;
-  };
-  locked?: boolean;
-}
+import { uiOutdated, type ServerBuild } from "../buildCheck";
 
 /** Worst-case across all required subsystems. */
 export type Health = "ok" | "warn" | "error" | "unknown";
 
-export const statusStore = writable<StatusData | null>(null);
+/** The player's build, hardware and controllers, as its `hardware` events
+ *  last said them (lib/grpc/watch.ts); null before the first. */
+export const statusStore = writable<Status | null>(null);
 
-let pollHandle: ReturnType<typeof setInterval> | null = null;
-
-async function fetchStatus() {
-  try {
-    const res = await fetch("/api/status");
-    if (!res.ok) return;
-    const data = (await res.json()) as StatusData;
-    statusStore.set(data);
-  } catch {
-    // Fetch failures are tolerated; the WS connect indicator already
-    // surfaces total disconnects via the disconnect banner.
-  }
-}
-
-function startPolling() {
-  if (pollHandle !== null) return;
-  void fetchStatus();
-  pollHandle = setInterval(fetchStatus, 5000);
-}
-
-function stopPolling() {
-  if (pollHandle === null) return;
-  clearInterval(pollHandle);
-  pollHandle = null;
-}
-
-// Poll while the WebSocket is up. When it drops we keep the last known
-// snapshot but stop hammering /api/status.
-wsConnected.subscribe((connected) => {
-  if (connected) startPolling();
-  else stopPolling();
+/** The server's build as first seen by this page. */
+let firstSeen: ServerBuild | null = null;
+statusStore.subscribe((s) => {
+  if (s && !firstSeen) firstSeen = { ...s.build };
 });
+
+/** The UI this bundle was built as; empty for a build that stamped none. */
+const UI_BUILD: string = import.meta.env?.VITE_MTRACK_UI_BUILD ?? "";
+
+/** This tab runs an older UI than the server now serves: reload for the
+ *  new one. Never reloads by itself — someone may be mid-edit. */
+export const uiUpdated = derived(statusStore, ($status) =>
+  uiOutdated(UI_BUILD, firstSeen, $status?.build ?? null),
+);
+
+/** The current venue, when it did not load. */
+export const venueFailure = derived(statusStore, ($status) => {
+  const venue = $status?.hardware.lighting_venue;
+  return venue?.status === "failed" ? venue : null;
+});
+
+/** The fixture test that is sending to the lights, when one is. */
+export const testOutput = derived(
+  statusStore,
+  ($status) => $status?.hardware.test_output ?? null,
+);
 
 /**
  * Derives the worst-case health across required subsystems.
@@ -126,6 +82,9 @@ export const healthStore = derived(statusStore, ($status): Health => {
   for (const sub of [subs.audio, subs.midi, subs.dmx] as const) {
     if (sub.status === "initializing") return "warn";
   }
+  // A venue that did not load lights nothing.
+  if (subs.lighting_venue?.status === "failed") return "error";
+
   if ($status.controllers.some((c) => c.status !== "running")) return "warn";
 
   return "ok";

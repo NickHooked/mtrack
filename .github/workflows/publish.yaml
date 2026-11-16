@@ -17,7 +17,7 @@ permissions:
   contents: write
 
 jobs:
-  # Publishes mtrack to crates.io.
+  # Publishes mtrack-core and then mtrack to crates.io.
   publish:
     name: Publish to crates.io
     if: github.event_name == 'push'
@@ -26,18 +26,20 @@ jobs:
     - uses: actions/checkout@v7
     # A tag whose version was never bumped in Cargo.toml used to fail only at
     # `cargo publish` ("version already uploaded") — after the GitHub release
-    # already existed. Fail the whole pipeline up front instead.
-    - name: Verify tag matches crate version
-      run: |
-        CRATE_VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-        if [ "v${CRATE_VERSION}" != "${GITHUB_REF_NAME}" ]; then
-          echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${CRATE_VERSION}." >&2
-          echo "Bump the version (and Cargo.lock) before tagging." >&2
-          exit 1
-        fi
+    # already existed. Fail the whole pipeline up front instead. mtrack-core
+    # is released with the player, at the same version.
+    - name: Verify tag matches crate versions
+      run: scripts/check-versions.sh "${GITHUB_REF_NAME}"
     - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler
+      run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler
     - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
+    - uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+    - name: Install wasm-opt
+      run: ./scripts/install-binaryen.sh
     - uses: actions/setup-node@v7
       with:
         node-version: '22'
@@ -49,10 +51,25 @@ jobs:
         restore-keys: node-modules-${{ runner.os }}-
     - name: Build frontend
       run: make build-ui
-    - name: Run publish
+    # The player depends on mtrack-core, and crates.io takes no crate whose
+    # dependency it does not have: mtrack-core goes first. Passed over when
+    # this version of it is there already, so the job can be run again after
+    # the player's own publish failed.
+    - name: Publish mtrack-core
       env:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      run: cargo publish --locked --allow-dirty
+      run: |
+        version="${GITHUB_REF_NAME#v}"
+        if curl -sf -A "mtrack-release (github.com/mdwn/mtrack)" \
+            "https://crates.io/api/v1/crates/mtrack-core/${version}" > /dev/null; then
+          echo "mtrack-core ${version} is on crates.io already."
+        else
+          cargo publish -p mtrack-core --locked --allow-dirty
+        fi
+    - name: Publish mtrack
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      run: cargo publish -p mtrack --locked --allow-dirty
 
   # Creates a release on Github. Gated on the crates.io publish so a bad tag
   # (wrong version, packaging failure) doesn't leave a half-made release to
@@ -65,14 +82,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+      # The notes go by file, never through the environment or a command
+      # line: 0.18.0's were 170000 characters, more than one argument or
+      # environment string may be (128 KiB), and the step failed to start
+      # with "Argument list too long". They are also more than a release
+      # body may be (125000 characters), so they are cut to fit.
       - name: Extract release notes
-        id: extract-release-notes
         uses: ffurrer2/extract-release-notes@v3
+        with:
+          release_notes_file: RELEASE_NOTES.md
+      - name: Fit the notes to a release body
+        run: ./scripts/fit-release-notes.sh RELEASE_NOTES.md "https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md"
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_NOTES: ${{ steps.extract-release-notes.outputs.release_notes }}
-        run: gh release create --notes "$RELEASE_NOTES" --title "${{ github.ref_name }}" "${{ github.ref_name }}"
+        run: gh release create --notes-file RELEASE_NOTES.md --title "${{ github.ref_name }}" "${{ github.ref_name }}"
 
   # Builds release binaries for each supported platform and uploads them to the
   # GitHub release. Linux binaries are built on the oldest supported Ubuntu LTS
@@ -95,11 +119,15 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
             platform: linux
+          # macos-14 runners are gone ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"): the jobs were
+          # cancelled as they started, and the packages, which wait on every
+          # binary, were skipped with them.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             platform: macos
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             platform: macos
     runs-on: ${{ matrix.os }}
     steps:
@@ -112,7 +140,7 @@ jobs:
         # use ("--experimental_allow_proto3_optional was not set") — the
         # failure that broke the v0.16.0 Linux binaries.
         if: matrix.platform == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev
       - name: Install protoc
         if: matrix.platform == 'linux'
         run: ./scripts/install-protoc.sh
@@ -121,7 +149,12 @@ jobs:
         run: brew install pkg-config protobuf
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }},wasm32-unknown-unknown
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+      - name: Install wasm-opt
+        run: ./scripts/install-binaryen.sh
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "release-${{ matrix.target }}"
@@ -241,18 +274,23 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
       - name: Install system and GStreamer dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
       - name: Install protoc
         run: ./scripts/install-protoc.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }},wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "release-video-${{ matrix.target }}"
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.1,wasm-bindgen@0.2.122
+      - name: Install wasm-opt
+        run: ./scripts/install-binaryen.sh
       - name: Build frontend
         run: make build-ui
       - name: Build video binary

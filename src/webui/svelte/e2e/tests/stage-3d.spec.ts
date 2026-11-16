@@ -13,18 +13,9 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { sendStage } from "../support/stage";
 
 let testCounter = 0;
-
-async function sendWsMessage(
-  page: import("@playwright/test").Page,
-  wsId: string,
-  msg: object,
-) {
-  await page.request.post("http://127.0.0.1:3111/test/send-ws", {
-    data: { ...msg, _wsId: wsId },
-  });
-}
 
 /** A venue with one placed mover carrying a rig, one placed PAR without
  *  one, one unplaced fixture, and a focus point. */
@@ -49,25 +40,89 @@ const VENUE_METADATA = {
   },
   venue: {
     name: "test-venue",
-    dir: null,
     focus_points: { drummer: [0, 2.8, 1.4] },
     scenery: "scenery/test/scene-v1.json",
   },
 };
 
-test.describe("Stage 3D", () => {
+// The 3D view on the venue card (Venues page, `?view=3d`).
+test.describe("3D on the venue card", () => {
   let wsId: string;
 
   test.beforeEach(() => {
     wsId = `s3d-${test.info().parallelIndex}-${++testCounter}-${Date.now()}`;
   });
 
-  test("the dashboard's stage card opens the 3D page", async ({ page }) => {
+  test("the dashboard's card switches to 3D in place", async ({ page }) => {
     await page.goto(`/?wsId=${wsId}#/`);
     await expect(page.locator(".stage-card")).toBeVisible();
-    await page.locator(".stage-card__3d").click();
-    await expect(page).toHaveURL(/#\/stage$/);
-    await expect(page.locator(".stage3d .page__title")).toHaveText("Stage 3D");
+    // No current venue yet: nothing to show in 3D.
+    await expect(page.getByTestId("stage-view-3d")).toHaveCount(0);
+    await sendStage(page, wsId, VENUE_METADATA);
+    await page.getByTestId("stage-view-3d").click();
+    await expect(page).toHaveURL(/#\/$/);
+    await expect(page.getByTestId("stage-view-3d")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await expect(page.locator(".stage3d__viewport")).toHaveAttribute(
+      "data-source",
+      "live",
+    );
+    // A live view: no show preview, and nothing to select.
+    await expect(page.getByTestId("stage3d-mode-preview")).toHaveCount(0);
+    await expect(page.getByTestId("stage3d-hint")).toHaveText("Drag to orbit");
+
+    await page.getByTestId("stage-view-plot").click();
+    await expect(page).toHaveURL(/#\/$/);
+    await expect(page.locator(".stage3d__viewport")).toHaveCount(0);
+    await expect(page.locator(".stage-card__viewport > canvas")).toBeVisible();
+  });
+
+  test("lit, placed fixtures light the deck, whichever way they point", async ({
+    page,
+  }) => {
+    await page.goto(`/?wsId=${wsId}#/lighting/venues/test-venue?view=3d`);
+    // A PAR hung pointing down, one on the floor aimed up at the band with
+    // a diffuser's beam angle, and one waiting in the tray.
+    await sendStage(page, wsId, {
+      type: "metadata",
+      fixtures: {
+        top: { tags: [], type: "par", position: [0, 3, 4], rig: null },
+        floor: {
+          tags: [],
+          type: "par",
+          position: [0, 0.5, 0.1],
+          rotation: [120, 0, 0],
+          rig: null,
+          beam_angle: 90,
+        },
+        spare: { tags: [], type: "par", position: null, rig: null },
+      },
+      venue: { name: "test-venue", focus_points: {} },
+    });
+    const viewport = page.locator(".stage3d__viewport");
+    await expect(viewport).toHaveAttribute("data-renderer", /webgl|none/, {
+      timeout: 15000,
+    });
+    test.skip(
+      (await viewport.getAttribute("data-renderer")) !== "webgl",
+      "no WebGL in this browser",
+    );
+    // Nothing reported yet: every fixture is dark, and so is the deck.
+    await expect(viewport).toHaveAttribute("data-deck-lights", "0");
+    const on = { red: 255, green: 0, blue: 160, dimmer: 255, strobe: 0 };
+    await sendStage(page, wsId, {
+      type: "state",
+      fixtures: { top: on, floor: on, spare: on },
+    });
+    // The two on the stage; not the one in the tray.
+    await expect(viewport).toHaveAttribute("data-deck-lights", "2");
+    await sendStage(page, wsId, {
+      type: "state",
+      fixtures: { top: on, floor: { ...on, dimmer: 0 }, spare: on },
+    });
+    await expect(viewport).toHaveAttribute("data-deck-lights", "1");
   });
 
   test("the page draws the venue from rigs and reports what it drew", async ({
@@ -75,7 +130,7 @@ test.describe("Stage 3D", () => {
   }) => {
     const rigRequests: string[] = [];
     page.on("request", (r) => {
-      if (r.url().includes("/api/lighting/assets/")) rigRequests.push(r.url());
+      if (r.url().includes("/lighting-assets/")) rigRequests.push(r.url());
     });
     // Asset failures surface only in the console; keep them in the report.
     page.on("console", (m) => {
@@ -84,11 +139,12 @@ test.describe("Stage 3D", () => {
       }
     });
     page.on("response", (r) => {
-      if (r.url().includes("/api/lighting/assets/") && r.status() !== 200) {
+      if (r.url().includes("/lighting-assets/") && r.status() !== 200) {
         console.log(`[asset ${r.status()}] ${r.url()}`);
       }
     });
-    await page.goto(`/?wsId=${wsId}#/stage`);
+    await page.goto(`/?wsId=${wsId}#/lighting/venues/test-venue?view=3d`);
+    await sendStage(page, wsId, VENUE_METADATA);
     await expect(page.locator(".stage3d__viewport")).toBeVisible();
     // The renderer decides: WebGL, or the fallback message — never a blank.
     await expect(page.locator(".stage3d__viewport")).toHaveAttribute(
@@ -96,16 +152,16 @@ test.describe("Stage 3D", () => {
       /webgl|none/,
       { timeout: 15000 },
     );
-    await sendWsMessage(page, wsId, VENUE_METADATA);
 
     const renderer = await page
       .locator(".stage3d__viewport")
       .getAttribute("data-renderer");
-    await expect(page.locator(".stage3d__subtitle")).toContainText(
-      "test-venue",
+    await expect(page.getByTestId("stage-venue-label")).toContainText(
+      "Current venue: test-venue",
     );
-    await expect(page.locator(".stage3d__subtitle")).toContainText(
-      "3 fixtures",
+    await expect(page.locator(".stage3d__viewport")).toHaveAttribute(
+      "data-fixtures",
+      "3",
     );
     if (renderer === "webgl") {
       // The mover's rig was fetched from the store; the PARs draw generically.
@@ -113,14 +169,15 @@ test.describe("Stage 3D", () => {
         .poll(() => rigRequests.length, { timeout: 10000 })
         .toBeGreaterThan(0);
       expect(rigRequests[0]).toContain("test-archive/rig-test-v1.json");
-      await expect(page.locator(".stage3d__subtitle")).toContainText(
-        "2 of 3 placed",
+      await expect(page.locator(".stage3d__viewport")).toHaveAttribute(
+        "data-placed",
+        "2",
       );
-      await expect(page.locator(".stage3d__subtitle")).toContainText(
+      await expect(page.getByTestId("stage3d-stats")).toContainText(
         "2 drawn generically",
       );
       // The scenery: the deck's glb drawn, the truss's .3ds reported.
-      await expect(page.locator(".stage3d__subtitle")).toContainText(
+      await expect(page.getByTestId("stage3d-stats")).toContainText(
         "1 scenery mesh (1 not drawn: .3ds)",
         { timeout: 10000 },
       );
@@ -146,11 +203,53 @@ test.describe("Stage 3D", () => {
     } else {
       await expect(page.locator(".stage3d__fallback")).toContainText("WebGL");
     }
+  });
+});
 
-    // Camera presets are buttons that take the active state.
-    await page.getByRole("button", { name: "Top" }).click();
-    await expect(page.getByRole("button", { name: "Top" })).toHaveClass(
-      /stage3d__preset--active/,
+// A rebuild empties the scene while its models load again, which shows as a
+// blank. The player says its metadata again whenever anything reloads, and
+// the gRPC stage stream sends a layout again for a venue reload that changed
+// nothing: neither is a reason to build what is already built.
+test.describe("3D keeps its scene", () => {
+  test("metadata that says what the scene was built from does not rebuild it", async ({
+    page,
+  }) => {
+    const wsId = `s3d-keep-${test.info().parallelIndex}-${Date.now()}`;
+    await page.goto(`/?wsId=${wsId}#/`);
+    await expect(page.locator(".stage-card")).toBeVisible();
+    await sendStage(page, wsId, VENUE_METADATA);
+    await page.getByTestId("stage-view-3d").click();
+    const viewport = page.locator(".stage3d__viewport");
+    await expect(viewport).toHaveAttribute("data-renderer", /webgl|none/, {
+      timeout: 15000,
+    });
+    test.skip(
+      (await viewport.getAttribute("data-renderer")) !== "webgl",
+      "no WebGL in this browser",
     );
+    await expect(viewport).toHaveAttribute("data-fixtures", "3");
+    await expect(viewport).toHaveAttribute("data-builds", "1");
+
+    // The same metadata again (new objects off the wire, the same stage),
+    // then one fixture more. Messages arrive in order, so once the fourth
+    // fixture shows, the repeat has been through: one build more, not two.
+    await sendStage(page, wsId, VENUE_METADATA);
+    await sendStage(page, wsId, {
+      ...VENUE_METADATA,
+      fixtures: {
+        ...VENUE_METADATA.fixtures,
+        another: { tags: [], type: "par", position: [2, 0.5, 3], rig: null },
+      },
+    });
+    await expect(viewport).toHaveAttribute("data-fixtures", "4");
+    await expect(viewport).toHaveAttribute("data-builds", "2");
+
+    // A change to the venue alone (a focus point moved) is a rebuild.
+    await sendStage(page, wsId, {
+      ...VENUE_METADATA,
+      venue: { ...VENUE_METADATA.venue, focus_points: { drummer: [1, 2, 1] } },
+    });
+    await expect(viewport).toHaveAttribute("data-fixtures", "3");
+    await expect(viewport).toHaveAttribute("data-builds", "3");
   });
 });

@@ -12,10 +12,9 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 
-use super::parser::LightShow;
 use crate::config::Lighting;
 
 /// Validation result containing information about the validation.
@@ -35,7 +34,7 @@ impl ValidationResult {
 }
 
 /// Collects all fixture group names used in the given shows.
-pub fn collect_groups(shows: &HashMap<String, LightShow>) -> HashSet<String> {
+pub fn collect_groups(shows: &crate::lighting::parser::LightShows) -> HashSet<String> {
     let mut groups = HashSet::new();
 
     for show in shows.values() {
@@ -55,16 +54,13 @@ pub fn collect_groups(shows: &HashMap<String, LightShow>) -> HashSet<String> {
 /// Returns a ValidationResult with information about the validation.
 /// If config is None, only collects groups without validation.
 pub fn validate_groups(
-    shows: &HashMap<String, LightShow>,
+    shows: &crate::lighting::parser::LightShows,
     config: Option<&Lighting>,
 ) -> ValidationResult {
     let groups = collect_groups(shows);
 
     let invalid_groups = if let Some(lighting_config) = config {
-        let valid_groups = lighting_config.groups();
-        let valid_fixtures = lighting_config.fixtures();
-        let mut all_valid_names: HashSet<String> = valid_groups.keys().cloned().collect();
-        all_valid_names.extend(valid_fixtures.keys().cloned());
+        let all_valid_names: HashSet<String> = lighting_config.groups().keys().cloned().collect();
 
         groups
             .iter()
@@ -84,7 +80,7 @@ pub fn validate_groups(
 /// Validates light shows and returns an error if validation fails.
 /// This is the main validation function that should be used when loading shows.
 pub fn validate_light_shows(
-    shows: &HashMap<String, LightShow>,
+    shows: &crate::lighting::parser::LightShows,
     config: Option<&Lighting>,
 ) -> Result<(), Box<dyn Error>> {
     let result = validate_groups(shows, config);
@@ -110,7 +106,7 @@ mod tests {
     use crate::lighting::parser::parse_light_shows;
     use std::collections::HashMap;
 
-    fn create_test_shows() -> HashMap<String, crate::lighting::parser::LightShow> {
+    fn create_test_shows() -> crate::lighting::parser::LightShows {
         let content = r#"show "Test Show 1" {
     @00:00.000
     front_wash: static color: "blue", duration: 5s, dimmer: 60%
@@ -166,15 +162,8 @@ show "Test Show 2" {
             ),
         );
 
-        let mut fixtures = HashMap::new();
-        fixtures.insert(
-            "emergency_light".to_string(),
-            "Emergency @ 1:500".to_string(),
-        );
-
         Lighting::new(
             Some("main_stage".to_string()),
-            Some(fixtures),
             Some(groups),
             None, // Don't need directories for validation tests
         )
@@ -263,7 +252,9 @@ show "Test Show 2" {
     }
 
     #[test]
-    fn test_validate_groups_with_fixtures() {
+    fn test_validate_groups_names_only_groups() {
+        // A show targets logical groups; a name that is not one (once an
+        // inline fixture's, a retired form) is not valid.
         let content = r#"show "Fixture Show" {
     @00:00.000
     emergency_light: static color: "red", duration: 5s
@@ -272,10 +263,9 @@ show "Test Show 2" {
         let config = create_test_config();
         let result = validate_groups(&shows, Some(&config));
 
-        // emergency_light is defined as a fixture in config, so it should be valid
         assert_eq!(result.groups.len(), 1);
-        assert_eq!(result.invalid_groups.len(), 0);
-        assert!(result.is_valid());
+        assert_eq!(result.invalid_groups, vec!["emergency_light".to_string()]);
+        assert!(!result.is_valid());
     }
 
     #[test]
@@ -407,7 +397,7 @@ show "Show 2" {
             ),
         );
 
-        let config = Lighting::new(None, None, Some(groups), None);
+        let config = Lighting::new(None, Some(groups), None);
 
         let result = validate_groups(&shows, Some(&config));
 

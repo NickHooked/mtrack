@@ -222,7 +222,7 @@ fn test_static_effect_crossfade_comprehensive() {
             duration: Duration::from_secs(10), // Total duration
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
         Some(Duration::from_secs(1)), // up_time: 1s
         Some(Duration::from_secs(1)), // down_time: 1s
@@ -310,7 +310,7 @@ fn test_color_cycle_effect_crossfade() {
             duration: Duration::from_secs(11),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
         Some(Duration::from_secs(1)), // fade_in: 1s
         Some(Duration::from_secs(1)), // fade_out: 1s
@@ -366,7 +366,7 @@ fn test_pulse_effect_crossfade() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Overlay,
         Some(Duration::from_secs(1)), // fade_in: 1s
         Some(Duration::from_secs(1)), // fade_out: 1s
@@ -375,23 +375,27 @@ fn test_pulse_effect_crossfade() {
 
     engine.start_effect(pulse_effect).unwrap();
 
+    // A pulse over no colour shows white at its level (design 3.4, rule 7):
+    // three channels at the one level, never a colour of its own.
+    let white_level = |commands: &[DmxCommand]| {
+        assert_eq!(commands.len(), 3, "{commands:?}");
+        assert!(
+            commands.iter().all(|cmd| cmd.value == commands[0].value),
+            "{commands:?}"
+        );
+    };
+
     // Test fade in phase - pulse should be dimmed
-    // With fixture profile system, RGB-only fixtures use _pulse_multiplier
-    // which gets applied during blending, so we expect no direct RGB commands
     let commands = engine.update(Duration::from_millis(500), None).unwrap();
-    // The pulse effect for RGB-only fixtures uses _pulse_multiplier, not direct RGB channels
-    // So there should be no DMX commands at this point (multiplier is internal)
-    assert!(commands.is_empty()); // No direct RGB commands with fixture profile system
+    white_level(commands);
 
     // Test full intensity phase - pulse should be at full amplitude
     let commands = engine.update(Duration::from_secs(2), None).unwrap();
-    // Same as above - no direct RGB commands with fixture profile system
-    assert!(commands.is_empty()); // No direct RGB commands with fixture profile system
+    white_level(commands);
 
     // Test fade out phase - pulse should be dimmed (at 4.5s total: 0.5s into down_time)
     let commands = engine.update(Duration::from_millis(2000), None).unwrap(); // 2.5s + 2s = 4.5s
-                                                                              // Same as above - no direct RGB commands with fixture profile system
-    assert!(commands.is_empty()); // No direct RGB commands with fixture profile system
+    white_level(commands);
 
     // Test effect end - should be no commands (at 5s total)
     let commands = engine.update(Duration::from_millis(500), None).unwrap(); // 4.5s + 0.5s = 5s
@@ -426,7 +430,7 @@ fn test_rainbow_effect_crossfade() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
         Some(Duration::from_secs(1)), // fade_in: 1s
         Some(Duration::from_secs(1)), // fade_out: 1s
@@ -565,7 +569,7 @@ fn test_static_effect_crossfade() {
             duration: Duration::from_secs(3),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
         Some(Duration::from_secs(1)), // 1 second fade in
         Some(Duration::from_secs(1)), // 1 second fade out
@@ -582,7 +586,7 @@ fn test_static_effect_crossfade() {
     // Test fade in: at t=500ms, should be 50% (half blue)
     let commands = engine.update(Duration::from_millis(500), None).unwrap();
     let blue_cmd = commands.iter().find(|cmd| cmd.channel == 3).unwrap();
-    assert_eq!(blue_cmd.value, 127); // Should be 127 (50% of 255)
+    assert_eq!(blue_cmd.value, 128); // Should be 128 (50% of 255)
 
     // Test full intensity: at t=1000ms, should be 100% (full blue)
     let commands = engine.update(Duration::from_millis(500), None).unwrap(); // 500ms more = 1000ms total
@@ -592,7 +596,7 @@ fn test_static_effect_crossfade() {
     // Test fade out: at t=2500ms, should be 50% (half blue)
     let commands = engine.update(Duration::from_millis(1500), None).unwrap(); // 1500ms more = 2500ms total
     let blue_cmd = commands.iter().find(|cmd| cmd.channel == 3).unwrap();
-    assert_eq!(blue_cmd.value, 127); // Should be 127 (50% of 255)
+    assert_eq!(blue_cmd.value, 128); // Should be 128 (50% of 255)
 
     // Test fade out: at t=3000ms, effect should be finished (no commands)
     let commands = engine.update(Duration::from_millis(500), None).unwrap(); // 500ms more = 3000ms total

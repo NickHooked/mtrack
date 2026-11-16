@@ -1,7 +1,7 @@
 # mtrack lighting DSL — quick reference
 
 `.light` files describe four kinds of content: **fixture types**, **venues**,
-**light shows**, and **sequences**. A single file can contain any combination.
+**light shows**, and **sequences** (plus an optional **palette** of named colours). A single file can contain any combination.
 Comments use `#` or `//` to end of line. Whitespace is insignificant.
 
 When generating a show for a song, you usually only write a `show "..." { … }`
@@ -17,7 +17,7 @@ show "Optional Name" {
 
     @00:05.000
     movers, beams: cycle color: "red", color: "green", color: "blue", \
-        duration: 8s, direction: forward, dimmer: 50%
+        duration: 8s, direction: forward
 }
 ```
 
@@ -28,48 +28,62 @@ show "Optional Name" {
   snake_case identifiers.
 - Multiple effects under the same `@time` can be stacked by repeating
   `group: effect …` on the next line under the same timestamp.
+- A colour alone does not light a fixture that has a dimmer channel: its
+  dimmer holds 0 until something sends it a level. Light such fixtures with
+  a `static` with `dimmer:`/`intensity:`, or a `dimmer` effect on another
+  layer under a `cycle`; a `chase` writes the dimmer itself. Otherwise the
+  show comes out dark, as `evaluate_show` reports it (`dark: true`).
 
 ### Effects
 
-| Effect    | Required params                                        | Notes |
-|-----------|--------------------------------------------------------|-------|
-| `static`  | `duration`                                             | Hold a color/intensity. Use `color`, and `intensity` or `dimmer` for the level. |
-| `cycle`   | one or more `color:`, `duration`                       | Iterates colors. Optional `speed`, `direction`. |
-| `strobe`  | `frequency`, `duration`                                | Hz strobe. Takes no color or intensity — it gates whatever is beneath it. |
-| `pulse`   | `frequency`, `duration`                                | Sinusoidal pulse. Optional `base_level` (default 50%) and `pulse_amplitude` (also spelled `intensity`). |
-| `chase`   | `speed`, `duration`                                    | A moving brightness mask over the layers beneath — needs a color bed under it. Optional `direction`, `pattern: linear|snake|random`. |
-| `dimmer`  | `start_level`, `end_level`, `duration`                 | Linear ramp; `curve: linear` optional. |
-| `rainbow` | `duration`                                             | Hue sweep. Optional `speed`. |
-
-Every effect must specify a finite `duration`. Effects can crossfade — set
-`up_time`, `hold_time`, and `down_time` (each a `time_parameter`).
-
-### Common parameters
-
-- `duration`, `up_time`, `down_time`, `hold_time`: time values. Units
-  are `ms`, `s`, `beats`, `beat`, `measures`, or `measure`. **No whitespace
-  between number and unit** — write `500ms`, `2s`, `4beats`, `2measures` (not
-  `4 beats`). `speed` and `frequency` parameters accept the same forms
-  (`speed: 1measure`, `frequency: 1beat`).
-- `color` (**`static` and `cycle` only**): a named color (`"red"`, `"blue"`,
-  `"white"`, `"orange"`, …), a hex string (`#FF8800` or `"#FF8800"`), or
-  `rgb(255, 128, 0)`. The other effect types have no color of their own — a
-  `chase` or `strobe` gates whatever is beneath it, so put the color on the bed.
-- `dimmer`, `red`, `green`, `blue` (**`static` only**), and `intensity`
-  (**`static` and `pulse` only**): floats `0.0`–`1.0`, or a percentage like
-  `60%`.
+{{effects}}
+An effect runs for a finite time: write `duration` (how long it holds) or
+`hold_time`, which stands in for it; a line with neither is a parse error. Two
+exceptions: a `dimmer`'s `duration` has the default above, and a `move` needs
+`duration` itself (its travel time). Effects can crossfade — set `up_time`,
+`hold_time`, and `down_time` (each a time value): the fades are added around
+the hold, not taken out of it.
 
 These are listed per effect deliberately. A parameter an effect does not read is
 accepted by the parser and dropped, so writing one produces a setting that never
 takes effect — `validate_lighting` reports it as an `unused-parameter` warning.
+On a `static`, an unknown name with a level is read as a channel of that name.
+
+### Common parameters
+
+Every effect also reads {{common_params}}.
+
+- Times (`duration`, `up_time`, `down_time`, `hold_time`) take a unit:
+  {{units}}. **No whitespace between number and unit** — write `500ms`, `2s`,
+  `4beats`, `2measures` (not `4 beats`). Rates (`speed`, `frequency`) are a
+  bare number per second or take the same forms (`speed: 1measure`,
+  `frequency: 1beat`).
+- `color`: a named color ({{named_colors}}, quoted), a hex string (`#FF8800`
+  or `"#FF8800"`), or `rgb(255, 128, 0)`. Only {{color_effects}} read it —
+  a `chase` or `strobe` gates whatever is beneath it, so put the color on the
+  bed. A color may also be a palette slot, `palette.primary` (see
+  [Palette](#palette)).
+- Levels (`dimmer`, `intensity`, `red`, `green`, `blue`, `white`,
+  `base_level`, `start_level`, …): floats `0.0`–`1.0`, or a percentage like
+  `60%`.
 - `direction`: the accepted values depend on the effect — they are two
   separate sets, not one list.
-  - `cycle`: `forward | backward | pingpong` (the order colours are stepped).
-  - `chase`: `left_to_right | right_to_left | top_to_bottom | bottom_to_top |
-    clockwise | counter_clockwise` (where the mask travels).
-  - No other effect reads `direction`; on `rainbow` it is accepted and ignored.
-- `layer`: `background | midground | foreground` (grandMA-inspired layers).
-- `blend_mode`: `replace | multiply | add | overlay | screen`.
+  - `cycle`: {{cycle_directions}} (the order colours are stepped).
+  - `chase`: {{chase_directions}} (where the mask travels).
+- `pattern` (`chase`): {{chase_patterns}}.
+- `transition`: `cycle` takes {{cycle_transitions}}; `chase` takes
+  {{chase_transitions}}. `crossfade` is `fade` by another name.
+- `curve` (`dimmer`): {{curves}}.
+- `easing` (`move`): {{easings}}.
+- `layer`: one of this player's layers, bottom to top: {{layers}}. A higher
+  layer draws over a lower; an effect with no `layer:` runs on the bottom one
+  (`{{layer_bottom}}`). The player's config (`dmx.lighting.layers`) sets the
+  layers (the default is `background`, `midground`, `foreground`), and a show
+  naming a layer the player lacks fails to load.
+- `blend_mode`: {{blend_modes}}.
+- `per`: {{per}} — `cell` (or `cells`) runs the effect across a pixel
+  fixture's cells. `spread`: an angle (`360deg`) that phases a `cycle` or a
+  `rainbow` across its targets.
 
 A `pulse`'s amplitude is added *on top of* its base level: it sweeps
 `base_level` to `base_level + amplitude` rather than modulating around the level
@@ -78,16 +92,17 @@ Set `base_level` explicitly to place the pulse where you want it.
 
 ### Layer commands
 
-Layer state can be managed mid-show. Each command takes parenthesised
-parameters: `layer:` is required, the others are optional.
+Layer state can be managed mid-show. The commands are {{layer_commands}};
+each takes parenthesised parameters ({{layer_command_params}}). `layer:` is
+required, but for `clear()`, which with no layer clears every layer.
 
 ```
 @01:00.000
-clear(layer: midground)                          # hard cut — stop this layer now
+clear(layer: {{layer_second}})                   # hard cut — stop this layer now
 clear()                                          # hard cut on every layer
-freeze(layer: background)                        # pin current output, ignore new cues
-unfreeze(layer: background)                      # resume normal updates
-master(layer: foreground, intensity: 50%)        # scale the layer's output
+freeze(layer: {{layer_bottom}})                  # pin current output, ignore new cues
+unfreeze(layer: {{layer_bottom}})                # resume normal updates
+master(layer: {{layer_top}}, intensity: 50%)     # scale the layer's output
 ```
 
 `master(...)` also accepts `speed:` (scales effect rates) in addition to
@@ -111,7 +126,7 @@ show, reference it on its own cue line:
 ```
 sequence "Verse" {
     @00:00.000
-    front_wash: static color: "blue", duration: 4s
+    front_wash: static color: "blue", dimmer: 100%, duration: 4s
 
     @00:02.000
     movers: chase speed: 2.0, direction: left_to_right, duration: 4s
@@ -129,6 +144,51 @@ show "Song" {
 }
 ```
 
+A pass lasts until its last effect ends. To loop on the bar when the effects
+end early, declare the pass length, in the same units as `duration:`:
+
+```
+sequence "Centre Beats", length: 1measure {
+    @1/1
+    centre: static color: "blue", dimmer: 100%, duration: 1beat
+    @1/3
+    centre: static color: "white", dimmer: 100%, duration: 1.5beats
+}
+```
+
+Each pass then starts one measure after the last; an effect running past the
+length is cut when the next pass starts, and a cue at or past the length is a
+parse error. Padding cues that only stretch a pass are no longer needed.
+
+A sequence can take parameters, written `$name` in its body and bound where
+it is used. One without a default must be given at every use; values are
+substituted as written (a quoted colour, a group, a number, a duration):
+
+```
+sequence "Strike"(hit, bed: "#1E6FE0", target: all_wash) {
+    @1/1
+    $target: static color: $bed, dimmer: 100%, layer: {{layer_bottom}}, duration: 2measures
+    @1/1
+    $target: static color: $hit, dimmer: 100%, layer: {{layer_top}}, duration: 1beat
+}
+
+show "Song" {
+    @1/1
+    sequence "Strike"(hit: "#FFD870"), loop: 4
+}
+```
+
+Prefer one parameterized sequence over copies that differ only by colour or
+group. `stop sequence "Strike"` stops every use of it.
+
+Sequences shared by several songs can live in one file. `include
+"../common/looks.light"` at the top of a file brings in that file's
+sequences; the path is relative to the including file's folder, and the
+included file may define only sequences (and include others). Its sequences
+run at the including song's tempo. A name defined in two files is an error.
+Validating source with an `include` needs `song`, which gives it a folder to
+resolve against.
+
 For one-off repetition without naming, use an inline loop. Timestamps inside
 the block are relative to the loop's start:
 
@@ -136,17 +196,57 @@ the block are relative to the loop's start:
 @00:00.000
 loop {
     @00:00.000
-    all_lights: static color: "red", duration: 250ms
+    all_lights: static color: "red", dimmer: 100%, duration: 250ms
     @00:00.250
     all_lights: static color: "black", duration: 250ms
 } repeats: 8
 ```
 
+### Palette
+
+A `palette { … }` block at file scope names the colours a show is built from:
+each slot has a default colour, and effects say `palette.<slot>` wherever they
+would write a colour. Write one when a show uses the same few colours in many
+places, so the look can be changed in one place.
+
+```
+palette {
+    primary: "#C01020"
+    secondary: "orange"
+    accent: rgb(255, 240, 200)
+}
+
+sequence "hit"(color: palette.accent) {
+    @1/1
+    front_wash: static color: $color, dimmer: 100%, duration: 1beat
+}
+
+show "Main" {
+    @1/1
+    front_wash: static color: palette.primary, dimmer: 100%, duration: 8measures
+    back_truss: cycle color: palette.primary, color: palette.secondary, duration: 8measures
+    @9/1
+    sequence "hit"(color: palette.secondary)
+}
+```
+
+- Slots are separated by a line break or a comma; each value is any colour a
+  `color:` takes. A file has at most one `palette` block, and a slot is declared
+  once in it.
+- `palette.<slot>` is accepted for `color:` (on `static` and each colour of a
+  `cycle`) and as a sequence argument or default (`sequence "hit"(color:
+  palette.accent)`); the sequence body still says `$color`.
+- A slot the file does not declare is a parse error naming the slot and its
+  position. Every slot has a default, so a show always plays on its own.
+- The colours are settled once, before the song plays; nothing changes while it
+  runs. An included file may carry a `palette` for its own sequences.
+
 ### Tempo and beat-based timing
 
-A `tempo { ... }` block enables musical-time conversion. Place it either at
-file scope (applies to every show/sequence) or as the first item inside a
-`show { ... }` body. Fields go on separate lines:
+A `tempo { ... }` block enables musical-time conversion. Place it at file
+scope (applies to every show/sequence) or inside a `show { ... }` or
+`sequence { ... }` body, where it governs every cue of that body; where there
+are several, the last wins. Fields go on separate lines:
 
 ```
 tempo {
@@ -168,7 +268,10 @@ beat 1, `@3/2.5` is bar 3 halfway between beats 2 and 3. Durations may use
 `Nbeats`, `Nbeat`, `Nmeasures`, or `Nmeasure` (no whitespace). Tempo-change
 transition durations use a slightly different syntax: a bare number means
 beats, and `Nm` means measures (`transition: 4` = 4 beats; `transition: 2m`
-= 2 measures; `transition: snap` for an instantaneous change).
+= 2 measures; `transition: snap` for an instantaneous change). A ramp moves
+the tempo linearly in time and spans exactly the beats written (or the beats
+in the measures written), as a DAW renders it: `@16/1 { bpm: 160,
+transition: 4 }` reaches 160 exactly on bar 17 beat 1 in 4/4.
 
 A block is not always required. A show with none inherits the song's tempo —
 its `tempo:` config if it has one, otherwise a map derived from the click
@@ -185,7 +288,7 @@ expressed relative to a new "bar 1":
 ```
 @8/1
 offset 8 measures   # cues at @N/M now mean (N+8)/M in song time
-all_lights: static color: "blue", duration: 4beats
+all_lights: static color: "blue", dimmer: 100%, duration: 4beats
 
 reset_measures      # back to the original baseline
 ```
@@ -227,21 +330,24 @@ fixture_type "RGBW_Par" {
 }
 ```
 
-Fixture types can also reference a manufacturer GDTF archive (`.fixture`
-files) instead of hand-written channel maps:
+A fixture type can also be a manufacturer GDTF archive: every `.gdtf` in
+`lighting/library/` is a fixture type, named from the fixture name inside it.
+Each venue fixture of a GDTF type states its own mode, after the type:
 
 ```
-fixture_type "PB15 PixelBrick"
-  from gdtf("lighting/library/pb15.gdtf", mode "8: RGBS")
-{
-}
+fixture "Brick1" "PB15 PixelBrick" mode "8: RGBS" @ 1:1
 ```
 
-Prefer the MCP import flow over writing these by hand: download the GDTF
-into the project, call `list_gdtf_modes` to pick the mode against the
-venue's patch sheet, then `import_gdtf` — it copies the archive into
-`lighting/library/`, writes the `.fixture` file, and returns the resolved
-channels plus every distillation warning.
+A fixture of a GDTF type with no `mode` fails the venue. A `.fixture` record
+(`fixture_type "Name" from gdtf("lighting/library/x.gdtf") { movement { ... } }`)
+holds only what the GDTF does not say — another name, movement limits — and
+never a mode.
+
+Prefer the MCP import flow over copying archives by hand: download the GDTF
+into the project, call `list_gdtf_modes` to choose modes against the venue's
+patch sheet, then `import_gdtf` — it copies the archive into
+`lighting/library/` (with `name`, it also writes the record). Then write
+each venue line with its `mode "…"`.
 
 ## Venue (rarely written from MCP)
 
@@ -256,13 +362,18 @@ Tags are the whole vocabulary a venue offers. Anything a show wants to address
 — `front`, `left`, an odd/even split — is a tag on the fixtures, selected by a
 logical group in the config.
 
+A `.venue` fixture line may also carry `position (x, y, z)`, `rotation (x, y, z)`
+and `beam_angle <degrees>` (greater than 0, at most 180; a drawing hint for the
+web UI's 3D view that never changes the DMX), in any order after the tags.
+
 ## Authoring tips
 
 1. **Always validate before writing.** Call `validate_lighting` with your draft.
 2. **Discover groups first.** Use `list_groups` for the active venue so cues
    target real groups (`front_wash`, `movers`, etc.) rather than guesses.
 3. **Crossfade by setting `up_time`/`down_time`.** Otherwise effects snap on.
-4. **End the show.** A trailing `dimmer end_level: 0%, duration: 2s` on
-   `all_lights` (or whatever your "all" group is called) gives a clean fade-out.
+4. **End the show.** A trailing `dimmer start_level: 100%, end_level: 0%,
+   duration: 2s` on `all_lights` (or whatever your "all" group is called)
+   gives a clean fade-out.
 5. **Prefer absolute times for songs without tempo metadata.** Switch to
    `@bar/beat` only after confirming a `tempo { … }` block exists.

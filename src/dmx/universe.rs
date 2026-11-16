@@ -15,7 +15,7 @@
 use ola::DmxBuffer;
 use parking_lot::RwLock;
 use spin_sleep;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -23,15 +23,107 @@ use std::time::{Duration, Instant};
 use tracing::error;
 
 use crate::config;
+use crate::lighting::channels::dmx_byte;
 use crate::playsync::CancelHandle;
 
 use super::engine::DmxMessage;
+// The dimming arithmetic the MIDI DMX store shares with the universe threads
+// is `mtrack-core`'s, with the store, and the frame rate it is counted at is
+// kept beside it.
+pub(crate) use super::midi_dmx_store::{
+    dim_rate, dim_step, dim_ticks, DEFAULT_DIM_TICKS, FRAMES_PER_SECOND, TARGET_HZ,
+};
 
 /// A DMX universe is 512 channels.
 const UNIVERSE_SIZE: usize = 512;
 
-/// The target number of updates per second.
-pub(crate) const TARGET_HZ: f64 = 44.0;
+/// When frame `k` of a run at [`FRAMES_PER_SECOND`] falls, from the run's
+/// start: to the nanosecond below, as a period of 1/44 s is not a whole
+/// number of them, so `k` frames span exactly `k` / 44 s, give or take
+/// that nanosecond, however many there are.
+pub(crate) fn frame_time(k: u64) -> Duration {
+    let nanos = u128::from(k) * 1_000_000_000 / u128::from(FRAMES_PER_SECOND);
+    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+}
+
+/// When a loop running at [`FRAMES_PER_SECOND`] runs its next frame: on
+/// deadlines counted from its start, so it keeps the rate on average
+/// whatever each frame takes and however late its sleeps wake. Restarting
+/// the count from each frame's own time made every frame's lateness the
+/// next one's too: the effects loop ran at about 43 Hz, and a dim it steps
+/// took 2 to 4% longer than its time. Fallen more than a frame behind (a
+/// stall), it starts counting again from then, rather than run the missed
+/// frames back to back.
+pub(crate) struct FrameClock {
+    start: Instant,
+    frame: u64,
+}
+
+impl FrameClock {
+    /// A clock whose first frame is due at `start`.
+    pub(crate) fn new(start: Instant) -> Self {
+        Self { start, frame: 0 }
+    }
+
+    /// When the next frame is due.
+    pub(crate) fn due(&self) -> Instant {
+        self.start + frame_time(self.frame)
+    }
+
+    /// Counts the frame due, run at `now`, and says when the next is due.
+    pub(crate) fn ran(&mut self, now: Instant) -> Instant {
+        self.frame += 1;
+        let due = self.due();
+        if now > due + frame_time(1) {
+            // More than a frame behind: the next a frame on from now.
+            self.start = now;
+            self.frame = 1;
+        } else if self.frame >= FRAMES_PER_SECOND * 3_600 {
+            // An hour of frames: counted from that hour's last deadline
+            // instead, an hour on from the start, so the count never grows
+            // without end. The next deadline is the same instant.
+            self.start += frame_time(self.frame);
+            self.frame = 0;
+        }
+        self.due()
+    }
+}
+
+/// Where a channel written at `from`, moving `rate` a tick toward `target`,
+/// is `ticks` ticks on: [`dim_step`] once for each whole tick, as the store
+/// and the universe thread take it a tick at a time; a part tick moves it
+/// no further, so every level is one the live run sends. Stepped, not
+/// `from + rate × ticks`: the sum of the steps rounds otherwise, so a
+/// seek's replay landed a byte off what the live run sent (#646: 0 → 35
+/// over 44 ticks, tick 22, 18 for 17). An instant write (no rate, or a
+/// dim over no ticks: infinite, or no number) is there at once.
+pub(crate) fn dimmed_at(from: f64, target: f64, rate: f64, ticks: f64) -> f64 {
+    if rate == 0.0 || !rate.is_finite() {
+        return target;
+    }
+    let whole = ticks.floor();
+    let mut value = from;
+    let mut n = 0.0;
+    while n < whole && value != target {
+        let next = dim_step(value, target, rate);
+        if next == value {
+            // A rate too small to move it; it never will.
+            return value;
+        }
+        value = next;
+        n += 1.0;
+    }
+    value
+}
+
+/// A fixture test's channels as a universe holds them: 0-based index and
+/// value, or none.
+type TestChannels = Option<Vec<(usize, u8)>>;
+
+/// The 0-based index of a 1-based DMX channel; channel 0 is taken as 1.
+fn channel_index(channel: u16) -> usize {
+    usize::from(channel.max(1) - 1)
+}
 
 /// A DMX universe.
 pub(crate) struct Universe {
@@ -51,9 +143,13 @@ pub(crate) struct Universe {
     cancel_handle: CancelHandle,
     /// Used to send data to the OLA client thread.
     ola_sender: Sender<DmxMessage>,
-    /// Last values written by effect commands. Used to skip redundant writes
-    /// so the Universe thread doesn't re-send unchanged buffers to OLA.
-    last_effect_values: RwLock<Vec<u8>>,
+    /// A fixture test's channels (0-based index, value), laid over the frame
+    /// last, as it goes out: it wins over effects and MIDI-DMX while set,
+    /// and the moment it is cleared the frame underneath goes out again.
+    test_override: Arc<RwLock<TestChannels>>,
+    /// Bumped on every override change, so the thread sends even when the
+    /// show underneath did not move.
+    test_generation: Arc<AtomicU64>,
 }
 
 impl Universe {
@@ -67,13 +163,39 @@ impl Universe {
             rates: Arc::new(RwLock::new(vec![0.0; UNIVERSE_SIZE])),
             current: Arc::new(RwLock::new(vec![0.0; UNIVERSE_SIZE])),
             target: Arc::new(RwLock::new(vec![0.0; UNIVERSE_SIZE])),
-            global_dim_rate: RwLock::new(1.0),
+            global_dim_rate: RwLock::new(DEFAULT_DIM_TICKS),
+
             max_channels: Arc::new(AtomicU16::new(0)),
             config,
             cancel_handle,
             ola_sender,
-            last_effect_values: RwLock::new(vec![0; UNIVERSE_SIZE]),
+            test_override: Arc::new(RwLock::new(None)),
+            test_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Lays a fixture test's channels (1-based DMX channel, value) over this
+    /// universe's output, or clears it (`None`). Channels outside 1..=512
+    /// are dropped.
+    pub fn set_test_override(&self, channels: Option<&[(u16, u8)]>) {
+        *self.test_override.write() = channels.map(|channels| {
+            channels
+                .iter()
+                .filter(|(channel, _)| (1..=UNIVERSE_SIZE as u16).contains(channel))
+                .map(|(channel, value)| (channel_index(*channel), *value))
+                .collect()
+        });
+        self.test_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The dim rate: ticks for a full transition.
+    pub fn dim_rate(&self) -> f64 {
+        *self.global_dim_rate.read()
+    }
+
+    /// Sets the dim rate, in ticks for a full transition.
+    pub fn set_dim_rate(&self, ticks: f64) {
+        *self.global_dim_rate.write() = ticks;
     }
 
     #[cfg(test)]
@@ -86,77 +208,96 @@ impl Universe {
         self.target.read()[channel_index]
     }
 
+    /// Every channel lit (1-based DMX channel, value) as the universe puts
+    /// it out: where a dim has got to, else its value -- whoever wrote it.
+    pub fn lit_channels(&self) -> Vec<(u16, u8)> {
+        let target = self.target.read();
+        let rates = self.rates.read();
+        let current = self.current.read();
+        (0..UNIVERSE_SIZE)
+            .map(|idx| {
+                let value = if rates[idx] != 0.0 {
+                    current[idx]
+                } else {
+                    target[idx]
+                };
+                (idx, dmx_byte(value))
+            })
+            .filter(|&(_, value)| value > 0)
+            .map(|(idx, value)| (idx as u16 + 1, value))
+            .collect()
+    }
+
     /// Updates the dim speed.
-    pub fn update_dim_speed(&self, dim_rate: Duration) {
-        let mut global_dim_rate = self.global_dim_rate.write();
-        if dim_rate.is_zero() {
-            *global_dim_rate = 1.0
-        } else {
-            *global_dim_rate = dim_rate.as_secs_f64() * TARGET_HZ
-        }
+    pub fn update_dim_speed(&self, dimming: Duration) {
+        *self.global_dim_rate.write() = dim_ticks(dimming);
+    }
+
+    /// A 1-based DMX channel about to be written: the universe thread's
+    /// range grows to cover it, and its 0-based index comes back.
+    fn touch(&self, channel: u16) -> usize {
+        let _ =
+            self.max_channels
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current_channel| {
+                    (channel >= current_channel).then_some(channel + 1)
+                });
+        channel_index(channel)
     }
 
     /// Updates the universe with the DMX channel/value.
     pub fn update_channel_data(&self, channel: u16, value: u8, dim: bool) {
-        let channel_index = if channel > 0 {
-            usize::from(channel - 1) // Convert from 1-based DMX to 0-based OLA
-        } else {
-            0 // Handle channel 0 case - map to index 0
-        };
+        let channel_index = self.touch(channel);
         let value = f64::from(value);
-        self.target.write()[channel_index] = value;
-        self.rates.write()[channel_index] = if dim {
-            (value - self.current.read()[channel_index]) / *self.global_dim_rate.read()
+        // The rate first, with no other lock held: an assignment evaluates
+        // its value before its place, so reading `current` inside it held
+        // that read while waiting for `rates`, against the order the
+        // universe thread takes them in (target, rates, current).
+        let rate = if dim {
+            dim_rate(
+                self.current.read()[channel_index],
+                value,
+                *self.global_dim_rate.read(),
+            )
         } else {
             0.0
         };
-
-        let _ =
-            self.max_channels
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current_channel| {
-                    if channel >= current_channel {
-                        return Some(channel + 1);
-                    }
-                    None
-                });
+        self.target.write()[channel_index] = value;
+        self.rates.write()[channel_index] = rate;
     }
 
-    /// Clears the effect deduplication cache so the next batch is applied unconditionally.
-    /// Call this between songs to avoid stale state.
-    pub fn clear_effect_cache(&self) {
-        self.last_effect_values.write().fill(0);
+    /// Puts a channel back where the MIDI writes before a playback's start
+    /// point left it: at `current`, still moving toward `target` by `rate`
+    /// a tick if a dim had not finished (#583). Takes the locks in the
+    /// universe thread's order (target, rates, current). A value already
+    /// reached leaves `current` to the thread, which sends a channel only
+    /// as it moves: set there too, it would never go out.
+    pub fn restore_channel_data(&self, channel: u16, current: f64, target: f64, rate: f64) {
+        let channel_index = self.touch(channel);
+        self.target.write()[channel_index] = target;
+        self.rates.write()[channel_index] = rate;
+        if rate != 0.0 {
+            self.current.write()[channel_index] = current;
+        }
     }
 
     /// Updates the universe with effect commands (bypasses dimming).
-    /// Acquires locks once for the entire batch rather than per-command,
-    /// and deduplicates against last frame to avoid redundant OLA sends.
+    /// Acquires locks once for the entire batch rather than per-command, and
+    /// skips a channel already at the value (and not dimming toward
+    /// another). It compares with the channel itself rather than with the
+    /// last effect write: MIDI DMX writes channels too, and a cache cleared
+    /// to 0 between songs took a new show's 0 for the old value and left the
+    /// previous song's byte on the wire (#557).
     pub fn update_effect_commands(&self, commands: Vec<(u16, u8)>) {
-        let mut last = self.last_effect_values.write();
         let mut target = self.target.write();
         let mut rates = self.rates.write();
 
         for (channel, value) in commands {
-            let idx = if channel > 0 {
-                usize::from(channel - 1)
-            } else {
-                0
-            };
-            if last[idx] != value {
-                last[idx] = value;
-                target[idx] = f64::from(value);
+            let idx = channel_index(channel);
+            let value_f = f64::from(value);
+            if target[idx] != value_f || rates[idx] != 0.0 {
+                self.touch(channel);
+                target[idx] = value_f;
                 rates[idx] = 0.0; // instant (no dimming for effect commands)
-
-                let _ = self.max_channels.fetch_update(
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                    |current_channel| {
-                        if channel >= current_channel {
-                            Some(channel + 1)
-                        } else {
-                            None
-                        }
-                    },
-                );
             }
         }
     }
@@ -170,23 +311,37 @@ impl Universe {
         let cancel_handle = self.cancel_handle.clone();
         let universe = u32::from(self.config.universe());
         let ola_sender = self.ola_sender.clone();
+        let test_override = self.test_override.clone();
+        let test_generation = self.test_generation.clone();
 
         thread::spawn(move || {
-            let mut last_time = Instant::now();
-            let tick_duration = Duration::from_secs(1).div_f64(TARGET_HZ);
+            let mut clock = FrameClock::new(Instant::now());
 
             let mut buffer = DmxBuffer::new();
+            // `buffer` is always the show's own frame (every channel); an
+            // override is laid on a copy, so clearing it sends the show's
+            // values again with nothing to restore.
+            let mut sent_generation = 0;
 
             loop {
                 if cancel_handle.is_cancelled() {
                     return;
                 }
 
-                if Universe::approach_target(&rates, &current, &target, &max_channels, &mut buffer)
-                {
+                let changed = Universe::approach_target(
+                    &rates,
+                    &current,
+                    &target,
+                    &max_channels,
+                    &mut buffer,
+                );
+                let generation = test_generation.load(Ordering::SeqCst);
+                if changed || generation != sent_generation {
+                    sent_generation = generation;
+                    let frame = Universe::compose(&buffer, test_override.read().as_deref());
                     if let Err(e) = ola_sender.send(DmxMessage {
                         universe,
-                        buffer: buffer.clone(),
+                        buffer: frame,
                     }) {
                         error!(
                             err = e.to_string(),
@@ -195,10 +350,20 @@ impl Universe {
                     }
                 }
 
-                last_time += tick_duration;
-                spin_sleep::sleep(last_time - Instant::now());
+                let due = clock.ran(Instant::now());
+                spin_sleep::sleep(due.saturating_duration_since(Instant::now()));
             }
         })
+    }
+
+    /// The frame that goes out: the show's, with a fixture test's channels
+    /// laid over it when one is set.
+    fn compose(show: &DmxBuffer, test: Option<&[(usize, u8)]>) -> DmxBuffer {
+        let mut frame = show.clone();
+        for &(i, value) in test.unwrap_or_default() {
+            frame.set_channel(i, value);
+        }
+        frame
     }
 
     /// Takes the given inputs and approaches the current expected DMX values.
@@ -224,20 +389,191 @@ impl Universe {
             // We want current == target, but due to floating points we'll test if they're close to each other.
             if (current[i] - target[i]).abs() > f64::EPSILON {
                 changed = true;
-                if rates[i] > 0.0 {
-                    current[i] = (current[i] + rates[i]).min(target[i])
-                } else if rates[i] == 0.0 {
-                    current[i] = target[i]
-                } else {
-                    current[i] = (current[i] + rates[i]).max(target[i])
-                }
-                buffer.set_channel(
-                    i,
-                    current[i].min(u8::MAX.into()).max(u8::MIN.into()).round() as u8,
-                );
+                current[i] = dim_step(current[i], target[i], rates[i]);
+                buffer.set_channel(i, dmx_byte(current[i]));
             }
         }
         changed
+    }
+}
+
+#[cfg(test)]
+mod frame_clock_test {
+    use super::*;
+
+    /// Frames a loop on `clock` runs in `secs`, each waking `late` after
+    /// it is due (the sleep's overshoot) and taking `work`.
+    fn frames_in(secs: u64, late: impl Fn(u64) -> Duration, work: Duration) -> u64 {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(start);
+        let end = start + Duration::from_secs(secs);
+        let mut frames = 0;
+        let mut now = start;
+        loop {
+            now = now.max(clock.due() + late(frames));
+            if now >= end {
+                return frames;
+            }
+            frames += 1;
+            now += work;
+            clock.ran(now);
+        }
+    }
+
+    #[test]
+    fn a_loop_on_the_clock_runs_at_the_rate_whatever_its_frames_take() {
+        // Restarting the count from each frame ran the effects loop at
+        // about 43 Hz: every wake's lateness carried into the next frame.
+        for secs in [1, 10, 600] {
+            for (late, work) in [
+                (Duration::ZERO, Duration::ZERO),
+                (Duration::from_micros(1_100), Duration::from_micros(300)),
+                (Duration::from_millis(5), Duration::from_millis(10)),
+            ] {
+                let frames = frames_in(secs, |_| late, work);
+                assert!(
+                    frames.abs_diff(FRAMES_PER_SECOND * secs) <= 1,
+                    "{frames} frames in {secs} s, {late:?} late, {work:?} work"
+                );
+            }
+            // Jittered wakes too.
+            let frames = frames_in(
+                secs,
+                |k| Duration::from_micros((k * 7_919) % 3_000),
+                Duration::from_micros(200),
+            );
+            assert!(frames.abs_diff(FRAMES_PER_SECOND * secs) <= 1, "{frames}");
+        }
+    }
+
+    #[test]
+    fn the_hourly_recount_neither_skips_nor_doubles_a_frame() {
+        // Run on time past the hour the count starts again at: every
+        // deadline is exactly one frame after the last, the boundary too.
+        let start = Instant::now();
+        let mut clock = FrameClock::new(start);
+        let frames = FRAMES_PER_SECOND * 3_601;
+        let mut due = clock.due();
+        for k in 1..=frames {
+            let next = clock.ran(due);
+            assert_eq!(next, start + frame_time(k), "frame {k}");
+            due = next;
+        }
+        assert_eq!(due, start + Duration::from_secs(3_601));
+    }
+
+    #[test]
+    fn a_stalled_loop_goes_on_a_frame_later_rather_than_catch_up() {
+        let start = Instant::now();
+        let mut clock = FrameClock::new(start);
+        clock.ran(start);
+        let stalled = start + Duration::from_secs(1);
+        let due = clock.ran(stalled);
+        assert_eq!(due, stalled + frame_time(1));
+        // Late by less than a frame, it keeps its deadlines.
+        let late = due + frame_time(1) / 2;
+        assert_eq!(clock.ran(late), stalled + frame_time(2));
+    }
+
+    #[test]
+    fn frame_times_span_whole_seconds_exactly() {
+        assert_eq!(frame_time(0), Duration::ZERO);
+        assert_eq!(frame_time(44), Duration::from_secs(1));
+        assert_eq!(frame_time(44 * 3_600), Duration::from_secs(3_600));
+        assert_eq!(frame_time(1), Duration::from_nanos(22_727_272));
+    }
+}
+
+#[cfg(test)]
+mod dimming_test {
+    use super::*;
+
+    /// The byte a channel's value goes out as, as the universe thread
+    /// always sent it; what `lit_channels` reports is the same byte.
+    #[test]
+    fn dmx_byte_rounds_within_a_byte() {
+        assert_eq!(dmx_byte(0.0), 0);
+        assert_eq!(dmx_byte(-0.4), 0);
+        assert_eq!(dmx_byte(-7.0), 0);
+        assert_eq!(dmx_byte(127.5), 128);
+        assert_eq!(dmx_byte(254.6), 255);
+        assert_eq!(dmx_byte(255.4), 255);
+        assert_eq!(dmx_byte(300.0), 255);
+        assert_eq!(dmx_byte(f64::NAN), 0);
+    }
+
+    /// A tick at a time lands exactly where [`dimmed_at`] says, whatever
+    /// the rate: the store and the universe thread step, a replay jumps
+    /// there. (At the write itself `dimmed_at` has an instant write landed
+    /// already; the step lands it a tick on.)
+    #[test]
+    fn stepping_a_dim_tick_by_tick_agrees_with_its_closed_form() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..2000 {
+            let from = (random() * 255.0).round();
+            let target = (random() * 255.0).round();
+            let ticks = match (random() * 4.0) as u8 {
+                0 => 0.0,
+                1 => 1.0,
+                2 => (random() * 10.0).round() + 1.0,
+                _ => random() * 4400.0 + 1.0,
+            };
+            let rate = dim_rate(from, target, ticks);
+            let steps = (random() * 80.0) as u32;
+            let mut current = from;
+            for n in 1..=steps {
+                current = dim_step(current, target, rate);
+                let closed = dimmed_at(from, target, rate, f64::from(n));
+                assert_eq!(
+                    current, closed,
+                    "from {from} to {target} over {ticks}: tick {n}"
+                );
+            }
+        }
+    }
+
+    /// #646: 0 → 35 over 44 ticks, stepped, is 17.499999999999996 at tick
+    /// 22, which goes out as 17; `from + rate × ticks` made it 17.5, 18.
+    /// The replay and the live run send the same byte at every tick, and a
+    /// part tick is where its whole tick left it: no level the live run
+    /// never sends.
+    #[test]
+    fn a_replayed_dim_sends_the_bytes_the_live_run_sent() {
+        let rate = dim_rate(0.0, 35.0, 44.0);
+        let mut current = 0.0;
+        for n in 1..=50 {
+            current = dim_step(current, 35.0, rate);
+            let replayed = dimmed_at(0.0, 35.0, rate, f64::from(n));
+            assert_eq!(dmx_byte(replayed), dmx_byte(current), "tick {n}");
+        }
+        assert_eq!(dmx_byte(dimmed_at(0.0, 35.0, rate, 22.0)), 17);
+        assert_eq!(
+            dimmed_at(0.0, 35.0, rate, 21.5),
+            dimmed_at(0.0, 35.0, rate, 21.0)
+        );
+        assert_eq!(dimmed_at(0.0, 35.0, rate, 1e6), 35.0);
+    }
+
+    #[test]
+    fn a_dim_of_no_ticks_is_instant_both_ways() {
+        let rate = dim_rate(10.0, 200.0, 0.0);
+        assert_eq!(dim_step(10.0, 200.0, rate), 200.0);
+        assert_eq!(dimmed_at(10.0, 200.0, rate, 0.0), 200.0);
+        let stay = dim_rate(50.0, 50.0, 0.0);
+        assert_eq!(dim_step(50.0, 50.0, stay), 50.0);
+        assert_eq!(dimmed_at(50.0, 50.0, stay, 3.0), 50.0);
+    }
+
+    #[test]
+    fn dimming_time_to_ticks() {
+        assert_eq!(dim_ticks(Duration::ZERO), 1.0);
+        assert_eq!(dim_ticks(Duration::from_secs(2)), 2.0 * TARGET_HZ);
     }
 }
 
@@ -273,6 +609,44 @@ mod test {
     }
 
     #[test]
+    fn lit_channels_reads_a_dim_where_it_has_got_to() {
+        let (universe, _receiver) = new_universe();
+        universe.update_effect_commands(vec![(3, 200)]);
+        universe.update_dim_speed(Duration::from_secs(1));
+        // Dimming up from 0, not yet on its way: not lit, though its target
+        // is 200.
+        universe.update_channel_data(10, 200, true);
+        assert_eq!(universe.lit_channels(), vec![(3, 200)]);
+    }
+
+    #[test]
+    fn a_restored_channel_goes_out() -> Result<(), Box<dyn Error>> {
+        // #583: a value the MIDI before a seek point had reached was
+        // written as reached, so the thread, which sends what moves, never
+        // sent it.
+        let (universe, receiver) = new_universe();
+        let handle = universe.start_thread();
+        universe.restore_channel_data(1, 254.0, 254.0, 0.0);
+        // And a dim on its way, half there.
+        universe.restore_channel_data(2, 100.0, 200.0, 1.0);
+        let mut frame = Vec::new();
+        for _ in 0..50 {
+            let message = receiver.recv_timeout(crate::testutil::PATIENCE)?;
+            frame = message.buffer.as_slice()[0..2].to_vec();
+            if frame[0] == 254 && frame[1] > 100 {
+                break;
+            }
+        }
+        universe.cancel_handle.cancel();
+        handle
+            .join()
+            .map_err(|_| "Error waiting for join".to_string())?;
+        assert_eq!(frame[0], 254, "the restored value never went out");
+        assert!(frame[1] > 100 && frame[1] < 200, "the dim: {frame:?}");
+        Ok(())
+    }
+
+    #[test]
     fn test_thread() -> Result<(), Box<dyn Error>> {
         // We just want to make sure that the thread vaguely does what we think it should.
         let (universe, receiver) = new_universe();
@@ -294,6 +668,42 @@ mod test {
             .join()
             .map_err(|_| "Error waiting for join".to_string())?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn a_test_override_wins_over_the_show_and_releases_back_to_it() -> Result<(), Box<dyn Error>> {
+        let (universe, receiver) = new_universe();
+        let handle = universe.start_thread();
+        // The show: channel 1 at 50, channel 3 at 7.
+        universe.update_effect_commands(vec![(1, 50), (3, 7)]);
+        let next = |want: &dyn Fn(&[u8]) -> bool| -> Result<Vec<u8>, Box<dyn Error>> {
+            loop {
+                let message = receiver.recv_timeout(crate::testutil::PATIENCE)?;
+                let frame = message.buffer.as_slice()[0..4].to_vec();
+                if want(&frame) {
+                    return Ok(frame);
+                }
+            }
+        };
+        assert_eq!(next(&|f| f[0] == 50)?, vec![50, 0, 7, 0]);
+
+        // A test on channels 1-2 (and one past the universe, dropped).
+        universe.set_test_override(Some(&[(1, 255), (2, 128), (600, 1)]));
+        assert_eq!(next(&|f| f[0] == 255)?, vec![255, 128, 7, 0]);
+
+        // The show moves underneath; the test still wins where it is.
+        universe.update_effect_commands(vec![(1, 60), (3, 9)]);
+        assert_eq!(next(&|f| f[2] == 9)?, vec![255, 128, 9, 0]);
+
+        // Released: the show's own values go out at once.
+        universe.set_test_override(None);
+        assert_eq!(next(&|f| f[0] == 60)?, vec![60, 0, 9, 0]);
+
+        universe.cancel_handle.cancel();
+        handle
+            .join()
+            .map_err(|_| "Error waiting for join".to_string())?;
         Ok(())
     }
 
@@ -594,19 +1004,26 @@ mod test {
     }
 
     #[test]
-    fn test_clear_effect_cache() {
+    fn an_effect_writes_zero_over_another_writers_value() {
+        // #557: a channel some other writer left lit -- the last song's
+        // effects, before a song change; MIDI DMX -- is set to 0 when an
+        // effect writes 0, not taken for unchanged.
         let (universe, _) = new_universe();
+        universe.update_effect_commands(vec![(3u16, 226u8)]);
+        universe.update_channel_data(4, 90, false);
+        universe.update_effect_commands(vec![(3u16, 0u8), (4, 0)]);
+        assert_eq!(universe.get_target_value(2), 0.0);
+        assert_eq!(universe.get_target_value(3), 0.0);
+    }
 
-        // Set some effect values
-        universe.update_effect_commands(vec![(1u16, 200u8)]);
-        assert_eq!(universe.get_target_value(0), 200.0);
-
-        // Clear cache
-        universe.clear_effect_cache();
-
-        // Same command should now apply again (not deduplicated)
-        universe.update_effect_commands(vec![(1u16, 200u8)]);
-        assert_eq!(universe.get_target_value(0), 200.0);
+    #[test]
+    fn an_effect_write_stops_a_dim_in_progress() {
+        // At the value but still dimming toward it: the effect snaps it.
+        let (universe, _) = new_universe();
+        universe.update_effect_commands(vec![(1u16, 100u8)]);
+        universe.update_channel_data(1, 100, true);
+        universe.update_effect_commands(vec![(1u16, 100u8)]);
+        assert_eq!(universe.rates.read()[0], 0.0);
     }
 
     #[test]

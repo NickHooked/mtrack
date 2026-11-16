@@ -13,28 +13,20 @@
 //
 
 use axum::{
-    extract::{
-        ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
-    },
+    extract::State,
     http::{header, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     routing::{any, get},
     Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use rust_embed::Embed;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, watch};
 use tonic_web::GrpcWebLayer;
 use tower::{Layer, ServiceExt};
 use tracing::{debug, error, info};
 
-use crate::controller::grpc::PlayerServer;
 use crate::player::Player;
-use crate::proto::player::v1::player_service_server::PlayerServiceServer;
-use crate::state::StateSnapshot;
 
 use super::state as ws_state;
 
@@ -47,6 +39,20 @@ fn process_video_preview_permit() -> Arc<tokio::sync::Semaphore> {
 #[folder = "src/webui/svelte/dist/"]
 #[allow_missing = true]
 struct WebUiAssets;
+
+/// The identity of the web UI this server serves — the hash of its frontend
+/// inputs, which the UI build writes to `build-info.json` and also compiles
+/// into the bundle. An open tab compares the two to know it is running an
+/// older UI than the server now serves. `None` when the UI was built without
+/// one (a plain `npm run build`) or there is no UI.
+pub(crate) fn ui_build() -> Option<String> {
+    let info = WebUiAssets::get("build-info.json")?;
+    let parsed: serde_json::Value = serde_json::from_slice(&info.data).ok()?;
+    parsed["ui_build"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
 
 /// Configuration for the web server (address + port).
 #[derive(Debug, Clone)]
@@ -72,27 +78,29 @@ impl Default for WebConfig {
 #[derive(Clone)]
 pub struct WebUiState {
     pub player: Arc<Player>,
-    pub state_rx: watch::Receiver<Arc<StateSnapshot>>,
-    pub broadcast_tx: broadcast::Sender<String>,
     /// Canonicalized path to the player config file (mtrack.yaml).
     pub config_path: PathBuf,
-    /// Canonicalized path to the songs directory.
-    /// codeql[rust/path-injection] Set once at startup from the player config file; not user-controlled.
-    pub songs_path: PathBuf,
-    /// Canonicalized path to the playlists directory (if configured).
-    pub playlists_dir: Option<PathBuf>,
-    /// Canonicalized path to the legacy playlist file (for backward compat).
-    pub legacy_playlist_path: Option<PathBuf>,
-    /// Shared waveform cache (sent to each WebSocket client on connect).
+    /// The hub's waveform cache.
     pub waveform_cache: ws_state::WaveformCache,
-    /// Canonicalized path to the profiles directory (if configured).
-    pub profiles_dir: Option<PathBuf>,
-    /// Active calibration session (at most one at a time).
-    pub(crate) calibration:
-        Arc<parking_lot::Mutex<Option<super::api::devices::CalibrationSession>>>,
     /// Process-wide single editor video-preview session permit.
     #[cfg_attr(not(feature = "video"), allow(dead_code))]
     pub(crate) video_preview_permit: Arc<tokio::sync::Semaphore>,
+}
+
+impl WebUiState {
+    /// The player's song sources as last resolved: read on each call, so a
+    /// runtime change to `songs:` or `playlists_dir:` reaches the web UI's
+    /// file access as it reaches every surface's reload.
+    fn song_sources(&self) -> crate::player::SongSources {
+        self.player.song_sources().unwrap_or_default()
+    }
+
+    /// Canonicalized path to the songs directory, from the player's song
+    /// sources, so the files the web UI edits are the ones it reloads.
+    /// codeql[rust/path-injection] Resolved from the player config file; not user-controlled.
+    pub fn songs_path(&self) -> PathBuf {
+        canonicalize_or_keep(self.song_sources().songs)
+    }
 }
 
 /// Canonicalizes a path, falling back to the original if canonicalization fails
@@ -104,30 +112,16 @@ fn canonicalize_or_keep(path: PathBuf) -> PathBuf {
 /// Parameters for constructing a [`WebUiState`].
 pub struct WebUiStateParams {
     pub player: Arc<Player>,
-    pub state_rx: watch::Receiver<Arc<StateSnapshot>>,
-    pub broadcast_tx: broadcast::Sender<String>,
     pub config_path: PathBuf,
-    pub songs_path: PathBuf,
-    pub playlists_dir: Option<PathBuf>,
-    pub legacy_playlist_path: Option<PathBuf>,
-    pub profiles_dir: Option<PathBuf>,
-    pub waveform_cache: ws_state::WaveformCache,
 }
 
 impl WebUiState {
     /// Creates a new WebUiState, canonicalizing all path fields.
     pub fn new(params: WebUiStateParams) -> Self {
         WebUiState {
+            waveform_cache: params.player.watch_hub().waveform_cache().clone(),
             player: params.player,
-            state_rx: params.state_rx,
-            broadcast_tx: params.broadcast_tx,
             config_path: canonicalize_or_keep(params.config_path),
-            songs_path: canonicalize_or_keep(params.songs_path),
-            playlists_dir: params.playlists_dir.map(canonicalize_or_keep),
-            legacy_playlist_path: params.legacy_playlist_path.map(canonicalize_or_keep),
-            profiles_dir: params.profiles_dir.map(canonicalize_or_keep),
-            waveform_cache: params.waveform_cache,
-            calibration: Arc::new(parking_lot::Mutex::new(None)),
             video_preview_permit: process_video_preview_permit(),
         }
     }
@@ -135,16 +129,11 @@ impl WebUiState {
 
 /// Handle to a running web UI server, returned so callers can shut it down.
 ///
-/// When dropped, the server and background tasks are aborted.
+/// When dropped, the server is aborted. The pollers that feed `Watch`
+/// are the player's hub's, started by whoever runs the player.
 pub struct WebUiHandle {
     _shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
-    playback_poller_handle: tokio::task::JoinHandle<()>,
-    state_poller_handle: tokio::task::JoinHandle<()>,
-    log_poller_handle: tokio::task::JoinHandle<()>,
-    waveform_poller_handle: tokio::task::JoinHandle<()>,
-    waveform_prewarmer_handle: tokio::task::JoinHandle<()>,
-    config_watcher_handle: tokio::task::JoinHandle<()>,
     /// The local address the server is bound to.
     #[allow(dead_code)]
     local_addr: std::net::SocketAddr,
@@ -161,22 +150,44 @@ impl WebUiHandle {
 impl Drop for WebUiHandle {
     fn drop(&mut self) {
         self.server_handle.abort();
-        self.playback_poller_handle.abort();
-        self.state_poller_handle.abort();
-        self.log_poller_handle.abort();
-        self.waveform_poller_handle.abort();
-        self.waveform_prewarmer_handle.abort();
-        self.config_watcher_handle.abort();
     }
 }
 
-/// Starts the unified web server with dashboard, gRPC-Web, and REST API.
+/// Starts the web UI, or, when it cannot start, unlocks the player. The
+/// web UI is how the lock is normally released (gRPC's and Bluetooth's
+/// `SetLock` aside), so a player left locked without one would refuse every
+/// gRPC and MCP config write for the whole run.
+pub async fn start_or_unlock(
+    webui_state: WebUiState,
+    address: String,
+    port: u16,
+) -> Option<WebUiHandle> {
+    let player = webui_state.player.clone();
+    match start(webui_state, address, port).await {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!("Failed to start web UI: {}", e);
+            player.set_locked(false);
+            info!(
+                "No web UI is running, so the player starts unlocked: there may be \
+                 nothing else to unlock it with"
+            );
+            None
+        }
+    }
+}
+
+/// Starts the unified web server with dashboard, gRPC-Web and file routes.
 ///
 /// The server serves:
 /// - `/` — Web UI SPA (dashboard, config editor, etc.)
-/// - `/ws` — WebSocket for real-time state streaming (playback, fixtures, logs)
 /// - `/player.v1.PlayerService/*` — gRPC-Web endpoints for player control
-/// - `/api/*` — REST endpoints for config/song/playlist/lighting CRUD
+/// - `/grpc.health.v1.Health/*` — the standard gRPC health service, over gRPC-Web
+/// - `/lighting-assets/*` — the lighting asset store (models, thumbnails)
+/// - `/uploads/{id}`, `/downloads/{id}` — file bytes (see `transfers`)
+///
+/// There is no REST API: nothing is served under `/api`, and a request for
+/// it gets what any unknown path gets.
 /// - Static assets from the embedded Svelte dist directory
 pub async fn start(
     webui_state: WebUiState,
@@ -185,39 +196,33 @@ pub async fn start(
 ) -> Result<WebUiHandle, Box<dyn std::error::Error + Send + Sync>> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Start background pollers that feed the broadcast channel
-    let playback_poller_handle = tokio::spawn(ws_state::playback_poller(
-        webui_state.player.clone(),
-        webui_state.broadcast_tx.clone(),
-    ));
-    let state_poller_handle = tokio::spawn(ws_state::state_poller(
-        webui_state.state_rx.clone(),
-        webui_state.broadcast_tx.clone(),
-    ));
-    let log_poller_handle = tokio::spawn(ws_state::log_poller(webui_state.broadcast_tx.clone()));
-    let waveform_poller_handle = tokio::spawn(ws_state::waveform_poller(
-        webui_state.player.clone(),
-        webui_state.broadcast_tx.clone(),
-        webui_state.waveform_cache.clone(),
-    ));
-    let waveform_prewarmer_handle = tokio::spawn(ws_state::waveform_prewarmer(
-        webui_state.player.clone(),
-        webui_state.waveform_cache.clone(),
-    ));
-    let config_watcher_handle = tokio::spawn(ws_state::config_watcher(
-        webui_state.player.clone(),
-        webui_state.broadcast_tx.clone(),
-    ));
-
     // Build the app router
-    let api_router = super::api::router().route_layer(axum::middleware::from_fn_with_state(
-        webui_state.clone(),
-        super::api::lock_guard,
-    ));
     let app = Router::new()
-        .route("/ws", get(ws_handler))
-        .nest("/api", api_router)
+        // File bytes (the id was issued under the lock policy) and the
+        // asset store's reads: not behind the lock, which the gRPC services
+        // enforce for themselves.
+        .merge(super::transfer_routes::router())
+        .merge(super::lighting_asset_route::router())
         .route("/player.v1.PlayerService/{method}", any(grpc_web_handler))
+        .route(
+            "/player.v1.ConfigService/{method}",
+            any(grpc_config_handler),
+        )
+        .route(
+            "/player.v1.LightingService/{method}",
+            any(grpc_lighting_handler),
+        )
+        .route("/grpc.health.v1.Health/{method}", any(grpc_health_handler))
+        .route(
+            "/api/songs/{name}/video-preview/ws",
+            get(super::video_preview::ws_handler),
+        )
+        .route(
+            "/api/video/capabilities",
+            get(|| async {
+                axum::Json(serde_json::json!({"video_preview": cfg!(feature = "video")}))
+            }),
+        )
         .route("/", get(index_handler))
         .fallback(get(static_handler))
         .with_state(webui_state);
@@ -246,12 +251,6 @@ pub async fn start(
     Ok(WebUiHandle {
         _shutdown_tx: shutdown_tx,
         server_handle,
-        playback_poller_handle,
-        state_poller_handle,
-        log_poller_handle,
-        waveform_poller_handle,
-        waveform_prewarmer_handle,
-        config_watcher_handle,
         local_addr,
     })
 }
@@ -275,13 +274,60 @@ async fn grpc_web_handler(
         method, uri, content_type
     );
 
-    let grpc_svc = match state.player.config_store() {
-        Some(store) => {
-            PlayerServiceServer::new(PlayerServer::with_config_store(state.player.clone(), store))
-        }
-        None => PlayerServiceServer::new(PlayerServer::new(state.player.clone())),
-    };
-    let grpc_web = GrpcWebLayer::new().layer(grpc_svc);
+    // The same service, behind the same lock, as native gRPC.
+    serve_grpc_web(
+        crate::controller::grpc::player_service(state.player.clone()),
+        request,
+    )
+    .await
+}
+
+/// Handles gRPC-Web requests for `ConfigService`: the editor pages' calls,
+/// behind the same lock as `PlayerService`.
+async fn grpc_config_handler(
+    State(state): State<WebUiState>,
+    request: axum::extract::Request,
+) -> Response {
+    serve_grpc_web(
+        crate::controller::grpc::config_service(state.player.clone()),
+        request,
+    )
+    .await
+}
+
+/// Handles gRPC-Web requests for `LightingService`: the lighting pages'
+/// calls, behind the same lock as `PlayerService`.
+async fn grpc_lighting_handler(
+    State(state): State<WebUiState>,
+    request: axum::extract::Request,
+) -> Response {
+    serve_grpc_web(
+        crate::controller::grpc::lighting_service(state.player.clone()),
+        request,
+    )
+    .await
+}
+
+/// Answers the standard `grpc.health.v1.Health` service over gRPC-Web. It is
+/// not behind the lock: a health check must work on a locked player.
+async fn grpc_health_handler(request: axum::extract::Request) -> Response {
+    serve_grpc_web(crate::controller::grpc::health_service().await, request).await
+}
+
+/// Serves one gRPC-Web request with `service`, adapting between axum and
+/// tonic body types.
+async fn serve_grpc_web<S>(service: S, request: axum::extract::Request) -> Response
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let grpc_web = GrpcWebLayer::new().layer(service);
 
     match grpc_web.oneshot(request).await {
         Ok(response) => {
@@ -303,12 +349,17 @@ async fn grpc_web_handler(
 /// Serves the embedded index.html for the SPA.
 async fn index_handler() -> impl IntoResponse {
     match WebUiAssets::get("index.html") {
-        Some(content) => Html(
-            std::str::from_utf8(content.data.as_ref())
-                .unwrap_or("<h1>Error loading web UI</h1>")
-                .to_string(),
+        // The shell names the content-hashed bundle, so it is never reused
+        // unchecked: a reload after an upgrade must fetch the new one.
+        Some(content) => (
+            [(header::CACHE_CONTROL, "no-cache")],
+            Html(
+                std::str::from_utf8(content.data.as_ref())
+                    .unwrap_or("<h1>Error loading web UI</h1>")
+                    .to_string(),
+            ),
         )
-        .into_response(),
+            .into_response(),
         None => (StatusCode::NOT_FOUND, "Web UI assets not found").into_response(),
     }
 }
@@ -332,6 +383,7 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
         if let Some(content) = WebUiAssets::get("index.html") {
             return Response::builder()
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-cache")
                 .body(axum::body::Body::from(content.data.to_vec()))
                 .unwrap();
         }
@@ -355,105 +407,8 @@ fn mime_type_for_path(path: &str) -> &'static str {
         Some("ico") => "image/x-icon",
         Some("woff") => "font/woff",
         Some("woff2") => "font/woff2",
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
-    }
-}
-
-/// Handles WebSocket upgrade requests for the dashboard.
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WebUiState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
-}
-
-/// Handles a single WebSocket connection for the dashboard.
-///
-/// Sends fixture metadata on connect, then streams playback, fixture state,
-/// and log messages from the broadcast channel.
-async fn handle_ws(socket: WebSocket, state: WebUiState) {
-    let (mut sender, mut receiver) = socket.split();
-
-    // Send metadata on connect (fixture tags, types for stage layout).
-    // Computed on-demand so it reflects the current DMX engine state
-    // (which may have changed via hot-reload since startup).
-    let metadata_json = match state.player.broadcast_handles() {
-        Some(handles) => ws_state::build_metadata_json(handles.lighting_system.as_ref()),
-        None => ws_state::build_metadata_json(None),
-    };
-    if sender
-        .send(Message::Text(metadata_json.into()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    // Send cached waveform for the current song on connect
-    let waveform_msg = {
-        state
-            .player
-            .get_playlist()
-            .current()
-            .and_then(|current_song| {
-                let song_name = current_song.name().to_string();
-                state
-                    .waveform_cache
-                    .lock()
-                    .get(&song_name)
-                    .cloned()
-                    .map(|track_peaks| {
-                        let tracks_json: Vec<serde_json::Value> = track_peaks
-                            .into_iter()
-                            .map(|(name, peaks)| {
-                                serde_json::json!({
-                                    "name": name,
-                                    "peaks": peaks,
-                                })
-                            })
-                            .collect();
-                        serde_json::json!({
-                            "type": "waveform",
-                            "song_name": song_name,
-                            "tracks": tracks_json,
-                        })
-                        .to_string()
-                    })
-            })
-    };
-    if let Some(msg) = waveform_msg {
-        if sender.send(Message::Text(msg.into())).await.is_err() {
-            return;
-        }
-    }
-
-    // Subscribe to state broadcasts
-    let mut rx = state.broadcast_tx.subscribe();
-
-    // Spawn a task to forward broadcasts to this client
-    let mut send_task = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    if sender.send(Message::Text(msg.into())).await.is_err() {
-                        break;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-
-    // Drain incoming messages (we only use server→client for now)
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            if let Message::Close(_) = msg {
-                break;
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = &mut send_task => { recv_task.abort(); }
-        _ = &mut recv_task => { send_task.abort(); }
     }
 }
 
@@ -529,67 +484,15 @@ mod test {
         assert_eq!(config.address, "127.0.0.1");
     }
 
-    use crate::player::PlayerDevices;
-    use crate::playlist;
-    use crate::songs::{Song, Songs};
-    use std::collections::HashMap;
-
     fn test_webui_state() -> (WebUiState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-
-        let config_path = dir.path().join("mtrack.yaml");
-        std::fs::write(&config_path, "songs: songs\n").unwrap();
-
-        let playlist_path = dir.path().join("playlist.yaml");
-        std::fs::write(&playlist_path, "songs:\n  - Song A\n").unwrap();
-
-        let songs_path = dir.path().join("songs");
-        std::fs::create_dir(&songs_path).unwrap();
-
-        let mut map = HashMap::new();
-        map.insert(
-            "Song A".to_string(),
-            Arc::new(Song::new_for_test("Song A", &["track1"])),
-        );
-        let songs = Arc::new(Songs::new(map));
-        let playlist_config = crate::config::Playlist::new(&["Song A".to_string()]);
-        let pl = playlist::Playlist::new("test", &playlist_config, songs.clone()).unwrap();
-        let devices = PlayerDevices {
-            audio: None,
-            mappings: None,
-            midi: None,
-            dmx_engine: None,
-            sample_engine: None,
-            trigger_engine: None,
-        };
-        let mut playlists = std::collections::HashMap::new();
-        playlists.insert(
-            "all_songs".to_string(),
-            playlist::from_songs(songs.clone()).unwrap(),
-        );
-        playlists.insert(pl.name().to_string(), pl);
-        let player = Arc::new(
-            crate::player::Player::new_with_devices(devices, playlists, "test".to_string(), None)
-                .unwrap(),
-        );
-
-        let (broadcast_tx, _) = broadcast::channel(16);
-        let (_state_tx, state_rx) =
-            watch::channel(Arc::new(crate::state::StateSnapshot::default()));
-
-        let state = WebUiState::new(WebUiStateParams {
-            player,
-            state_rx,
-            broadcast_tx,
-            config_path,
-            songs_path,
-            playlists_dir: None,
-            legacy_playlist_path: Some(playlist_path),
-            profiles_dir: None,
-            waveform_cache: ws_state::new_waveform_cache(),
-        });
-
-        (state, dir)
+        super::super::api::test_helpers::test_state_on_disk(
+            crate::testutil::player::memory_player(&["Song A"]).playlists(),
+            "test",
+            None,
+            None,
+            "songs:\n  - Song A\n",
+            false,
+        )
     }
 
     async fn start_test_server() -> (WebUiHandle, String, tempfile::TempDir) {
@@ -607,6 +510,8 @@ mod test {
 
         let resp = reqwest::get(&base_url).await.unwrap();
         assert_eq!(resp.status(), 200);
+        // A reload after an upgrade must not reuse the old shell.
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
         let body = resp.text().await.unwrap();
         assert!(body.contains("html"), "expected HTML response");
     }
@@ -620,6 +525,7 @@ mod test {
             .unwrap();
         // SPA routes should return index.html
         assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
     }
 
     #[tokio::test]
@@ -632,60 +538,592 @@ mod test {
         assert_eq!(resp.status(), 404);
     }
 
+    /// Nothing is served under `/api`: every route that was is answered as
+    /// any unknown path is, whether that is the SPA's shell (a path without
+    /// an extension) or a plain 404 (one with).
     #[tokio::test]
-    async fn server_api_config() {
+    async fn nothing_is_served_under_api() {
         let (_handle, base_url, _dir) = start_test_server().await;
-
-        let resp = reqwest::get(format!("{}/api/config", base_url))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body = resp.text().await.unwrap();
-        assert!(body.contains("songs:"));
-    }
-
-    #[tokio::test]
-    async fn server_api_playlist() {
-        let (_handle, base_url, _dir) = start_test_server().await;
-
-        let resp = reqwest::get(format!("{}/api/playlist", base_url))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[tokio::test]
-    async fn server_api_validate_config() {
-        let (_handle, base_url, _dir) = start_test_server().await;
-
         let client = reqwest::Client::new();
+
+        let ask = |method: &'static str, path: String| {
+            let client = client.clone();
+            let url = format!("{base_url}{path}");
+            async move {
+                let resp = client
+                    .request(method.parse().unwrap(), url)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let content_type = resp.headers().get("content-type").cloned();
+                (status, content_type, resp.bytes().await.unwrap())
+            }
+        };
+
+        for (method, path) in [
+            ("GET", "/api/songs"),
+            ("PUT", "/api/lock"),
+            ("GET", "/api/playlist"),
+            ("GET", "/api/playlists/all_songs"),
+            ("GET", "/api/config/samples"),
+            ("POST", "/api/songs/Song A/tracks"),
+            ("GET", "/api/lighting/show.light"),
+            ("GET", "/api/lighting/venues/Hall"),
+            ("GET", "/api/lighting/assets/abc/rig.json"),
+            ("GET", "/api/downloads/abc"),
+            ("PUT", "/api/uploads/abc"),
+            ("GET", "/api/ws"),
+        ] {
+            let at_api = ask(method, path.to_string()).await;
+            let elsewhere = ask(method, path.replacen("/api", "/nowhere", 1)).await;
+            assert_eq!(
+                at_api, elsewhere,
+                "{method} {path} is answered differently from an unknown path"
+            );
+            let json = at_api
+                .1
+                .as_ref()
+                .is_some_and(|t| t.to_str().unwrap().contains("json"));
+            assert!(!json, "{method} {path} still answers JSON");
+        }
+    }
+
+    /// The song list, the playlists and the lock are gRPC-Web calls on the
+    /// web port: each answers, and the lock toggle answers the lock as it now
+    /// stands.
+    #[tokio::test]
+    async fn the_song_list_playlists_and_lock_are_grpc_web_calls() {
+        use crate::proto::player::v1::{
+            ListPlaylistsRequest, ListPlaylistsResponse, ListSongsRequest, ListSongsResponse,
+            SetLockRequest, SetLockResponse,
+        };
+        use prost::Message;
+        let (_handle, base_url, _dir) = start_test_server().await;
+        let client = reqwest::Client::new();
+        let call = |method: &'static str, request: Vec<u8>| {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            async move {
+                let mut frame = vec![0u8];
+                frame.extend_from_slice(&(request.len() as u32).to_be_bytes());
+                frame.extend_from_slice(&request);
+                let resp = client
+                    .post(format!("{base_url}/player.v1.PlayerService/{method}"))
+                    .header("content-type", "application/grpc-web+proto")
+                    .header("x-grpc-web", "1")
+                    .body(frame)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "{method}");
+                let body = resp.bytes().await.unwrap().to_vec();
+                let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+                let trailers = String::from_utf8_lossy(&body[5 + len..]).to_string();
+                assert!(trailers.contains("grpc-status:0"), "{method}: {trailers}");
+                body[5..5 + len].to_vec()
+            }
+        };
+
+        let songs = ListSongsResponse::decode(
+            &call(
+                "ListSongs",
+                ListSongsRequest {
+                    start: 0,
+                    detailed: true,
+                }
+                .encode_to_vec(),
+            )
+            .await[..],
+        )
+        .unwrap();
+        assert_eq!(songs.total as usize, songs.songs.len());
+        let playlists = ListPlaylistsResponse::decode(
+            &call(
+                "ListPlaylists",
+                ListPlaylistsRequest { detailed: true }.encode_to_vec(),
+            )
+            .await[..],
+        )
+        .unwrap();
+        assert!(playlists.names.contains(&"all_songs".to_string()));
+        assert_eq!(playlists.playlists.len(), playlists.names.len());
+        for locked in [true, false] {
+            let answer = SetLockResponse::decode(
+                &call("SetLock", SetLockRequest { locked }.encode_to_vec()).await[..],
+            )
+            .unwrap();
+            assert_eq!(answer.locked, locked);
+        }
+    }
+
+    /// `ConfigService` is served by the web port's gRPC-Web beside
+    /// `PlayerService`, behind the same lock: a write is refused while the
+    /// player is locked, a read reaches its handler (which has no profiles
+    /// directory to read).
+    #[tokio::test]
+    async fn config_service_is_a_grpc_web_service_behind_the_lock() {
+        use prost::Message;
+        use tonic_health::pb::{health_check_response::ServingStatus, HealthCheckRequest};
+        let (_handle, base_url, _dir) = start_test_server().await;
+        let client = reqwest::Client::new();
+        let frame = |message: Vec<u8>| {
+            let mut frame = vec![0u8];
+            frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&message);
+            frame
+        };
+        // Headers and body as one lowercase text: a refusal is in the
+        // headers or the trailer frame.
+        let call = |method: &'static str, message: Vec<u8>| {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let body = frame(message);
+            async move {
+                let resp = client
+                    .post(format!("{base_url}/player.v1.ConfigService/{method}"))
+                    .header("content-type", "application/grpc-web+proto")
+                    .header("x-grpc-web", "1")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "{method}");
+                let headers = format!("{:?}", resp.headers()).to_lowercase();
+                let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_lowercase();
+                format!("{headers} {body}")
+            }
+        };
+
+        // The message is percent-encoded in the header.
+        assert!(
+            call(
+                "UpdateSamples",
+                crate::proto::player::v1::UpdateSamplesRequest {
+                    samples_json: "{}".to_string(),
+                    max_sample_voices: None,
+                    expected_checksum: String::new(),
+                }
+                .encode_to_vec()
+            )
+            .await
+            .contains("locked"),
+            "a write while locked"
+        );
+        // FAILED_PRECONDITION is status 9, for the lock and for no profiles
+        // directory alike: the message tells them apart.
+        let read = call(
+            "ListProfileFiles",
+            crate::proto::player::v1::ListProfileFilesRequest {}.encode_to_vec(),
+        )
+        .await;
+        assert!(
+            read.contains("no%20profiles%20directory%20configured") && !read.contains("locked"),
+            "{read}"
+        );
+
+        // Served as such.
+        let msg = HealthCheckRequest {
+            service: "player.v1.ConfigService".to_string(),
+        }
+        .encode_to_vec();
         let resp = client
-            .post(format!("{}/api/config/validate", base_url))
-            .body("songs: songs\n")
+            .post(format!("{base_url}/grpc.health.v1.Health/Check"))
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(frame(msg))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        let body = resp.bytes().await.unwrap();
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        let answer = tonic_health::pb::HealthCheckResponse::decode(&body[5..5 + len]).unwrap();
+        assert_eq!(answer.status, ServingStatus::Serving as i32);
     }
 
+    /// `LightingService` is served by the web port's gRPC-Web beside the
+    /// other services, behind the same lock: a write is refused while the
+    /// player is locked, a read reaches its handler.
     #[tokio::test]
-    async fn server_api_songs_empty() {
+    async fn lighting_service_is_a_grpc_web_service_behind_the_lock() {
+        use prost::Message;
+        use tonic_health::pb::{health_check_response::ServingStatus, HealthCheckRequest};
         let (_handle, base_url, _dir) = start_test_server().await;
+        let client = reqwest::Client::new();
+        let frame = |message: Vec<u8>| {
+            let mut frame = vec![0u8];
+            frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&message);
+            frame
+        };
+        // Headers and body as one lowercase text: a refusal is in the
+        // headers or the trailer frame.
+        let call = |method: &'static str, message: Vec<u8>| {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let body = frame(message);
+            async move {
+                let resp = client
+                    .post(format!("{base_url}/player.v1.LightingService/{method}"))
+                    .header("content-type", "application/grpc-web+proto")
+                    .header("x-grpc-web", "1")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "{method}");
+                let headers = format!("{:?}", resp.headers()).to_lowercase();
+                let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_lowercase();
+                format!("{headers} {body}")
+            }
+        };
+        use crate::proto::player::v1 as pb;
 
-        let resp = reqwest::get(format!("{}/api/songs", base_url))
+        // The test server's player is locked: a write is refused before its
+        // handler, and the reads and the validation are not.
+        assert!(
+            call(
+                "SaveLightShow",
+                pb::SaveLightShowRequest {
+                    name: "a.light".to_string(),
+                    source: String::new(),
+                }
+                .encode_to_vec()
+            )
+            .await
+            .contains("locked"),
+            "a write while locked"
+        );
+        assert!(
+            call(
+                "StartFixtureTest",
+                pb::StartFixtureTestRequest::default().encode_to_vec()
+            )
+            .await
+            .contains("locked"),
+            "a fixture test while locked"
+        );
+        // The fixture types: the writes are refused, the reads are not.
+        for (method, message) in [
+            (
+                "SaveFixtureType",
+                pb::SaveFixtureTypeRequest::default().encode_to_vec(),
+            ),
+            (
+                "DeleteFixtureType",
+                pb::DeleteFixtureTypeRequest::default().encode_to_vec(),
+            ),
+            (
+                "SaveFixtureTypeSettings",
+                pb::SaveFixtureTypeSettingsRequest::default().encode_to_vec(),
+            ),
+        ] {
+            assert!(
+                call(method, message).await.contains("locked"),
+                "{method} while locked"
+            );
+        }
+        let missing = call(
+            "GetFixtureType",
+            pb::GetFixtureTypeRequest {
+                name: "Nowhere".to_string(),
+                dir: None,
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        // This server's player has no config store: the call reached its
+        // handler, which says so, where a locked one never gets there.
+        assert!(
+            missing.contains("config%20store%20not%20available") && !missing.contains("locked"),
+            "{missing}"
+        );
+        let listed = call(
+            "ListFixtureTypes",
+            pb::ListFixtureTypesRequest::default().encode_to_vec(),
+        )
+        .await;
+        assert!(!listed.contains("locked"), "{listed}");
+        // The venues: the writes are refused, the reads are not.
+        for (method, message) in [
+            ("SaveVenue", pb::SaveVenueRequest::default().encode_to_vec()),
+            (
+                "DeleteVenue",
+                pb::DeleteVenueRequest::default().encode_to_vec(),
+            ),
+            (
+                "AddVenueAimPoints",
+                pb::AddVenueAimPointsRequest::default().encode_to_vec(),
+            ),
+            (
+                "KeepMvrExport",
+                pb::KeepMvrExportRequest::default().encode_to_vec(),
+            ),
+        ] {
+            assert!(
+                call(method, message).await.contains("locked"),
+                "{method} while locked"
+            );
+        }
+        for (method, message) in [
+            (
+                "ListVenues",
+                pb::ListVenuesRequest::default().encode_to_vec(),
+            ),
+            ("GetVenue", pb::GetVenueRequest::default().encode_to_vec()),
+            (
+                "GetVenuePatch",
+                pb::GetVenuePatchRequest::default().encode_to_vec(),
+            ),
+            (
+                "GetVenueScene",
+                pb::GetVenueSceneRequest::default().encode_to_vec(),
+            ),
+            (
+                "GetMvrExportSummary",
+                pb::GetMvrExportSummaryRequest::default().encode_to_vec(),
+            ),
+        ] {
+            let read = call(method, message).await;
+            // This server's player has no config store, or the name is
+            // refused first: the call reached its handler, not the lock.
+            assert!(!read.contains("locked"), "{method}: {read}");
+        }
+        // FAILED_PRECONDITION (9) is for the lock and for a refusal alike:
+        // the message tells them apart.
+        let read = call(
+            "GetLightShow",
+            pb::GetLightShowRequest {
+                name: "nowhere.light".to_string(),
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert!(
+            read.contains("lighting%20file%20not%20found") && !read.contains("locked"),
+            "{read}"
+        );
+        let validated = call(
+            "ValidateLightShow",
+            pb::ValidateLightShowRequest {
+                source: "invalid {{{".to_string(),
+                song: None,
+                file: None,
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        assert!(
+            validated.contains("grpc-status:0") || !validated.contains("locked"),
+            "{validated}"
+        );
+
+        // Served as such.
+        let msg = HealthCheckRequest {
+            service: "player.v1.LightingService".to_string(),
+        }
+        .encode_to_vec();
+        let resp = client
+            .post(format!("{base_url}/grpc.health.v1.Health/Check"))
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(frame(msg))
+            .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        let body = resp.bytes().await.unwrap();
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        let answer = tonic_health::pb::HealthCheckResponse::decode(&body[5..5 + len]).unwrap();
+        assert_eq!(answer.status, ServingStatus::Serving as i32);
     }
 
+    /// File bytes: `BeginUpload` over gRPC-Web answers an id and a path, the
+    /// bytes go to `PUT <path>` (past the lock, over the default body
+    /// limit), and the claiming call takes them; a staged download is
+    /// fetched by `GET`. The web server serves both.
     #[tokio::test]
-    async fn server_api_lighting_empty() {
-        let (_handle, base_url, _dir) = start_test_server().await;
+    async fn file_bytes_travel_by_put_and_get_past_the_lock() {
+        use crate::proto::player::v1 as pb;
+        use prost::Message;
+        let (state, _dir) = test_webui_state();
+        let player = state.player.clone();
+        assert!(player.is_locked());
+        let handle = start(state, "127.0.0.1".to_string(), 0).await.unwrap();
+        let base_url = format!("http://{}", handle.local_addr());
+        let client = reqwest::Client::new();
+        let frame = |message: Vec<u8>| {
+            let mut frame = vec![0u8];
+            frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&message);
+            frame
+        };
+        let call = |service: &'static str, method: &'static str, message: Vec<u8>| {
+            let client = client.clone();
+            let base_url = base_url.clone();
+            let body = frame(message);
+            async move {
+                let resp = client
+                    .post(format!("{base_url}/player.v1.{service}/{method}"))
+                    .header("content-type", "application/grpc-web+proto")
+                    .header("x-grpc-web", "1")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200, "{method}");
+                let headers = format!("{:?}", resp.headers()).to_lowercase();
+                let bytes = resp.bytes().await.unwrap();
+                (headers, bytes)
+            }
+        };
+        let begin = |purpose: pb::UploadPurpose, size: u64| {
+            pb::BeginUploadRequest {
+                purpose: purpose.into(),
+                file_name: "Kellys.mvr".to_string(),
+                size: Some(size),
+                song: None,
+            }
+            .encode_to_vec()
+        };
 
-        let resp = reqwest::get(format!("{}/api/lighting", base_url))
+        // Locked: only the inspection may be announced.
+        let (headers, body) = call(
+            "ConfigService",
+            "BeginUpload",
+            begin(pb::UploadPurpose::MvrImport, 6),
+        )
+        .await;
+        assert!(
+            format!("{headers} {}", String::from_utf8_lossy(&body))
+                .to_lowercase()
+                .contains("locked"),
+            "an import announced while locked"
+        );
+        let (headers, body) = call(
+            "ConfigService",
+            "BeginUpload",
+            begin(pb::UploadPurpose::MvrInspect, 6),
+        )
+        .await;
+        assert!(!headers.contains("grpc-status: 9"), "{headers}");
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        let begun = pb::BeginUploadResponse::decode(&body[5..5 + len]).unwrap();
+        assert_eq!(begun.path, format!("/uploads/{}", begun.upload_id));
+
+        // The bytes: not behind the lock.
+        let unknown = client
+            .put(format!(
+                "{base_url}/uploads/0123456789abcdef0123456789abcdef"
+            ))
+            .body("abcdef")
+            .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        assert_eq!(unknown.status(), 404);
+        let too_long = client
+            .put(format!("{base_url}{}", begun.path))
+            .body("abcdefg")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(too_long.status(), 413);
+        // Spent: the announcement is gone with the refused bytes.
+        let again = client
+            .put(format!("{base_url}{}", begun.path))
+            .body("abcdef")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 404);
+
+        let (_, body) = call(
+            "ConfigService",
+            "BeginUpload",
+            begin(pb::UploadPurpose::MvrInspect, 6),
+        )
+        .await;
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        let begun = pb::BeginUploadResponse::decode(&body[5..5 + len]).unwrap();
+        let put = client
+            .put(format!("{base_url}{}", begun.path))
+            .body("abcdef")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 204);
+        let second = client
+            .put(format!("{base_url}{}", begun.path))
+            .body("abcdef")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), 409);
+        // The claim reaches its handler (this server has no config store to
+        // inspect against) and spends the upload.
+        let (headers, body) = call(
+            "LightingService",
+            "InspectMvr",
+            pb::InspectMvrRequest {
+                upload_id: begun.upload_id.clone(),
+                options: None,
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        let said = format!("{headers} {}", String::from_utf8_lossy(&body)).to_lowercase();
+        assert!(said.contains("config%20store%20not%20available"), "{said}");
+        assert_eq!(
+            std::fs::read_dir(player.transfers().staging_dir().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+
+        // A download: any number of times, as an attachment.
+        let id = player
+            .transfers()
+            .stage_download("kellys.mvr".to_string(), b"archive")
+            .unwrap();
+        for _ in 0..2 {
+            let got = client
+                .get(format!("{base_url}/downloads/{id}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(got.status(), 200);
+            assert_eq!(got.headers()["content-type"], "application/octet-stream");
+            assert_eq!(
+                got.headers()["content-disposition"],
+                "attachment; filename=\"kellys.mvr\""
+            );
+            assert_eq!(got.bytes().await.unwrap(), "archive");
+        }
+        drop(handle);
+    }
+
+    /// The asset store is served at `/lighting-assets/`, on a locked player
+    /// too (a read), and not at the old place under `/api`.
+    #[tokio::test]
+    async fn lighting_assets_are_served_while_locked_and_not_under_api() {
+        let (state, dir) = test_webui_state();
+        let store = dir.path().join("lighting/.cache/assets/abc");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("rig.json"), "{\"version\":1}").unwrap();
+        state.player.set_locked(true);
+        let handle = start(state, "127.0.0.1".to_string(), 0).await.unwrap();
+        let base_url = format!("http://{}", handle.local_addr());
+
+        let got = reqwest::get(format!("{base_url}/lighting-assets/abc/rig.json"))
+            .await
+            .unwrap();
+        assert_eq!(got.status(), 200);
+        assert_eq!(got.headers()["content-type"], "application/json");
+        assert_eq!(got.text().await.unwrap(), "{\"version\":1}");
+
+        let old = reqwest::get(format!("{base_url}/api/lighting/assets/abc/rig.json"))
+            .await
+            .unwrap();
+        assert_eq!(old.status(), 404);
     }
 
     #[tokio::test]
@@ -784,6 +1222,102 @@ mod test {
             "unexpected status: {}",
             status
         );
+    }
+
+    /// The standard health service answers over gRPC-Web, on a locked
+    /// player, for the server as a whole.
+    #[tokio::test]
+    async fn the_health_service_answers_over_grpc_web_while_locked() {
+        use prost::Message;
+        use tonic_health::pb::{health_check_response::ServingStatus, HealthCheckRequest};
+        let (_handle, base_url, _dir) = start_test_server().await;
+
+        for (service, expected) in [
+            ("", ServingStatus::Serving),
+            ("player.v1.PlayerService", ServingStatus::Serving),
+        ] {
+            let msg = HealthCheckRequest {
+                service: service.to_string(),
+            }
+            .encode_to_vec();
+            let mut frame = vec![0u8];
+            frame.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&msg);
+
+            let resp = reqwest::Client::new()
+                .post(format!("{base_url}/grpc.health.v1.Health/Check"))
+                .header("content-type", "application/grpc-web+proto")
+                .header("x-grpc-web", "1")
+                .body(frame)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body = resp.bytes().await.unwrap();
+            // The first frame is the message: flag 0, a 4 byte length, then
+            // the response. A trailers frame (flag 0x80) follows it.
+            assert_eq!(body[0], 0, "{service:?}");
+            let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+            let answer = tonic_health::pb::HealthCheckResponse::decode(&body[5..5 + len]).unwrap();
+            assert_eq!(answer.status, expected as i32, "{service:?}");
+            let trailers = String::from_utf8_lossy(&body[5 + len..]).to_lowercase();
+            assert!(trailers.contains("grpc-status:0"), "{trailers}");
+        }
+    }
+
+    /// Only the web UI can release the lock, so a player whose web UI
+    /// cannot start is left unlocked rather than refusing every write.
+    #[tokio::test]
+    async fn a_web_ui_that_cannot_start_leaves_the_player_unlocked() {
+        let (state, _dir) = test_webui_state();
+        let player = state.player.clone();
+        assert!(player.is_locked());
+        assert!(start_or_unlock(state, "not-an-ip".to_string(), 0)
+            .await
+            .is_none());
+        assert!(!player.is_locked());
+
+        let (state, _dir) = test_webui_state();
+        let player = state.player.clone();
+        let _handle = start_or_unlock(state, "127.0.0.1".to_string(), 0)
+            .await
+            .expect("server should start");
+        assert!(player.is_locked(), "a running web UI keeps the lock");
+    }
+
+    /// A config write over the web UI's gRPC-Web route is refused while
+    /// locked, the same as over native gRPC.
+    #[tokio::test]
+    async fn a_grpc_web_config_write_is_refused_while_locked() {
+        use prost::Message;
+        let (_handle, base_url, _dir) = start_test_server().await;
+        let msg = crate::proto::player::v1::UpdateAudioRequest {
+            audio_json: String::new(),
+            expected_checksum: String::new(),
+        }
+        .encode_to_vec();
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&msg);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base_url}/player.v1.PlayerService/UpdateAudio"))
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(frame)
+            .send()
+            .await
+            .unwrap();
+        let headers = format!("{:?}", resp.headers()).to_lowercase();
+        let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).to_lowercase();
+        let all = format!("{headers} {body}");
+        // FAILED_PRECONDITION is status 9, in the headers or the trailer frame.
+        assert!(
+            all.contains("\"grpc-status\": \"9\"") || all.contains("grpc-status:9"),
+            "{all}"
+        );
+        assert!(all.contains("locked"), "{all}");
     }
 
     #[tokio::test]
@@ -944,8 +1478,24 @@ mod test {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
                 let request_id = value["request_id"].as_str().unwrap();
                 assert_eq!(value["type"], "error", "unexpected response: {value}");
-                assert_eq!(value["state"], "stopped", "unexpected response: {value}");
-                correlated.insert(request_id.to_string());
+                // A burst may fill the bounded actor queue before it drains.
+                // Both rejections must remain correlated and must not deadlock.
+                assert!(
+                    value["state"] == "stopped"
+                        || (value["state"] == "busy"
+                            && value["error"] == "video preview command queue is full"),
+                    "unexpected response: {value}"
+                );
+                let index: usize = request_id
+                    .strip_prefix("pipeline-")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(index < COMMANDS, "unexpected request id: {request_id}");
+                assert!(
+                    correlated.insert(request_id.to_string()),
+                    "duplicate response"
+                );
             }
         }
         assert_eq!(correlated.len(), COMMANDS);
@@ -955,7 +1505,9 @@ mod test {
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial(video_preview_global)]
     async fn active_player_excludes_preview_start_play_and_seek_but_allows_pause_and_stop() {
+        use crate::player::PlayerDevices;
         use futures_util::{SinkExt, StreamExt};
+        use std::collections::HashMap;
 
         let song_dir = tempfile::tempdir().unwrap();
         crate::testutil::write_wav(
@@ -998,7 +1550,7 @@ mod test {
         let mut playlists = HashMap::new();
         playlists.insert(
             "all_songs".to_string(),
-            playlist::from_songs(songs).unwrap(),
+            crate::playlist::from_songs(songs).unwrap(),
         );
         state.player = Arc::new(
             crate::player::Player::new_with_devices(
@@ -1247,104 +1799,96 @@ mod test {
         assert_eq!(response["state"], "busy");
     }
 
+    /// One frame of a gRPC-Web response body: the message of the first
+    /// data frame in `buffer`, taken off it, once it is all there.
+    fn take_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+        if buffer.len() < 5 {
+            return None;
+        }
+        let len = u32::from_be_bytes(buffer[1..5].try_into().unwrap()) as usize;
+        if buffer.len() < 5 + len {
+            return None;
+        }
+        assert_eq!(buffer[0], 0, "a data frame");
+        let message = buffer[5..5 + len].to_vec();
+        buffer.drain(..5 + len);
+        Some(message)
+    }
+
+    /// `Watch` streams over gRPC-Web from the web server's own port, on a
+    /// locked player, from the player's hub, and with no gRPC
+    /// controller anywhere.
     #[tokio::test]
-    async fn server_websocket_receives_waveform() {
-        use futures_util::StreamExt;
+    async fn watch_streams_over_grpc_web_while_locked() {
+        use crate::proto::player::v1::{watch_event::Event, WatchEvent, WatchRequest, WatchTopic};
+        use prost::Message;
 
         let (state, _dir) = test_webui_state();
-        // Pre-populate waveform cache for current song "Song A"
-        state.waveform_cache.lock().insert(
-            "Song A".to_string(),
-            vec![("track1".to_string(), vec![0.5, 0.8, 0.3])],
-        );
+        assert!(state.player.is_locked());
+        let sender = state.player.watch_hub().sender();
         let handle = start(state, "127.0.0.1".to_string(), 0)
             .await
             .expect("server should start");
-        let addr = handle.local_addr();
-        let ws_url = format!("ws://{}/ws", addr);
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .expect("WebSocket connect failed");
-
-        let (_, mut read) = ws_stream.split();
-
-        // First message: metadata
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
-            .await
-            .unwrap();
-
-        // Second message: waveform (from pre-populated cache)
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
-            .await
-            .expect("timed out waiting for waveform message")
-            .expect("stream ended")
-            .expect("WS error");
-
-        let text = msg.into_text().expect("expected text message");
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["type"], "waveform");
-        assert_eq!(parsed["song_name"], "Song A");
-        assert!(parsed["tracks"].is_array());
-        let tracks = parsed["tracks"].as_array().unwrap();
-        assert_eq!(tracks[0]["name"], "track1");
-    }
-
-    #[tokio::test]
-    async fn server_websocket_receives_metadata() {
-        use futures_util::StreamExt;
-
-        let (handle, _, _dir) = start_test_server().await;
-        let addr = handle.local_addr();
-        let ws_url = format!("ws://{}/ws", addr);
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .expect("WebSocket connect failed");
-
-        let (_, mut read) = ws_stream.split();
-
-        // First message should be the metadata JSON
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
-            .await
-            .expect("timed out waiting for WS message")
-            .expect("stream ended")
-            .expect("WS error");
-
-        let text = msg.into_text().expect("expected text message");
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["type"], "metadata");
-    }
-
-    #[tokio::test]
-    async fn server_websocket_receives_playback() {
-        use futures_util::StreamExt;
-
-        let (handle, _, _dir) = start_test_server().await;
-        let addr = handle.local_addr();
-        let ws_url = format!("ws://{}/ws", addr);
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-            .await
-            .expect("WebSocket connect failed");
-
-        let (_, mut read) = ws_stream.split();
-
-        // Skip the metadata message
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
+        let request = WatchRequest {
+            topics: vec![WatchTopic::Hardware as i32, WatchTopic::Reload as i32],
+        }
+        .encode_to_vec();
+        let mut frame = vec![0u8];
+        frame.extend_from_slice(&(request.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&request);
+        let mut response = reqwest::Client::new()
+            .post(format!(
+                "http://{}/player.v1.PlayerService/Watch",
+                handle.local_addr()
+            ))
+            .header("content-type", "application/grpc-web+proto")
+            .header("x-grpc-web", "1")
+            .body(frame)
+            .send()
             .await
             .unwrap();
+        assert_eq!(response.status(), 200);
 
-        // Next messages should include a playback update (poller runs at 200ms)
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), read.next())
-            .await
-            .expect("timed out waiting for playback message")
-            .expect("stream ended")
-            .expect("WS error");
+        let mut buffer = Vec::new();
+        let mut next_event = async |buffer: &mut Vec<u8>| -> Event {
+            loop {
+                if let Some(message) = take_frame(buffer) {
+                    return WatchEvent::decode(message.as_slice())
+                        .unwrap()
+                        .event
+                        .expect("an event");
+                }
+                let chunk = tokio::time::timeout(crate::testutil::PATIENCE, response.chunk())
+                    .await
+                    .expect("the stream said nothing")
+                    .unwrap()
+                    .expect("the stream ended");
+                buffer.extend_from_slice(&chunk);
+            }
+        };
 
-        let text = msg.into_text().expect("expected text message");
-        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        // Could be playback, state, or waveform — just verify it's valid JSON
-        assert!(parsed["type"].is_string());
+        let Event::Hardware(hardware) = next_event(&mut buffer).await else {
+            panic!("the hardware status comes first");
+        };
+        assert!(hardware.locked);
+        assert_eq!(hardware.build.unwrap().version, crate::build_info::VERSION);
+        assert_eq!(
+            hardware.hardware.unwrap().audio.unwrap().status,
+            "not_connected"
+        );
+
+        // The hub's news arrives on the same stream.
+        sender
+            .send(crate::webui::wire::messages::SocketMessage::Reload(
+                crate::webui::wire::messages::ShowReload::Error {
+                    error: "boom".to_string(),
+                },
+            ))
+            .expect("the stream is a reader");
+        let Event::Reload(reload) = next_event(&mut buffer).await else {
+            panic!("a reload");
+        };
+        assert_eq!(reload.error.as_deref(), Some("boom"));
     }
 }

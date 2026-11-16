@@ -98,6 +98,7 @@ const WORLD_LEVEL: &[&str] = &[
     "malformed_show_is_rejected",
     "song_lighting_produces_cues",
     "lighting_effects_activate_during_playback",
+    "a_colour_is_the_same_colour_on_an_rgb_par_and_a_cmy_head",
 ];
 
 /// Whether this check's negative control only substitutes the asserted value.
@@ -434,6 +435,35 @@ pub fn all() -> Vec<Check> {
              every cell taking a turn, while the bed's dimmer stays up; the same chase\n  \
              without `per: cell` lights the whole bar at once.",
             dmx_output::a_per_cell_chase_runs_along_the_bar
+        ),
+        entry!(
+            "dmx-output",
+            "dimming_below_leaves_the_colour_above_alone",
+            "Dimming on a layer must stop at that layer: red on the foreground over a 25%\n  \
+             background plays at full on a dimmer-channel par and an RGB-only par alike,\n  \
+             while a level on the colour's own layer still dims it (#752).",
+            dmx_output::dimming_below_leaves_the_colour_above_alone
+        ),
+        entry!(
+            "dmx-output",
+            "palettes_recolour_the_show_on_the_wire",
+            "A show's palette slot must play its default, a song's palette must recolour\n  \
+             it, and a playlist entry's palette must win over the song's.",
+            dmx_output::palettes_recolour_the_show_on_the_wire
+        ),
+        entry!(
+            "dmx-output",
+            "a_configured_fourth_layer_plays_on_top",
+            "A player configured with four layers must play a show that uses the fourth,\n  \
+             with the fourth above the third.",
+            dmx_output::a_configured_fourth_layer_plays_on_top
+        ),
+        entry!(
+            "dmx-output",
+            "a_colour_is_the_same_colour_on_an_rgb_par_and_a_cmy_head",
+            "A colour must look the same on an RGB par and a CMY head: the head's flags\n  \
+             exactly the complement of the par's bytes, for hex, named and cmy() colours.",
+            dmx_output::a_colour_is_the_same_colour_on_an_rgb_par_and_a_cmy_head
         ),
     ]
 }

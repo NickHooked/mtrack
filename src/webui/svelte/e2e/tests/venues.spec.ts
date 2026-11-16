@@ -13,17 +13,13 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { LightingService } from "../../src/gen/player/v1/player_pb";
+import { venueListReply } from "../support/lighting-rpc";
+import { mockRpc } from "../support/rpc";
 
 test.describe("Venues Management", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto("/#/config");
-    await page.locator(".profile-row", { hasText: "test-host" }).click();
-    await expect(page.getByRole("button", { name: "Back" })).toBeVisible();
-    await page.locator(".tab", { hasText: "Lighting" }).click();
-    await expect(page.locator(".tab.active")).toContainText("Lighting");
-    await page.getByRole("button", { name: "Enable Lighting" }).click();
-    // Navigate to Venues sub-tab.
-    await page.locator(".sub-tab", { hasText: "Venues" }).click();
+    await page.goto("/#/lighting/venues");
   });
 
   test("a venue file that will not parse is named, and the rest still list", async ({
@@ -33,24 +29,28 @@ test.describe("Venues Management", () => {
     // parse error, and the loader used to abort the whole directory on the
     // first one — so a single stale file emptied the list with nothing to say
     // why, and re-saving through this very UI was the migration route.
-    await page.route("**/api/lighting/venues*", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          venues: {
-            "test-venue": { name: "test-venue", fixtures: {} },
+    const rpc = await mockRpc(page);
+    rpc.unary(
+      LightingService.method.listVenues,
+      venueListReply({
+        venues: {
+          "test-venue": {
+            name: "test-venue",
+            fixtures: {},
+            focus_points: {},
+            source: null,
           },
-          errors: [
-            {
-              file: "legacy.light",
-              error:
-                "venue group `wash` is no longer supported. Tag the fixtures instead",
-            },
-          ],
-        }),
-      });
-    });
+        },
+        owners: {},
+        errors: [
+          {
+            file: "legacy.light",
+            error:
+              "venue group `wash` is no longer supported. Tag the fixtures instead",
+          },
+        ],
+      }),
+    );
     // Re-fetch through the panel's own Refresh rather than reloading the page,
     // which would discard the navigation `beforeEach` performed.
     await page.getByRole("button", { name: "Refresh" }).first().click();
@@ -80,15 +80,26 @@ test.describe("Venues Management", () => {
     await expect(page.locator("#venue-name")).toHaveValue("");
   });
 
-  test("clicking venue opens editor form", async ({ page }) => {
-    await page.locator(".item-card").first().click();
+  test("clicking a venue selects it for the plot and does not open the editor", async ({
+    page,
+  }) => {
+    const card = page.locator(".item-card").first();
+    await card.click();
+    await expect(card).toHaveClass(/item-card--selected/);
+    await expect(page.locator(".editor-form")).not.toBeVisible();
+  });
+
+  test("the Edit button opens the editor form", async ({ page }) => {
+    await page.locator('[data-testid^="venue-edit-"]').first().click();
     await expect(page.locator(".editor-form")).toBeVisible();
     await expect(page.locator("#venue-name")).toBeVisible();
   });
 
   test("Add Fixture adds a fixture row", async ({ page }) => {
-    await page.locator(".item-card").first().click();
+    await page.locator('[data-testid^="venue-edit-"]').first().click();
     await expect(page.locator(".editor-form")).toBeVisible();
+    // Count the rows once they are there, not while the form is still filling.
+    await expect(page.locator(".venue-fixture-card").first()).toBeVisible();
     const initialCount = await page.locator(".venue-fixture-card").count();
     await page.getByRole("button", { name: "Add Fixture" }).click();
     await expect(page.locator(".venue-fixture-card")).toHaveCount(
@@ -96,13 +107,12 @@ test.describe("Venues Management", () => {
     );
   });
 
-  test("saving venue calls PUT API", async ({ page }) => {
-    await page.locator(".item-card").first().click();
+  test("saving venue calls SaveVenue", async ({ page }) => {
+    await page.locator('[data-testid^="venue-edit-"]').first().click();
     await expect(page.locator(".editor-form")).toBeVisible();
 
-    const requestPromise = page.waitForRequest(
-      (req) =>
-        req.url().includes("/api/lighting/venues/") && req.method() === "PUT",
+    const requestPromise = page.waitForRequest((req) =>
+      req.url().includes("/player.v1.LightingService/SaveVenue"),
     );
     await page
       .locator(".editor-form")
@@ -112,7 +122,7 @@ test.describe("Venues Management", () => {
   });
 
   test("cancel button closes venue editor", async ({ page }) => {
-    await page.locator(".item-card").first().click();
+    await page.locator('[data-testid^="venue-edit-"]').first().click();
     await expect(page.locator(".editor-form")).toBeVisible();
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(page.locator(".editor-form")).not.toBeVisible();

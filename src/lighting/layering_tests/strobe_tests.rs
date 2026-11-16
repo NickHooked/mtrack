@@ -38,7 +38,7 @@ fn test_effect_layering_with_strobe() {
             duration: Duration::from_secs(10),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -50,7 +50,7 @@ fn test_effect_layering_with_strobe() {
             duration: Duration::from_secs(10),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Foreground,
+        EffectLayer::FOREGROUND,
         BlendMode::Overlay,
     );
 
@@ -65,12 +65,12 @@ fn test_effect_layering_with_strobe() {
     // At strobe peak (should be on)
     let commands = engine.update(Duration::from_millis(250), None).unwrap(); // 1/4 cycle
     let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 4).unwrap();
-    assert_eq!(strobe_cmd.value, 12); // Should be 1.0Hz / 20.0Hz * 255 = 12.75, rounded to 12
+    assert_eq!(strobe_cmd.value, 13); // Should be 1.0Hz / 20.0Hz * 255 = 12.75, rounded to 13
 
     // At strobe trough (should be off)
     let commands = engine.update(Duration::from_millis(500), None).unwrap(); // 1/2 cycle
     let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 4).unwrap();
-    assert_eq!(strobe_cmd.value, 12); // Strobe channel value should remain at the speed, not turn off
+    assert_eq!(strobe_cmd.value, 13); // Strobe channel value should remain at the speed, not turn off
 }
 #[test]
 fn test_strobe_effect_crossfade() {
@@ -97,7 +97,7 @@ fn test_strobe_effect_crossfade() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Foreground,
+        EffectLayer::FOREGROUND,
         BlendMode::Overlay,
         Some(Duration::from_secs(1)), // fade_in: 1s
         Some(Duration::from_secs(1)), // fade_out: 1s
@@ -121,7 +121,8 @@ fn test_strobe_effect_crossfade() {
     let strobe_cmd = commands.iter().find(|cmd| cmd.channel == 1).unwrap();
     assert!(strobe_cmd.value > 0 && strobe_cmd.value < 255); // Dimmed strobe during fade out
 
-    // Test effect end - should be no commands (at 5s total)
+    // Test effect end (at 5s total) - the only command is the strobe sent off
     let commands = engine.update(Duration::from_millis(500), None).unwrap(); // 4.5s + 0.5s = 5s
-    assert!(commands.is_empty()); // Effect should be finished
+    assert_eq!(commands.len(), 1);
+    assert_eq!((commands[0].channel, commands[0].value), (1, 0));
 }

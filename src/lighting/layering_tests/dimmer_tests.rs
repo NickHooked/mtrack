@@ -59,7 +59,7 @@ fn test_dimmer_multiplier_passes_through_locks_rgb_only() {
         None,
         None,
     );
-    static_blue.layer = EffectLayer::Background;
+    static_blue.layer = EffectLayer::BACKGROUND;
     static_blue.blend_mode = BlendMode::Replace;
     engine.start_effect(static_blue).unwrap();
 
@@ -80,7 +80,7 @@ fn test_dimmer_multiplier_passes_through_locks_rgb_only() {
         None,
         None,
     );
-    fade_out.layer = EffectLayer::Foreground;
+    fade_out.layer = EffectLayer::FOREGROUND;
     fade_out.blend_mode = BlendMode::Multiply;
     engine.start_effect(fade_out).unwrap();
 
@@ -164,7 +164,7 @@ fn test_dedicated_dimmer_preserves_rgb() {
         None,
         None,
     );
-    static_blue.layer = EffectLayer::Background;
+    static_blue.layer = EffectLayer::BACKGROUND;
     static_blue.blend_mode = BlendMode::Replace;
     engine.start_effect(static_blue).unwrap();
 
@@ -185,7 +185,7 @@ fn test_dedicated_dimmer_preserves_rgb() {
         None,
         None,
     );
-    fade_out.layer = EffectLayer::Foreground;
+    fade_out.layer = EffectLayer::FOREGROUND;
     fade_out.blend_mode = BlendMode::Replace;
     engine.start_effect(fade_out).unwrap();
 
@@ -241,7 +241,7 @@ fn test_effect_layering_static_blue_and_dimmer() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -255,7 +255,7 @@ fn test_effect_layering_static_blue_and_dimmer() {
             curve: DimmerCurve::Linear,
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Multiply,
     );
 
@@ -341,7 +341,7 @@ fn test_dimmer_without_dedicated_channel() {
         None,
         None,
     );
-    blue_effect.layer = EffectLayer::Background;
+    blue_effect.layer = EffectLayer::BACKGROUND;
     blue_effect.blend_mode = BlendMode::Replace;
 
     // Create a dimmer effect (1s duration, permanent)
@@ -358,7 +358,7 @@ fn test_dimmer_without_dedicated_channel() {
         None,
         None,
     );
-    dimmer_effect.layer = EffectLayer::Midground;
+    dimmer_effect.layer = EffectLayer::MIDGROUND;
     dimmer_effect.blend_mode = BlendMode::Multiply;
 
     // Start effects
@@ -443,7 +443,7 @@ fn test_dimmer_precedence_and_selective_dimming() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -477,7 +477,7 @@ fn test_dimmer_precedence_and_selective_dimming() {
             curve: DimmerCurve::Linear,
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Replace,
     );
 
@@ -572,7 +572,7 @@ fn test_dimmer_debug() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -586,7 +586,7 @@ fn test_dimmer_debug() {
             curve: DimmerCurve::Linear,
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Multiply,
     );
 
@@ -683,7 +683,7 @@ fn test_static_with_dimmer_parameter() {
             duration: Duration::from_secs(5),
         },
         vec!["front_wash".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -706,7 +706,7 @@ fn test_static_with_dimmer_parameter() {
             curve: DimmerCurve::Linear,
         },
         vec!["front_wash".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Multiply,
     );
 
@@ -767,7 +767,7 @@ fn test_dimmer_replace_vs_multiply() {
             duration: Duration::from_secs(5),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -781,7 +781,7 @@ fn test_dimmer_replace_vs_multiply() {
             curve: DimmerCurve::Linear,
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Replace,
     );
 
@@ -829,7 +829,7 @@ fn test_dimmer_replace_vs_multiply() {
             curve: DimmerCurve::Linear,
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Multiply,
     );
 
@@ -894,7 +894,7 @@ fn test_astera_pixelblock_dimmer() {
             duration: Duration::from_secs(5),
         },
         vec!["astera_pixelblock".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -908,7 +908,7 @@ fn test_astera_pixelblock_dimmer() {
             curve: DimmerCurve::Linear,
         },
         vec!["astera_pixelblock".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Multiply,
     );
 
@@ -953,7 +953,7 @@ fn test_astera_pixelblock_dimmer() {
             curve: DimmerCurve::Linear,
         },
         vec!["astera_pixelblock".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Replace,
     );
 
@@ -1014,7 +1014,7 @@ fn test_chase_effect_without_dimmer_channel() {
             duration: Duration::from_secs(5),
         },
         vec!["rgb_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -1028,11 +1028,12 @@ fn test_chase_effect_without_dimmer_channel() {
     // Update engine to generate commands
     let commands = engine.update(Duration::from_millis(100), None).unwrap();
 
-    // The chase routes through the chase multiplier rather than writing RGB directly
-    // (#345), so on its own it contributes no colour — it masks whatever is beneath.
+    // The chase is a level, not a colour (#345): with nothing beneath it, it
+    // shows white at its level (design 3.4, rule 7), never a colour of its own.
+    assert_eq!(commands.len(), 3);
     assert!(
-        commands.iter().all(|cmd| cmd.value == 0),
-        "chase on an RGB-only fixture should not paint colour of its own"
+        commands.iter().all(|cmd| cmd.value == commands[0].value),
+        "chase on an RGB-only fixture should be white at its level: {commands:?}"
     );
 }
 #[test]
@@ -1067,7 +1068,7 @@ fn test_chase_effect_with_dimmer_channel() {
             duration: Duration::from_secs(5),
         },
         vec!["rgb_dimmer_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -1085,23 +1086,16 @@ fn test_chase_effect_with_dimmer_channel() {
     let dimmer_cmd = commands.iter().find(|cmd| cmd.channel == 4);
     assert!(dimmer_cmd.is_some(), "Should have dimmer channel command");
 
-    // Should not have RGB commands when dimmer is available
-    let red_cmd = commands.iter().find(|cmd| cmd.channel == 1);
-    let green_cmd = commands.iter().find(|cmd| cmd.channel == 2);
-    let blue_cmd = commands.iter().find(|cmd| cmd.channel == 3);
-
-    assert!(
-        red_cmd.is_none(),
-        "Should not have red channel command when dimmer is available"
-    );
-    assert!(
-        green_cmd.is_none(),
-        "Should not have green channel command when dimmer is available"
-    );
-    assert!(
-        blue_cmd.is_none(),
-        "Should not have blue channel command when dimmer is available"
-    );
+    // The level is the dimmer's; the colour beneath it is white, at full
+    // (design 3.4, rule 7), however the chase moves the dimmer.
+    for channel in 1..=3 {
+        let cmd = commands.iter().find(|cmd| cmd.channel == channel);
+        assert_eq!(
+            cmd.map(|c| c.value),
+            Some(255),
+            "channel {channel} is full white, the dimmer carrying the level"
+        );
+    }
 }
 #[test]
 fn test_software_strobing_dimmer_only_fixture() {
@@ -1130,7 +1124,7 @@ fn test_software_strobing_dimmer_only_fixture() {
             duration: Duration::from_secs(5),
         },
         vec!["dimmer_only_fixture".to_string()],
-        EffectLayer::Foreground,
+        EffectLayer::FOREGROUND,
         BlendMode::Overlay,
     );
 
@@ -1210,7 +1204,7 @@ fn test_multiple_dimmer_fade_to_black() {
         None,
         None,
     );
-    front_wash_fade.layer = EffectLayer::Foreground;
+    front_wash_fade.layer = EffectLayer::FOREGROUND;
     front_wash_fade.blend_mode = BlendMode::Replace;
 
     let mut back_wash_fade = EffectInstance::new(
@@ -1226,7 +1220,7 @@ fn test_multiple_dimmer_fade_to_black() {
         None,
         None,
     );
-    back_wash_fade.layer = EffectLayer::Foreground;
+    back_wash_fade.layer = EffectLayer::FOREGROUND;
     back_wash_fade.blend_mode = BlendMode::Replace;
 
     // Start the effects
@@ -1314,7 +1308,7 @@ fn test_dimmer_effect_mid_level_start() {
         None,
         None,
     );
-    dimmer_effect.layer = EffectLayer::Foreground;
+    dimmer_effect.layer = EffectLayer::FOREGROUND;
     dimmer_effect.blend_mode = BlendMode::Replace;
 
     // Add a static blue effect to provide RGB values to dim
@@ -1344,17 +1338,17 @@ fn test_dimmer_effect_mid_level_start() {
     // At 0s - dimmer is at start_level (0.5)
     let commands = engine.update(Duration::from_secs(0), None).unwrap();
     let blue_cmd = commands.iter().find(|cmd| cmd.channel == 3).unwrap();
-    assert_eq!(blue_cmd.value, 127, "Blue should be at 50% (127) at 0s"); // 255 * 0.5 = 127
+    assert_eq!(blue_cmd.value, 128, "Blue should be at 50% (128) at 0s"); // 255 * 0.5 = 128.5, rounded
 
     // At 0.5s (25% through 2s fade) - dimmer at 0.5 + (0.0 - 0.5) * 0.25 = 0.375
     let commands = engine.update(Duration::from_millis(500), None).unwrap();
     let blue_cmd = commands.iter().find(|cmd| cmd.channel == 3).unwrap();
-    assert_eq!(blue_cmd.value, 95, "Blue should be at 37.5% (95) at 0.5s"); // 255 * 0.375 ≈ 95
+    assert_eq!(blue_cmd.value, 96, "Blue should be at 37.5% (96) at 0.5s"); // 255 * 0.375 = 95.6, rounded to 96
 
     // At 1s (50% through 2s fade) - dimmer at 0.5 + (0.0 - 0.5) * 0.5 = 0.25
     let commands = engine.update(Duration::from_millis(500), None).unwrap();
     let blue_cmd = commands.iter().find(|cmd| cmd.channel == 3).unwrap();
-    assert_eq!(blue_cmd.value, 63, "Blue should be at 25% (63) at 1s"); // 255 * 0.25 ≈ 63
+    assert_eq!(blue_cmd.value, 64, "Blue should be at 25% (64) at 1s"); // 255 * 0.25 = 63.75, rounded to 64
 
     // At 2s (end of fade) - dimmer completes and is removed.
     // The underlying static blue shows through at full brightness.
@@ -1470,7 +1464,7 @@ fn test_dimmer_curves() {
             None,
             None,
         );
-        dimmer.layer = EffectLayer::Midground;
+        dimmer.layer = EffectLayer::MIDGROUND;
         dimmer.blend_mode = BlendMode::Multiply;
         test_engine.start_effect(dimmer).unwrap();
 

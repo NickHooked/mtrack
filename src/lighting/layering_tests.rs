@@ -15,6 +15,8 @@
 #[cfg(test)]
 mod blend_mode_tests;
 #[cfg(test)]
+mod brightness_tests;
+#[cfg(test)]
 mod chase_tests;
 #[cfg(test)]
 mod common;
@@ -95,7 +97,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_dim_50.layer = EffectLayer::Midground;
+        mid_dim_50.layer = EffectLayer::MIDGROUND;
         mid_dim_50.blend_mode = BlendMode::Multiply;
         engine.start_effect(mid_dim_50).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -114,7 +116,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        fg_dim_50.layer = EffectLayer::Foreground;
+        fg_dim_50.layer = EffectLayer::FOREGROUND;
         fg_dim_50.blend_mode = BlendMode::Multiply;
         engine.start_effect(fg_dim_50).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -133,19 +135,23 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_dim_100.layer = EffectLayer::Midground;
+        mid_dim_100.layer = EffectLayer::MIDGROUND;
         mid_dim_100.blend_mode = BlendMode::Multiply;
         engine.start_effect(mid_dim_100).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
 
-        // Expect blue = 127 (50% of 255) — only foreground 0.5 remains
+        // Expect blue = 64 (25% of 255): both midground dimmers and the
+        // foreground one multiply (design 3.4, rule 1: layers blend within a
+        // layer as any channel does). A later multiply in the same layer no
+        // longer overwrites an earlier one on an RGB-only fixture, as it
+        // never did on a dimmer channel.
         let blue_ch = 1 + 3 - 1; // address 1 + blue offset 3 - 1 = 3
         let blue = cmds
             .iter()
             .find(|c| c.universe == 1 && c.channel == blue_ch)
             .map(|c| c.value)
             .unwrap_or(0);
-        assert!((120..=135).contains(&blue), "expected ~127, got {}", blue);
+        assert!((60..=68).contains(&blue), "expected ~64, got {}", blue);
     }
 
     #[test]
@@ -186,7 +192,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        fg_dim_50.layer = EffectLayer::Foreground;
+        fg_dim_50.layer = EffectLayer::FOREGROUND;
         fg_dim_50.blend_mode = BlendMode::Multiply;
         engine.start_effect(fg_dim_50).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -205,7 +211,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_dim_50.layer = EffectLayer::Midground;
+        mid_dim_50.layer = EffectLayer::MIDGROUND;
         mid_dim_50.blend_mode = BlendMode::Multiply;
         engine.start_effect(mid_dim_50).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -224,19 +230,20 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        fg_dim_100.layer = EffectLayer::Foreground;
+        fg_dim_100.layer = EffectLayer::FOREGROUND;
         fg_dim_100.blend_mode = BlendMode::Multiply;
         engine.start_effect(fg_dim_100).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
 
-        // Expect blue ≈ 127 (mid=0.5, fg=1.0)
+        // Expect blue ≈ 64: mid 0.5, then both foreground multiplies
+        // (0.5 and 1.0) compound -- see the note on the test above.
         let blue_ch = 1 + 3 - 1;
         let blue = cmds
             .iter()
             .find(|c| c.universe == 1 && c.channel == blue_ch)
             .map(|c| c.value)
             .unwrap_or(0);
-        assert!((120..=135).contains(&blue), "expected ~127, got {}", blue);
+        assert!((60..=68).contains(&blue), "expected ~64, got {}", blue);
     }
 
     #[test]
@@ -277,7 +284,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_dim.layer = EffectLayer::Midground;
+        mid_dim.layer = EffectLayer::MIDGROUND;
         mid_dim.blend_mode = BlendMode::Multiply;
         engine.start_effect(mid_dim).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
@@ -331,7 +338,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_red.layer = EffectLayer::Midground;
+        mid_red.layer = EffectLayer::MIDGROUND;
         mid_red.blend_mode = BlendMode::Replace;
         engine.start_effect(mid_red).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
@@ -385,7 +392,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_red.layer = EffectLayer::Midground;
+        mid_red.layer = EffectLayer::MIDGROUND;
         mid_red.blend_mode = BlendMode::Replace;
         engine.start_effect(mid_red).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -406,7 +413,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        fg_green.layer = EffectLayer::Foreground;
+        fg_green.layer = EffectLayer::FOREGROUND;
         fg_green.blend_mode = BlendMode::Replace;
         engine.start_effect(fg_green).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
@@ -460,7 +467,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_red.layer = EffectLayer::Midground;
+        mid_red.layer = EffectLayer::MIDGROUND;
         mid_red.blend_mode = BlendMode::Replace;
         engine.start_effect(mid_red).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
@@ -514,7 +521,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        fg_red.layer = EffectLayer::Foreground;
+        fg_red.layer = EffectLayer::FOREGROUND;
         fg_red.blend_mode = BlendMode::Replace;
         engine.start_effect(fg_red).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -533,7 +540,7 @@ mod layering_behavior_tests {
             None,
             None,
         );
-        mid_dim.layer = EffectLayer::Midground;
+        mid_dim.layer = EffectLayer::MIDGROUND;
         mid_dim.blend_mode = BlendMode::Multiply;
         engine.start_effect(mid_dim).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();
@@ -602,7 +609,7 @@ mod layering_show_regression {
             None,
             None,
         );
-        static_blue.layer = EffectLayer::Background;
+        static_blue.layer = EffectLayer::BACKGROUND;
         static_blue.blend_mode = BlendMode::Replace;
         engine.start_effect(static_blue).unwrap();
         let _ = engine.update(Duration::from_millis(1), None).unwrap();
@@ -621,7 +628,7 @@ mod layering_show_regression {
             None,
             None,
         );
-        dimmer_50.layer = EffectLayer::Midground;
+        dimmer_50.layer = EffectLayer::MIDGROUND;
         dimmer_50.blend_mode = BlendMode::Multiply;
         engine.start_effect(dimmer_50).unwrap();
         let cmds = engine.update(Duration::from_millis(1), None).unwrap();

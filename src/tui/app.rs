@@ -17,6 +17,7 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent};
 use tokio::sync::watch;
 
+use crate::controller::TransportAction;
 use crate::player::Player;
 use crate::state::{FixtureSnapshot, StateSnapshot};
 
@@ -77,7 +78,7 @@ impl App {
                 .unwrap_or_default(),
             current_song_duration: current
                 .as_ref()
-                .map(|s| s.length())
+                .map(|s| s.duration())
                 .unwrap_or(std::time::Duration::ZERO),
             current_song_tracks: current
                 .as_ref()
@@ -129,51 +130,39 @@ impl App {
         }
     }
 
-    /// Processes a keyboard event and returns the action to take.
+    /// Processes a keyboard event and returns the action to take. Each key
+    /// runs the transport action the controllers run, which logs a failure
+    /// to the log pane.
     pub async fn handle_key_event(&mut self, key: KeyEvent) -> Action {
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.player.stop().await;
-                Action::Quit
+        let (transport, action) = match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => (TransportAction::Stop, Action::Quit),
+            KeyCode::Char(' ') | KeyCode::Enter if self.is_playing => {
+                (TransportAction::Stop, Action::None)
             }
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                if self.is_playing {
-                    self.player.stop().await;
-                } else {
-                    let _ = self.player.play().await;
-                }
-                Action::None
-            }
-            KeyCode::Right | KeyCode::Char('n') => {
-                self.player.next().await;
-                Action::None
-            }
-            KeyCode::Left | KeyCode::Char('p') => {
-                self.player.prev().await;
-                Action::None
-            }
-            KeyCode::Char('a') => {
-                let _ = self.player.switch_to_playlist("all_songs").await;
-                Action::None
-            }
-            KeyCode::Char('l') => {
-                let name = self.player.persisted_playlist_name();
-                let _ = self.player.switch_to_playlist(&name).await;
-                Action::None
-            }
-            _ => Action::None,
-        }
+            KeyCode::Char(' ') | KeyCode::Enter => (TransportAction::Play, Action::None),
+            KeyCode::Right | KeyCode::Char('n') => (TransportAction::Next, Action::None),
+            KeyCode::Left | KeyCode::Char('p') => (TransportAction::Prev, Action::None),
+            KeyCode::Char('a') => (TransportAction::AllSongs, Action::None),
+            KeyCode::Char('l') => (TransportAction::Playlist, Action::None),
+            _ => return Action::None,
+        };
+        transport.run(&self.player).await;
+        action
     }
 }
 
-/// Converts fixture snapshots into display-ready colors by extracting RGB channels.
+/// Each fixture in the colour it shows (`channels::shown_color`), as the
+/// web UI's stage views draw it.
 fn fixture_colors_from_snapshot(fixtures: &[FixtureSnapshot]) -> Vec<FixtureColor> {
     fixtures
         .iter()
         .map(|f| {
-            let r = f.channels.get("red").copied().unwrap_or(0);
-            let g = f.channels.get("green").copied().unwrap_or(0);
-            let b = f.channels.get("blue").copied().unwrap_or(0);
+            let [r, g, b] = crate::lighting::channels::shown_color(
+                f.channels
+                    .iter()
+                    .map(|(name, &value)| (name.as_str(), f64::from(value))),
+            )
+            .map(|c| crate::lighting::channels::dmx_byte(c * 255.0));
             FixtureColor {
                 name: f.name.clone(),
                 r,
@@ -189,17 +178,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use crate::config;
-    use crate::player::PlayerDevices;
-    use crate::playlist;
-    use crate::songs::{Song, Songs};
-
     fn make_fixture(name: &str, channels: &[(&str, u8)]) -> FixtureSnapshot {
         let mut map = HashMap::new();
         for (k, v) in channels {
             map.insert(k.to_string(), *v);
         }
         FixtureSnapshot {
+            strobe_hz: None,
             name: name.to_string(),
             channels: map,
             cells: Default::default(),
@@ -208,37 +193,7 @@ mod tests {
 
     /// Creates a test Player with no hardware devices.
     fn test_player(song_names: &[&str]) -> Arc<Player> {
-        let songs = song_names
-            .iter()
-            .map(|name| Arc::new(Song::new_for_test(name, &["track1"])))
-            .collect();
-        test_player_with_songs(songs)
-    }
-
-    fn test_player_with_songs(songs: Vec<Arc<Song>>) -> Arc<Player> {
-        let song_names: Vec<String> = songs.iter().map(|song| song.name().to_string()).collect();
-        let map = songs
-            .into_iter()
-            .map(|song| (song.name().to_string(), song))
-            .collect();
-        let songs = Arc::new(Songs::new(map));
-        let playlist_config = config::Playlist::new(&song_names);
-        let pl = playlist::Playlist::new("test", &playlist_config, songs.clone()).unwrap();
-        let devices = PlayerDevices {
-            audio: None,
-            mappings: None,
-            midi: None,
-            dmx_engine: None,
-            sample_engine: None,
-            trigger_engine: None,
-        };
-        let mut playlists = HashMap::new();
-        playlists.insert(
-            "all_songs".to_string(),
-            playlist::from_songs(songs.clone()).unwrap(),
-        );
-        playlists.insert(pl.name().to_string(), pl);
-        Arc::new(Player::new_with_devices(devices, playlists, "test".to_string(), None).unwrap())
+        crate::testutil::player::memory_player(song_names).build()
     }
 
     fn test_app(song_names: &[&str]) -> App {
@@ -321,6 +276,27 @@ mod tests {
             assert_eq!(colors[0].b, 30);
         }
 
+        /// A fixture's dimmer scales its colour, a dimmer-only fixture
+        /// shows a warm white, and white adds to the mix.
+        #[test]
+        fn dimmer_and_white_apply() {
+            let rgb = |channels: &[(&str, u8)]| {
+                let c = &fixture_colors_from_snapshot(&[make_fixture("f", channels)])[0];
+                (c.r, c.g, c.b)
+            };
+            assert_eq!(rgb(&[("red", 255), ("dimmer", 0)]), (0, 0, 0));
+            assert_eq!(rgb(&[("red", 255), ("dimmer", 51)]), (51, 0, 0));
+            assert_eq!(rgb(&[("dimmer", 255)]), (255, 235, 204));
+            assert_eq!(
+                rgb(&[("red", 0), ("green", 0), ("blue", 0), ("amber", 255)]),
+                (255, 191, 0)
+            );
+            assert_eq!(
+                rgb(&[("red", 255), ("blue", 0), ("white", 100), ("dimmer", 255)]),
+                (255, 100, 100)
+            );
+        }
+
         #[test]
         fn preserves_fixture_names() {
             let fixtures = vec![
@@ -335,33 +311,6 @@ mod tests {
 
     mod app_new_tests {
         use super::*;
-
-        #[test]
-        fn initializes_video_only_song_with_timeline_length() {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("visual.mp4"), b"video placeholder").unwrap();
-            let config_path = dir.path().join("song.yaml");
-            std::fs::write(
-                &config_path,
-                r#"name: Video Only
-tracks: []
-video:
-  tracks:
-    - name: screen
-      clips:
-        - { id: visual, start: 2.5, duration: 7.0, file: visual.mp4 }
-"#,
-            )
-            .unwrap();
-            let config = config::Song::deserialize(&config_path).unwrap();
-            let song = Arc::new(Song::new(dir.path(), &config).unwrap());
-            let player = test_player_with_songs(vec![song]);
-            let (_state_tx, state_rx) = watch::channel(Arc::new(StateSnapshot::default()));
-
-            let app = App::new(player, state_rx);
-
-            assert_eq!(app.current_song_duration, Duration::from_secs_f64(9.5));
-        }
 
         #[test]
         fn initializes_playlist_name() {
@@ -514,6 +463,7 @@ video:
                 fixtures: vec![make_fixture("spot", &[("red", 255)])],
                 active_effects: vec!["chase".to_string()],
                 poses: Vec::new(),
+                under_test: Vec::new(),
             });
             let (_tx, state_rx) = watch::channel(snapshot);
             let mut app = App::new(player, state_rx);

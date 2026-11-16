@@ -1,0 +1,549 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+use crate::lighting::effects::{Color, EffectType};
+use crate::lighting::parser::*;
+
+#[test]
+fn test_parameter_population() {
+    // Test that parameters are properly populated in effect types
+    let simple_dsl = r#"show "Parameter Test" {
+    @00:00.000
+    front_wash: static color: "blue", dimmer: 60%, duration: 5s
+    
+    @00:05.000
+    back_wash: static color: "red", dimmer: 80%, duration: 5s
+}"#;
+
+    let result = parse_light_shows(simple_dsl);
+    assert!(result.is_ok(), "Simple DSL should parse successfully");
+
+    let shows = result.unwrap();
+    assert_eq!(shows.len(), 1);
+
+    let show = shows.get("Parameter Test").unwrap();
+    assert_eq!(show.cues.len(), 2);
+
+    // Test first cue
+    let first_cue = &show.cues[0];
+    assert_eq!(first_cue.effects.len(), 1);
+
+    let first_effect = &first_cue.effects[0];
+    assert_eq!(first_effect.groups, vec!["front_wash"]);
+
+    // Check that parameters are stored in the EffectType
+    match &first_effect.effect_type {
+        crate::lighting::effects::EffectType::Static { parameters, .. } => {
+            assert!(
+                parameters.contains_key("color")
+                    || parameters.contains_key("red")
+                    || parameters.contains_key("green")
+                    || parameters.contains_key("blue")
+            );
+            assert!(parameters.contains_key("dimmer"));
+        }
+        _ => panic!("Expected static effect"),
+    }
+
+    // Check that effect type is properly populated
+    match &first_effect.effect_type {
+        EffectType::Static {
+            parameters: static_params,
+            ..
+        } => {
+            // Check that parameters were applied to the effect type
+            assert!(static_params.contains_key("red"));
+            assert!(static_params.contains_key("green"));
+            assert!(static_params.contains_key("blue"));
+            assert!(static_params.contains_key("dimmer"));
+
+            // Check specific values
+            assert_eq!(static_params.get("dimmer"), Some(&0.6)); // 60% converted to 0.6
+            assert_eq!(static_params.get("blue"), Some(&1.0)); // Blue color should be 1.0
+            assert_eq!(static_params.get("red"), Some(&0.0)); // Red should be 0.0
+            assert_eq!(static_params.get("green"), Some(&0.0)); // Green should be 0.0
+        }
+        _ => panic!("Expected static effect type"),
+    }
+
+    // Test second cue
+    let second_cue = &show.cues[1];
+    let second_effect = &second_cue.effects[0];
+    assert_eq!(second_effect.groups, vec!["back_wash"]);
+    // Check that the second effect has the expected parameters
+    match &second_effect.effect_type {
+        crate::lighting::effects::EffectType::Static { parameters, .. } => {
+            assert!(
+                parameters.contains_key("color")
+                    || parameters.contains_key("red")
+                    || parameters.contains_key("green")
+                    || parameters.contains_key("blue")
+            );
+            assert!(parameters.contains_key("dimmer"));
+        }
+        _ => panic!("Expected static effect"),
+    }
+
+    // Check that red effect was properly applied
+    match &second_effect.effect_type {
+        EffectType::Static {
+            parameters: static_params,
+            ..
+        } => {
+            assert_eq!(static_params.get("dimmer"), Some(&0.8)); // 80% converted to 0.8
+            assert_eq!(static_params.get("red"), Some(&1.0)); // Red should be 1.0
+            assert_eq!(static_params.get("blue"), Some(&0.0)); // Blue should be 0.0
+            assert_eq!(static_params.get("green"), Some(&0.0)); // Green should be 0.0
+        }
+        _ => panic!("Expected static effect type"),
+    }
+}
+
+#[test]
+fn test_t_advanced_parameter_parsing() {
+    // Test DSL that should use advanced parameter parsing functions
+    // Using the exact syntax the grammar expects
+    let advanced_dsl = r#"show "Advanced Show" {
+    @00:00.000
+    front_wash: static color: "blue", dimmer: 60%, fade: 2s, duration: 5s
+    
+    @00:05.000
+    back_wash: cycle speed: 1.5, direction: forward, duration: 10s
+    
+    @00:10.000
+    strobe_lights: strobe frequency: 8, intensity: 0.8, duration: 5s
+    
+    @00:15.000
+    moving_heads: chase loop: pingpong, direction: random, transition: crossfade, duration: 10s
+    
+    @00:20.000
+    dimmer_test: dimmer start: 0%, end: 100%, duration: 3s, curve: linear
+    
+    @00:25.000
+    rainbow_effect: rainbow speed: 2.0, direction: forward, duration: 10s
+    
+    @00:30.000
+    pulse_lights: pulse frequency: 4, intensity: 0.6, duty: 50%, duration: 5s
+}"#;
+
+    let result = parse_light_shows(advanced_dsl);
+    if let Err(e) = &result {
+        println!("Advanced DSL parsing error: {}", e);
+    }
+    // This might fail if the grammar doesn't support the advanced syntax
+    // but it should help us understand what's actually supported
+    println!("Advanced DSL parsing result: {:?}", result);
+}
+
+#[test]
+fn test_simple_advanced_parameters() {
+    // Test with just one advanced parameter at a time to isolate issues
+    let simple_advanced = r#"show "Simple Advanced" {
+    @00:00.000
+    front_wash: static color: "blue", dimmer: 60%, fade: 2s, duration: 5s
+}"#;
+
+    let result = parse_light_shows(simple_advanced);
+    if let Err(e) = &result {
+        println!("Simple advanced DSL parsing error: {}", e);
+    }
+    println!("Simple advanced DSL parsing result: {:?}", result);
+}
+
+#[test]
+fn pink_is_a_named_color() {
+    let shows = parse_light_shows(
+        r#"show "s" {
+    @00:00.000
+    front_wash: static color: "pink", duration: 5s
+}"#,
+    )
+    .unwrap();
+    match &shows["s"].cues[0].effects[0].effect_type {
+        EffectType::Static { parameters, .. } => assert_eq!(
+            (parameters["red"], parameters["green"], parameters["blue"]),
+            (1.0, 192.0 / 255.0, 203.0 / 255.0)
+        ),
+        other => panic!("expected a static, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_custom_color_formats() {
+    // Test all three supported color formats
+    let custom_colors_dsl = r##"show "Custom Colors Show" {
+    @00:00.000
+    front_wash: static color: "#ff0000", dimmer: 60%, duration: 5s
+    
+    @00:05.000
+    back_wash: static color: rgb(0, 255, 0), dimmer: 80%, duration: 5s
+    
+    @00:10.000
+    side_wash: static color: "purple", dimmer: 100%, duration: 5s
+}"##;
+
+    let result = parse_light_shows(custom_colors_dsl);
+    if let Err(e) = &result {
+        println!("Custom colors DSL parsing error: {}", e);
+    }
+    assert!(
+        result.is_ok(),
+        "Custom colors DSL should parse successfully"
+    );
+
+    let shows = result.unwrap();
+    let show = shows.get("Custom Colors Show").unwrap();
+    assert_eq!(show.cues.len(), 3);
+
+    // Verify that colors are parsed correctly in the effect types
+    let first_cue = &show.cues[0];
+    match &first_cue.effects[0].effect_type {
+        crate::lighting::effects::EffectType::Static { parameters, .. } => {
+            assert!(
+                parameters.contains_key("color")
+                    || parameters.contains_key("red")
+                    || parameters.contains_key("green")
+                    || parameters.contains_key("blue")
+            );
+        }
+        _ => panic!("Expected static effect"),
+    }
+
+    let second_cue = &show.cues[1];
+    match &second_cue.effects[0].effect_type {
+        crate::lighting::effects::EffectType::Static { parameters, .. } => {
+            assert!(
+                parameters.contains_key("color")
+                    || parameters.contains_key("red")
+                    || parameters.contains_key("green")
+                    || parameters.contains_key("blue")
+            );
+        }
+        _ => panic!("Expected static effect"),
+    }
+
+    let third_cue = &show.cues[2];
+    match &third_cue.effects[0].effect_type {
+        crate::lighting::effects::EffectType::Static { parameters, .. } => {
+            assert!(
+                parameters.contains_key("color")
+                    || parameters.contains_key("red")
+                    || parameters.contains_key("green")
+                    || parameters.contains_key("blue")
+            );
+        }
+        _ => panic!("Expected static effect"),
+    }
+}
+
+#[test]
+fn test_t_user_dsl_syntax() {
+    let content = r#"show "Shieldbrother" {
+@00:00.000
+front_wash: static, color: "blue", duration: 5s
+
+@00:05.000
+all_wash: cycle, color: "red", color: "green", color: "blue", speed: 1.5, direction: "forward", duration: 10s
+}"#;
+
+    let result = parse_light_shows(content);
+    if let Err(e) = &result {
+        println!("Parse error: {}", e);
+    }
+    assert!(result.is_ok());
+    let shows = result.unwrap();
+    assert_eq!(shows.len(), 1);
+    assert!(shows.contains_key("Shieldbrother"));
+
+    let show = shows.get("Shieldbrother").unwrap();
+    assert_eq!(show.cues.len(), 2);
+
+    // Check first cue (static effect)
+    let first_cue = &show.cues[0];
+    assert_eq!(first_cue.time.as_nanos(), 0);
+    assert_eq!(first_cue.effects.len(), 1);
+    assert_eq!(first_cue.effects[0].groups, vec!["front_wash"]);
+
+    // Check second cue (cycle effect)
+    let second_cue = &show.cues[1];
+    assert_eq!(second_cue.time.as_secs(), 5);
+    assert_eq!(second_cue.effects.len(), 1);
+    assert_eq!(second_cue.effects[0].groups, vec!["all_wash"]);
+
+    // Verify that the cycle effect has multiple colors
+    if let EffectType::ColorCycle {
+        colors,
+        speed: _,
+        direction: _,
+        transition: _,
+        ..
+    } = &second_cue.effects[0].effect_type
+    {
+        assert_eq!(colors.len(), 3, "Cycle effect should have 3 colors");
+        // Check that the colors are correct
+        assert_eq!(
+            colors[0],
+            Color::new(255, 0, 0),
+            "First color should be red"
+        );
+        assert_eq!(
+            colors[1],
+            Color::new(0, 255, 0),
+            "Second color should be green"
+        );
+        assert_eq!(
+            colors[2],
+            Color::new(0, 0, 255),
+            "Third color should be blue"
+        );
+    } else {
+        panic!("Expected ColorCycle effect type");
+    }
+}
+
+// ── move ───────────────────────────────────────────────────────────
+
+#[test]
+fn a_move_aims_at_a_focus_point_or_at_angles() {
+    use crate::lighting::effects::{Easing, EffectType, MoveTarget};
+    let source = r#"
+show "s" {
+    @00:00.000
+    spots: move focus: "drummer", duration: 2s, easing: smooth
+    @00:04.000
+    spots: move pan: 45deg, tilt: -20.5deg, duration: 1s, easing: linear
+    @00:08.000
+    spots: move from: "center-stage", to: "drummer", duration: 2s
+}
+"#;
+    let shows = parse_light_shows(source).expect("parses");
+    let show = &shows["s"];
+    let effect = |i: usize| &show.cues[i].effects[0].effect_type;
+
+    let EffectType::Move {
+        to,
+        from,
+        easing,
+        duration,
+    } = effect(0)
+    else {
+        panic!("not a move: {:?}", effect(0));
+    };
+    assert_eq!(*to, MoveTarget::Focus("drummer".to_string()));
+    assert_eq!(*from, None);
+    assert_eq!(*easing, Easing::Smooth);
+    assert_eq!(*duration, std::time::Duration::from_secs(2));
+
+    let EffectType::Move { to, easing, .. } = effect(1) else {
+        panic!("not a move");
+    };
+    assert_eq!(
+        *to,
+        MoveTarget::Angles {
+            pan: Some(45.0),
+            tilt: Some(-20.5)
+        }
+    );
+    assert_eq!(*easing, Easing::Linear);
+
+    let EffectType::Move { to, from, .. } = effect(2) else {
+        panic!("not a move");
+    };
+    assert_eq!(*to, MoveTarget::Focus("drummer".to_string()));
+    assert_eq!(*from, Some(MoveTarget::Focus("center-stage".to_string())));
+}
+
+// ── per: cell / spread (design §17.3) ─────────────────────────────
+
+#[test]
+fn per_cell_sets_the_flag_and_per_fixture_or_its_absence_do_not() {
+    let source = r#"show "s" {
+    @00:00.000
+    bars: chase pattern: linear, per: cell, duration: 1s
+
+    @00:02.000
+    bars: chase pattern: linear, per: fixture, duration: 1s
+
+    @00:04.000
+    bars: chase pattern: linear, duration: 1s
+}"#;
+    let shows = parse_light_shows(source).expect("parses");
+    let show = &shows["s"];
+    assert!(show.cues[0].effects[0].per_cell, "per: cell");
+    assert!(!show.cues[1].effects[0].per_cell, "per: fixture");
+    assert!(!show.cues[2].effects[0].per_cell, "no per at all");
+}
+
+#[test]
+fn spread_parses_positive_and_negative_degrees() {
+    let source = r#"show "s" {
+    @00:00.000
+    bars: rainbow speed: 1.0, spread: 180deg, duration: 1s
+
+    @00:02.000
+    bars: rainbow speed: 1.0, spread: -90deg, duration: 1s
+}"#;
+    let shows = parse_light_shows(source).expect("parses");
+    let show = &shows["s"];
+    assert_eq!(show.cues[0].effects[0].spread, 180.0);
+    assert_eq!(show.cues[1].effects[0].spread, -90.0);
+}
+
+#[test]
+fn an_invalid_per_value_is_a_parse_error() {
+    let source = r#"show "s" {
+    @00:00.000
+    bars: chase pattern: linear, per: sideways, duration: 1s
+}"#;
+    let err = parse_light_shows(source)
+        .expect_err("`per: sideways` should not parse")
+        .to_string();
+    assert!(
+        err.contains("expected: fixture or cell"),
+        "error should name the valid values: {err}"
+    );
+}
+
+#[test]
+fn per_and_spread_are_not_reported_as_ignored_parameters() {
+    let source = r#"show "s" {
+    @00:00.000
+    bars: chase pattern: linear, per: cell, spread: 90deg, duration: 1s
+}"#;
+    let shows = parse_light_shows(source).expect("parses");
+    let effect = &shows["s"].cues[0].effects[0];
+    assert!(
+        !effect.ignored_parameters.iter().any(|p| p == "per"),
+        "{:?}",
+        effect.ignored_parameters
+    );
+    assert!(
+        !effect.ignored_parameters.iter().any(|p| p == "spread"),
+        "{:?}",
+        effect.ignored_parameters
+    );
+}
+
+#[test]
+fn a_move_refuses_a_missing_or_mixed_target_and_a_unitless_angle() {
+    for (source, needle) in [
+        ("spots: move duration: 2s", "requires a `focus`"),
+        (
+            "spots: move focus: \"a\", pan: 10deg, duration: 2s",
+            "not both",
+        ),
+        ("spots: move pan: 45, duration: 2s", "degrees"),
+        (
+            "spots: move focus: \"a\", easing: bouncy, duration: 2s",
+            "Invalid easing 'bouncy' (expected: linear, smooth)",
+        ),
+        ("spots: move focus: \"a\"", "requires a 'duration'"),
+        (
+            "spots: move focus: \"a\", hold_time: 5s",
+            "requires a 'duration'",
+        ),
+    ] {
+        let err = parse_light_shows(&format!(
+            "show \"s\" {{\n    @00:00.000\n    {source}\n}}\n"
+        ))
+        .expect_err(source)
+        .to_string();
+        assert!(err.contains(needle), "{source}: {err}");
+    }
+}
+
+/// #538: an unparseable colour is a parse error naming the value and its
+/// line, not silently dropped (a `static` with no colour, a `cycle` short a
+/// colour, and a show that validated clean).
+#[test]
+fn an_invalid_color_is_a_parse_error_naming_it() {
+    for bad in ["#X", "#12345", "#GGGGGG", "notacolour"] {
+        let source = format!(
+            r##"show "t" {{
+    @00:00.000
+    all_wash: static, color: "#FFD000", duration: 4s
+    left: static, color: "{bad}", duration: 4s
+}}"##
+        );
+        let error = parse_light_shows(&source)
+            .err()
+            .unwrap_or_else(|| panic!("{bad:?} parsed"))
+            .to_string();
+        assert!(error.contains(&format!("'{bad}'")), "{bad:?}: {error}");
+        assert!(error.contains("line 4"), "{bad:?}: {error}");
+    }
+
+    let cycle = r##"show "t" {
+    @00:00.000
+    all_wash: cycle, color: "red", color: "#X", color: "blue", speed: 1s, duration: 4s
+}"##;
+    let error = parse_light_shows(cycle)
+        .expect_err("cycle parsed")
+        .to_string();
+    assert!(
+        error.contains("'#X'") && error.contains("line 3"),
+        "{error}"
+    );
+}
+
+#[test]
+fn valid_colors_still_parse() {
+    let source = r##"show "t" {
+    @00:00.000
+    a: static, color: "#010101", duration: 1s
+    b: static, color: "rgb(255, 0, 128)", duration: 1s
+    c: cycle, color: "red", color: "#00FF00", speed: 1s, duration: 1s
+}"##;
+    assert!(parse_light_shows(source).is_ok());
+}
+
+/// A level that is not a number or a percentage is a parse error naming the
+/// parameter and value, for every effect that takes one -- not dropped,
+/// leaving the effect at its default level.
+#[test]
+fn an_invalid_level_is_a_parse_error_naming_it() {
+    let cases = [
+        ("static, color: \"red\", dimmer: full", "dimmer", "full"),
+        ("static, red: lots", "red", "lots"),
+        ("pulse, base_level: half", "base_level", "half"),
+        (
+            "dimmer, start_level: 1.0, end_level: zero",
+            "end_level",
+            "zero",
+        ),
+        ("rainbow, saturation: vivid", "saturation", "vivid"),
+    ];
+    for (effect, key, value) in cases {
+        let source = format!("show \"t\" {{\n    @00:00.000\n    wash: {effect}, duration: 2s\n}}");
+        let error = parse_light_shows(&source)
+            .expect_err(&format!("{effect} parsed"))
+            .to_string();
+        assert!(
+            error.contains(&format!("Invalid {key} '{value}'")) && error.contains("line 3"),
+            "{effect}: {error}"
+        );
+    }
+}
+
+#[test]
+fn valid_levels_still_parse() {
+    let source = r##"show "t" {
+    @00:00.000
+    a: static, color: "red", dimmer: 50%, duration: 1s
+    b: static, red: 0.5, green: 25%, duration: 1s
+    c: pulse, base_level: 0.2, intensity: 80%, duration: 1s
+    d: dimmer, start_level: 100%, end_level: 0, duration: 1s
+    e: rainbow, saturation: 0.9, brightness: 100%, duration: 1s
+}"##;
+    parse_light_shows(source).expect("valid levels parse");
+}

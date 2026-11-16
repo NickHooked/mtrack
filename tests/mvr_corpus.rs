@@ -30,30 +30,14 @@
 //! an embedded archive that itself parses. Scene warnings are printed for
 //! eyeballing, not asserted — they are console-quirk facts, not code facts.
 
+mod common;
+
 use mtrack::lighting::{gdtf, mvr};
 
 #[test]
 #[ignore = "bring-your-own corpus: put .mvr files in tests/mvr-corpus/ and run with --ignored"]
 fn every_corpus_file_parses_and_references_resolve() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mvr-corpus");
-    assert!(
-        dir.is_dir(),
-        "no corpus at {}: create it and drop .mvr files in (see module docs)",
-        dir.display()
-    );
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("readable corpus dir")
-        .filter_map(|entry| {
-            let path = entry.expect("dir entry").path();
-            (path.extension().is_some_and(|e| e == "mvr")).then_some(path)
-        })
-        .collect();
-    files.sort();
-    assert!(
-        !files.is_empty(),
-        "corpus dir {} holds no .mvr files",
-        dir.display()
-    );
+    let files = common::corpus_files("mvr-corpus", "mvr", common::Listing::NonEmpty);
 
     for path in files {
         let bytes = std::fs::read(&path).expect("readable mvr");
@@ -119,15 +103,7 @@ fn every_corpus_file_parses_and_references_resolve() {
 #[test]
 #[ignore = "bring-your-own corpus: put .mvr files in tests/mvr-corpus/ and run with --ignored"]
 fn every_embedded_gdtf_distills_a_rig_per_mode() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mvr-corpus");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("readable corpus dir")
-        .filter_map(|entry| {
-            let path = entry.expect("dir entry").path();
-            (path.extension().is_some_and(|e| e == "mvr")).then_some(path)
-        })
-        .collect();
-    files.sort();
+    let files = common::corpus_files("mvr-corpus", "mvr", common::Listing::MayBeEmpty);
     let mut spiider_checked = false;
     let mut rigs = 0;
     for path in files {
@@ -231,6 +207,49 @@ fn every_embedded_gdtf_distills_a_rig_per_mode() {
     );
 }
 
+/// The frame (columns u, v, w) of `R = Rz·Ry·Rx` for Euler degrees.
+fn euler_frame(r: &[f64; 3]) -> [[f64; 3]; 3] {
+    let (sx, cx) = r[0].to_radians().sin_cos();
+    let (sy, cy) = r[1].to_radians().sin_cos();
+    let (sz, cz) = r[2].to_radians().sin_cos();
+    [
+        [cz * cy, sz * cy, -sy],
+        [cz * sy * sx - sz * cx, sz * sy * sx + cz * cx, cy * sx],
+        [cz * sy * cx + sz * sx, sz * sy * cx - cz * sx, cy * cx],
+    ]
+}
+
+/// Every planned rotation must produce the SOURCE matrix's frame, so a
+/// wrong decomposition cannot hide behind an import that agrees with itself.
+fn assert_rotations_match_source(
+    file_name: &str,
+    stage: &str,
+    source: &mvr::Scene,
+    planned: &[mtrack::lighting::import::PlannedFixture],
+) {
+    assert_eq!(source.fixtures.len(), planned.len(), "{file_name}: {stage}");
+    for (src, plan) in source.fixtures.iter().zip(planned) {
+        let (Some(m), Some(rot)) = (src.matrix, plan.rotation) else {
+            continue;
+        };
+        let norm = |a: [f64; 3]| {
+            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            [a[0] / l, a[1] / l, a[2] / l]
+        };
+        if m.rotation_degrees().1 {
+            let want = [norm(m.u), norm(m.v), norm(m.w)];
+            let got = euler_frame(&rot);
+            for (w, g) in want.iter().zip(&got) {
+                assert!(
+                    w.iter().zip(g).all(|(a, b)| (a - b).abs() < 1e-4),
+                    "{file_name}: {stage}: {} rotation {rot:?} is not the source frame {want:?}",
+                    src.name
+                );
+            }
+        }
+    }
+}
+
 /// Import → export → import (design §16.6, P2-3 exit): every corpus venue
 /// exported by mtrack re-imports as a merge that changes nothing.
 #[test]
@@ -239,15 +258,7 @@ fn every_corpus_venue_round_trips_through_export() {
     use mtrack::lighting::export::{export_mvr_bytes, MvrExportOptions};
     use mtrack::lighting::import::{import_mvr_bytes, inspect_mvr_bytes, MvrImportOptions};
 
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mvr-corpus");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("readable corpus dir")
-        .filter_map(|entry| {
-            let path = entry.expect("dir entry").path();
-            (path.extension().is_some_and(|e| e == "mvr")).then_some(path)
-        })
-        .collect();
-    files.sort();
+    let files = common::corpus_files("mvr-corpus", "mvr", common::Listing::MayBeEmpty);
     for path in files {
         let project = tempfile::tempdir().expect("temp project");
         let bytes = std::fs::read(&path).expect("readable mvr");
@@ -256,6 +267,8 @@ fn every_corpus_venue_round_trips_through_export() {
         let report = import_mvr_bytes(&bytes, &file_name, &options, project.path())
             .unwrap_or_else(|e| panic!("{file_name}: import: {e}"));
         let venue = report.plan.venue_name.clone();
+        let source = mvr::parse_archive(&bytes).expect("source parses");
+        assert_rotations_match_source(&file_name, "import", &source, &report.plan.fixtures);
         let (exported, export) =
             export_mvr_bytes(&MvrExportOptions::for_venue(&venue), project.path())
                 .unwrap_or_else(|e| panic!("{file_name}: export: {e}"));
@@ -275,6 +288,8 @@ fn every_corpus_venue_round_trips_through_export() {
         let after = inspect_mvr_bytes(&exported, &file_name, &options, project.path())
             .unwrap_or_else(|e| panic!("{file_name}: re-import: {e}"));
         assert!(after.merge, "{file_name}");
+        let exported_scene = mvr::parse_archive(&exported).expect("export parses");
+        assert_rotations_match_source(&file_name, "re-import", &exported_scene, &after.fixtures);
         assert!(
             after.fixture_types.iter().all(|t| t.existing),
             "{file_name}: {:?}",
@@ -309,15 +324,7 @@ fn every_corpus_venue_round_trips_through_export() {
 fn every_corpus_venue_distills_its_scenery() {
     use mtrack::lighting::distill::DistillCache;
 
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mvr-corpus");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("readable corpus dir")
-        .filter_map(|entry| {
-            let path = entry.expect("dir entry").path();
-            (path.extension().is_some_and(|e| e == "mvr")).then_some(path)
-        })
-        .collect();
-    files.sort();
+    let files = common::corpus_files("mvr-corpus", "mvr", common::Listing::MayBeEmpty);
     let mut drawn_somewhere = false;
     for path in files {
         let bytes = std::fs::read(&path).expect("readable mvr");

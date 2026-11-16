@@ -110,6 +110,7 @@ install_build_deps_debian() {
     pkg-config
     libasound2-dev
     libudev-dev
+    libdbus-1-dev
     libssl-dev
     protobuf-compiler
   )
@@ -136,6 +137,7 @@ install_build_deps_fedora() {
     pkg-config
     alsa-lib-devel
     systemd-devel
+    dbus-devel
     openssl-devel
     protobuf-compiler
   )
@@ -161,6 +163,7 @@ install_build_deps_arch() {
     pkg-config
     alsa-lib
     systemd-libs
+    dbus
     openssl
     protobuf
   )
@@ -258,6 +261,23 @@ check_rust() {
 
   # Ensure clippy and rustfmt are installed.
   rustup component add clippy rustfmt 2>/dev/null || true
+
+  # The web UI compiles the player's rules to WebAssembly (make gen-wasm):
+  # wasm-pack, the wasm-bindgen CLI at the crate's pinned version, and
+  # binaryen's wasm-opt -- all pinned, so a build never fetches a binary of
+  # its own choosing.
+  rustup target add wasm32-unknown-unknown
+  if ! command -v wasm-pack &>/dev/null; then
+    echo "Installing wasm-pack..."
+    cargo install wasm-pack --version 0.15.1
+  fi
+  if ! wasm-bindgen --version 2>/dev/null | grep -q " 0\.2\.122$"; then
+    echo "Installing wasm-bindgen-cli 0.2.122..."
+    cargo install wasm-bindgen-cli --version 0.2.122
+  fi
+  if ! command -v wasm-opt &>/dev/null; then
+    "$(dirname "$0")/scripts/install-binaryen.sh"
+  fi
 }
 
 # --- Main ---

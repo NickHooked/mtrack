@@ -12,20 +12,19 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+use crate::lighting::effects::Color;
 use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
-use parking_lot::Mutex;
-use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use crate::lighting::system::LightingSystem;
-use crate::lighting::timeline::LightingTimeline;
+use super::engine::Engine;
 use crate::lighting::validation::validate_light_shows;
-use crate::lighting::EffectEngine;
+use crate::util::FileStamp;
+use crate::webui::wire::messages::{ShowReload, SocketMessage};
 
 /// Handle to a running file watcher, shuts down when dropped.
 pub struct WatcherHandle {
@@ -37,19 +36,20 @@ pub struct WatcherHandle {
 /// On file change (debounced 300ms):
 /// 1. Re-parses the .light file
 /// 2. Builds a new LightingTimeline
-/// 3. Swaps it into current_song_timeline
-/// 4. Reconstructs state at current_song_time
-/// 5. Sends a reload notification over WebSocket
-#[allow(clippy::too_many_arguments)]
+/// 3. Swaps it into `engine`'s, rebuilt where the lights are
+///    ([`Engine::reload_show`])
+/// 4. Sends a reload notification to the player's watch hub
+///
+/// The engine is held weakly: it owns the handle, and the watcher stops
+/// with it. It reloads under `generation`, the engine's watcher generation
+/// for the song it watches for: once let go, it reloads nothing more.
 pub fn start_watching(
+    engine: Weak<Engine>,
+    generation: u64,
     file_paths: Vec<PathBuf>,
-    effect_engine: Arc<Mutex<EffectEngine>>,
-    current_song_timeline: Arc<Mutex<Option<LightingTimeline>>>,
-    current_song_time: Arc<AtomicU64>,
-    lighting_system: Option<Arc<Mutex<LightingSystem>>>,
-    lighting_config: Option<crate::config::Lighting>,
     fallback_tempo_map: Option<crate::tempo::TempoMap>,
-    broadcast_tx: broadcast::Sender<String>,
+    palette: Arc<HashMap<String, Color>>,
+    broadcast_tx: broadcast::Sender<SocketMessage>,
 ) -> Result<WatcherHandle, Box<dyn std::error::Error>> {
     // Canonicalize paths so they match what the OS reports in events.
     let paths: Vec<PathBuf> = file_paths
@@ -57,11 +57,25 @@ pub fn start_watching(
         .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
         .collect();
 
+    // The files those include are watched too: an edit to a shared sequence
+    // changes the shows that use it. One included only after the song is
+    // loaded is watched from its next load.
+    // Includes resolve from the path as given, as the song load did, so a
+    // symlinked show includes what its link's folder holds.
+    let mut watched = paths.clone();
+    for path in &file_paths {
+        for included in crate::lighting::parser::included_files(path) {
+            if !watched.contains(&included) {
+                watched.push(included);
+            }
+        }
+    }
+
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_millis(300), tx)?;
 
     // Watch each file path
-    for path in &paths {
+    for path in &watched {
         if let Some(parent) = path.parent() {
             debouncer
                 .watcher()
@@ -70,25 +84,16 @@ pub fn start_watching(
     }
 
     // Spawn a thread to handle file change events
-    let effect_engine = effect_engine.clone();
-    let current_song_timeline = current_song_timeline.clone();
-    let current_song_time = current_song_time.clone();
-
     std::thread::spawn(move || {
-        // Track the last-known mtime per watched file so we can distinguish
+        // Track the last-known stamp per watched file so we can distinguish
         // "the file actually changed" from "something fired a spurious event"
         // (read-only access updating atime, the watcher's own read triggering
         // notify in certain backend configurations, etc.). Pre-seed with the
-        // current mtimes so the first event we process compares against a
+        // current stamps so the first event we process compares against a
         // real baseline rather than treating every watched file as "new".
-        let mut last_mtimes: std::collections::HashMap<PathBuf, std::time::SystemTime> = paths
+        let mut last_stamps: std::collections::HashMap<PathBuf, FileStamp> = watched
             .iter()
-            .filter_map(|p| {
-                std::fs::metadata(p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|t| (p.clone(), t))
-            })
+            .filter_map(|p| FileStamp::of(p).map(|stamp| (p.clone(), stamp)))
             .collect();
 
         for events in rx {
@@ -103,39 +108,39 @@ pub fn start_watching(
                             .path
                             .canonicalize()
                             .unwrap_or_else(|_| event.path.clone());
-                        paths.contains(&event_path)
+                        watched.contains(&event_path)
                     });
                     if !relevant {
                         continue;
                     }
 
-                    // Second guard: mtime-based change detection. Reads
+                    // Second guard: stamp-based change detection
+                    // ([`FileStamp`]: modified time and length). Reads
                     // (which trigger IN_ACCESS / IN_OPEN / IN_CLOSE_NOWRITE
                     // on some inotify backend configurations) do NOT change
-                    // mtime, so a "did mtime advance?" check breaks the
-                    // self-sustaining read → event → reload → read loop
+                    // the stamp, so a "did the stamp change?" check breaks
+                    // the self-sustaining read → event → reload → read loop
                     // without affecting genuine write-driven reloads.
                     //
                     // Use `fold` rather than `any` so EVERY changed file's
-                    // mtime entry is refreshed in this pass. With `any`
+                    // stamp entry is refreshed in this pass. With `any`
                     // short-circuiting on the first hit, a multi-file save
                     // would update only the first file's baseline and
                     // trigger a spurious second reload when the next event
                     // arrives for one of the stale entries.
-                    let any_changed = paths.iter().fold(false, |acc, p| {
-                        let changed = match std::fs::metadata(p).and_then(|m| m.modified()) {
-                            Ok(mt) => {
-                                let changed =
-                                    last_mtimes.get(p).map(|prev| mt > *prev).unwrap_or(true);
+                    let any_changed = watched.iter().fold(false, |acc, p| {
+                        let changed = match FileStamp::of(p) {
+                            Some(stamp) => {
+                                let changed = last_stamps.get(p) != Some(&stamp);
                                 if changed {
-                                    last_mtimes.insert(p.clone(), mt);
+                                    last_stamps.insert(p.clone(), stamp);
                                 }
                                 changed
                             }
                             // Metadata failed — be conservative and reload,
                             // so a transient stat error doesn't silently
                             // skip a real change.
-                            Err(_) => true,
+                            None => true,
                         };
                         acc || changed
                     });
@@ -146,33 +151,31 @@ pub fn start_watching(
                         continue;
                     }
 
+                    let Some(engine) = engine.upgrade() else {
+                        break;
+                    };
                     info!("Light show file changed, reloading...");
 
                     match reload_timeline(
-                        &paths,
-                        &effect_engine,
-                        &current_song_timeline,
-                        &current_song_time,
-                        lighting_system.as_ref(),
-                        lighting_config.as_ref(),
+                        &engine,
+                        &file_paths,
                         fallback_tempo_map.as_ref(),
+                        &palette,
+                        generation,
                     ) {
-                        Ok(()) => {
+                        Ok(false) => {
+                            info!("Light show watcher let go; its song's show not reloaded");
+                            break;
+                        }
+                        Ok(true) => {
                             info!("Light show reloaded successfully");
-                            let msg = json!({
-                                "type": "reload",
-                                "status": "ok",
-                            });
-                            let _ = broadcast_tx.send(msg.to_string());
+                            let _ = broadcast_tx.send(SocketMessage::Reload(ShowReload::Ok));
                         }
                         Err(e) => {
                             warn!("Light show reload failed: {}", e);
-                            let msg = json!({
-                                "type": "reload",
-                                "status": "error",
-                                "error": e.to_string(),
-                            });
-                            let _ = broadcast_tx.send(msg.to_string());
+                            let _ = broadcast_tx.send(SocketMessage::Reload(ShowReload::Error {
+                                error: e.to_string(),
+                            }));
                         }
                     }
                 }
@@ -188,32 +191,36 @@ pub fn start_watching(
     })
 }
 
-/// Re-parses light show files, builds a new timeline, and swaps it in.
-#[allow(clippy::too_many_arguments)]
-fn reload_timeline(
+/// Re-parses light show files, builds a new timeline, and swaps it into
+/// `engine`'s, rebuilt where the lights are (see [`Engine::reload_show`]),
+/// unless the watcher reloading under `generation` has been let go since:
+/// then it returns false, the show as it was.
+pub(super) fn reload_timeline(
+    engine: &Engine,
     file_paths: &[PathBuf],
-    effect_engine: &Arc<Mutex<EffectEngine>>,
-    current_song_timeline: &Arc<Mutex<Option<LightingTimeline>>>,
-    current_song_time: &Arc<AtomicU64>,
-    lighting_system: Option<&Arc<Mutex<LightingSystem>>>,
-    lighting_config: Option<&crate::config::Lighting>,
     fallback_tempo_map: Option<&crate::tempo::TempoMap>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    palette: &HashMap<String, Color>,
+    generation: u64,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut all_shows = Vec::new();
 
     for path in file_paths {
-        let content = std::fs::read_to_string(path)
+        let content = crate::util::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
 
         // Parse with the same tempo this timeline will run under. Using the
         // tempo-less entry point here meant a show inheriting the song's tempo
         // failed every live edit, and the timeline silently never swapped.
-        let shows =
-            crate::lighting::parser::parse_light_shows_with_tempo(&content, fallback_tempo_map)
-                .map_err(|e| format!("Parse error in {}: {}", path.display(), e))?;
+        let shows = crate::lighting::parser::parse_light_file(
+            &engine.layers(),
+            &content,
+            Some(path),
+            fallback_tempo_map,
+        )
+        .map_err(|e| format!("Parse error in {}: {}", path.display(), e))?;
 
         // Validate if lighting config is available
-        if let Some(lc) = lighting_config {
+        if let Some(lc) = engine.lighting_config.as_ref() {
             validate_light_shows(&shows, Some(lc))
                 .map_err(|e| format!("Validation error in {}: {}", path.display(), e))?;
         }
@@ -223,110 +230,42 @@ fn reload_timeline(
         }
     }
 
-    if all_shows.is_empty() {
-        return Err("No shows found after re-parse".into());
-    }
-
-    let mut new_timeline = LightingTimeline::new(all_shows);
-
-    // Get current song time
-    let song_time = Duration::from_nanos(current_song_time.load(Ordering::Relaxed));
-
-    // Calculate the timeline update before acquiring the engine lock.
-    let timeline_update = if song_time > Duration::ZERO {
-        new_timeline.start_at(song_time)
-    } else {
-        new_timeline.start();
-        crate::lighting::timeline::TimelineUpdate::default()
-    };
-
-    // Pre-resolve group names while the engine lock is NOT held
-    // to avoid deadlocking with the lighting system lock.
-    let resolved_effects_with_elapsed: Vec<_> = {
-        let mut sorted: Vec<_> = timeline_update.effects_with_elapsed.values().collect();
-        sorted.sort_by_key(|(effect, _)| effect.cue_time.unwrap_or(Duration::ZERO));
-        sorted
-            .into_iter()
-            .map(|(effect, elapsed)| {
-                (
-                    resolve_effect_groups(lighting_system, effect.clone()),
-                    *elapsed,
-                )
-            })
-            .collect()
-    };
-    let mut resolved_effects: Vec<_> = timeline_update.effects;
-    resolved_effects.sort_by_key(|e| if e.id.starts_with("seq_") { 0 } else { 1 });
-    let resolved_effects: Vec<_> = resolved_effects
-        .into_iter()
-        .map(|e| resolve_effect_groups(lighting_system, e))
-        .collect();
-
-    // Extract tempo map before moving new_timeline into the lock. Shows
-    // without their own tempo block fall back to the song's tempo map.
-    let tempo_map = new_timeline
-        .tempo_map()
-        .cloned()
-        .or_else(|| fallback_tempo_map.cloned());
-
-    // Swap the timeline first, so the main effects loop won't generate
-    // updates from the old timeline while the engine has new state.
-    {
-        let mut current = current_song_timeline.lock();
-        // The song's end bound belongs to the song, not the show text.
-        new_timeline.set_end_cap(current.as_ref().and_then(|t| t.end_cap()));
-        *current = Some(new_timeline);
-    }
-
-    // Atomically stop + apply the new state under a single lock to prevent
-    // the sampler loop from seeing an intermediate empty state (flash).
-    {
-        info!("Watcher acquiring effect_engine lock for reload...");
-        let mut engine = effect_engine.lock();
-        info!("Watcher acquired effect_engine lock.");
-        engine.set_tempo_map(tempo_map);
-        engine.stop_all_effects();
-
-        if song_time > Duration::ZERO {
-            for cmd in &timeline_update.layer_commands {
-                engine.apply_layer_command(cmd);
-            }
-            for seq_name in &timeline_update.stop_sequences {
-                engine.stop_sequence(seq_name);
-            }
-            for (effect, elapsed_time) in resolved_effects_with_elapsed {
-                if let Err(e) = engine.start_effect_with_elapsed(effect, elapsed_time) {
-                    error!("Failed to start lighting effect with elapsed time: {}", e);
-                }
-            }
-        }
-        for effect in resolved_effects {
-            if let Err(e) = engine.start_effect(effect) {
-                error!("Failed to start lighting effect: {}", e);
-            }
-        }
-        info!("Watcher releasing effect_engine lock.");
-    }
-
-    Ok(())
-}
-
-/// Resolves group names in an effect's target_fixtures to actual fixture names.
-fn resolve_effect_groups(
-    lighting_system: Option<&Arc<Mutex<LightingSystem>>>,
-    effect: crate::lighting::EffectInstance,
-) -> crate::lighting::EffectInstance {
-    if let Some(ls) = lighting_system {
-        let mut system = ls.lock();
-        system.resolve_effect_groups(effect)
-    } else {
-        effect
-    }
+    // No end cap of its own: `reload_show` carries the running timeline's
+    // over.
+    let timeline = super::engine::lighting_timeline(all_shows, Duration::ZERO, palette)
+        .ok_or("No shows found after re-parse")?;
+    let tempo_map = timeline.tempo_map_or(fallback_tempo_map);
+    Ok(engine.reload_show(timeline, tempo_map, generation))
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::sync::Arc;
+
+    /// An engine for one universe with `lighting` (from `base`), its song
+    /// time at `song_time`.
+    fn test_engine(
+        lighting: Option<&crate::config::Lighting>,
+        base: Option<&std::path::Path>,
+        song_time: Duration,
+    ) -> Arc<Engine> {
+        let engine = Engine::new(
+            &crate::config::Dmx::new(
+                None,
+                None,
+                Some(9010),
+                vec![crate::config::Universe::new(1, "universe1".to_string())],
+                None,
+            ),
+            lighting,
+            base,
+            crate::dmx::ola_client::OlaClientFactory::create_mock_client(),
+        )
+        .unwrap();
+        engine.update_song_time(song_time);
+        Arc::new(engine)
+    }
 
     #[test]
     fn reload_timeline_with_valid_file_at_zero() {
@@ -341,21 +280,81 @@ mod test {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_ok());
-        assert!(timeline.lock().is_some());
+        assert!(engine.current_song_timeline.lock().is_some());
+    }
+
+    #[test]
+    fn a_reload_keeps_the_colours_the_song_started_with() {
+        // A live edit of the show re-reads its file, but the palette the
+        // song started with (its override and its entry's) is the one the
+        // new timeline settles to.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dsl_path = tmp_dir.path().join("show.light");
+        std::fs::write(
+            &dsl_path,
+            "palette { primary: \"#C01020\" }\nshow \"t\" {\n    @00:00.000\n    front_wash: static color: palette.primary, duration: 5s\n}",
+        )
+        .unwrap();
+        let engine = test_engine(None, None, Duration::ZERO);
+        let red = |engine: &Engine| {
+            let timeline = engine.current_song_timeline.lock();
+            let (_, effects) = timeline.as_ref().unwrap().cue_effects().next().unwrap();
+            match &effects[0].effect_type {
+                crate::lighting::effects::EffectType::Static { parameters, .. } => {
+                    (parameters["red"] * 255.0).round() as u8
+                }
+                other => panic!("{other:?}"),
+            }
+        };
+        reload_timeline(
+            &engine,
+            std::slice::from_ref(&dsl_path),
+            None,
+            &HashMap::new(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(red(&engine), 0xC0);
+        let palette = HashMap::from([("primary".to_string(), Color::new(0x20, 0x40, 0xFF))]);
+        reload_timeline(&engine, &[dsl_path], None, &palette, 0).unwrap();
+        assert_eq!(red(&engine), 0x20);
+    }
+
+    #[test]
+    fn a_reload_leaves_what_midi_dmx_holds() {
+        // A live edit's reload cleared the MIDI DMX store along with the
+        // show's effects, and nothing put it back mid-song (#583).
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let dsl_path = tmp_dir.path().join("show.light");
+        std::fs::write(
+            &dsl_path,
+            "show \"test\" {\n    @00:00.000\n    front_wash: static color: \"blue\", duration: 5s\n}",
+        )
+        .unwrap();
+        let store = Arc::new(parking_lot::RwLock::new(
+            crate::dmx::midi_dmx_store::MidiDmxStore::new(),
+        ));
+        {
+            let mut store = store.write();
+            store.register_slot(1, 1, "par", "dimmer");
+            store.register_universe(1);
+        }
+        store.read().write(1, 1, 200, false);
+        let engine = test_engine(None, None, Duration::from_secs(3));
+        engine
+            .effect_engine
+            .lock()
+            .set_midi_dmx_store(store.clone());
+
+        reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0).unwrap();
+        assert!(
+            store.read().has_active_slots(),
+            "the reload cleared MIDI DMX"
+        );
     }
 
     #[test]
@@ -373,37 +372,23 @@ mod test {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(Duration::from_secs(3).as_nanos() as u64));
+        let engine = test_engine(None, None, Duration::from_secs(3));
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_ok());
-        assert!(timeline.lock().is_some());
+        assert!(engine.current_song_timeline.lock().is_some());
     }
 
     #[test]
     fn reload_timeline_with_missing_file() {
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
 
         let result = reload_timeline(
+            &engine,
             &[PathBuf::from("/nonexistent/show.light")],
-            &effect_engine,
-            &timeline,
-            &song_time,
             None,
-            None,
-            None,
+            &HashMap::new(),
+            0,
         );
         assert!(result.is_err());
     }
@@ -414,19 +399,9 @@ mod test {
         let dsl_path = tmp_dir.path().join("bad.light");
         std::fs::write(&dsl_path, "this is not valid DSL {").unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_err());
     }
 
@@ -446,28 +421,16 @@ mod test {
         // Lighting config with "front_wash" defined so validation passes
         let lighting_config = crate::config::Lighting::new(
             None,
-            Some({
-                let mut fixtures = std::collections::HashMap::new();
-                fixtures.insert("front_wash".to_string(), "Generic_Dimmer @ 1:1".to_string());
-                fixtures
-            }),
-            None,
+            Some(std::collections::HashMap::from([(
+                "front_wash".to_string(),
+                crate::config::lighting::LogicalGroup::new("front_wash".to_string(), vec![]),
+            )])),
             None,
         );
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(Some(&lighting_config), None, Duration::ZERO);
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            Some(&lighting_config),
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_ok());
     }
 
@@ -487,28 +450,16 @@ mod test {
         // Lighting config WITHOUT "unknown_fixture" — validation will fail
         let lighting_config = crate::config::Lighting::new(
             None,
-            Some({
-                let mut fixtures = std::collections::HashMap::new();
-                fixtures.insert("front_wash".to_string(), "Generic_Dimmer @ 1:1".to_string());
-                fixtures
-            }),
-            None,
+            Some(std::collections::HashMap::from([(
+                "front_wash".to_string(),
+                crate::config::lighting::LogicalGroup::new("front_wash".to_string(), vec![]),
+            )])),
             None,
         );
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(Some(&lighting_config), None, Duration::ZERO);
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            Some(&lighting_config),
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_err());
     }
 
@@ -525,26 +476,24 @@ mod test {
         )
         .unwrap();
 
-        let mut ls = LightingSystem::new();
-        let _ = ls.load(
-            &crate::config::Lighting::new(None, None, None, None),
-            tmp_dir.path(),
-        );
-        let lighting_system = Arc::new(Mutex::new(ls));
-
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(Duration::from_secs(1).as_nanos() as u64));
-
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            Some(&lighting_system),
+        // The group named, so the show validates against the configuration
+        // the lighting system loads.
+        let lighting = crate::config::Lighting::new(
             None,
+            Some(std::collections::HashMap::from([(
+                "front_wash".to_string(),
+                crate::config::lighting::LogicalGroup::new("front_wash".to_string(), vec![]),
+            )])),
             None,
         );
+        let engine = test_engine(
+            Some(&lighting),
+            Some(tmp_dir.path()),
+            Duration::from_secs(1),
+        );
+        assert!(engine.lighting_system.is_some());
+
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_ok());
     }
 
@@ -556,19 +505,9 @@ mod test {
         // Write a valid DSL file but with empty content (no show blocks)
         std::fs::write(&dsl_path, "// just a comment\n").unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No shows found"));
     }
@@ -591,20 +530,10 @@ mod test {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
         // Set song_time > 0 to exercise the layer_commands/stop_sequences path
-        let song_time = Arc::new(AtomicU64::new(Duration::from_secs(3).as_nanos() as u64));
+        let engine = test_engine(None, None, Duration::from_secs(3));
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_ok());
     }
 
@@ -634,20 +563,10 @@ show "test" {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
         // Set song_time past the stop sequence cue
-        let song_time = Arc::new(AtomicU64::new(Duration::from_secs(3).as_nanos() as u64));
+        let engine = test_engine(None, None, Duration::from_secs(3));
 
-        let result = reload_timeline(
-            &[dsl_path],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path], None, &HashMap::new(), 0);
         assert!(result.is_ok());
     }
 
@@ -665,14 +584,18 @@ show "test" {
             None,
         );
 
-        let resolved = resolve_effect_groups(None, effect);
+        let resolved = test_engine(None, None, Duration::ZERO).resolve_effect_groups(effect);
         assert_eq!(resolved.target_fixtures, vec!["group1".to_string()]);
     }
 
     #[test]
     fn resolve_effect_groups_with_system() {
-        let ls = LightingSystem::new();
-        let lighting_system = Arc::new(Mutex::new(ls));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(
+            Some(&crate::config::Lighting::new(None, None, None)),
+            Some(tmp_dir.path()),
+            Duration::ZERO,
+        );
 
         let effect = crate::lighting::EffectInstance::new(
             "test".to_string(),
@@ -686,7 +609,7 @@ show "test" {
             None,
         );
 
-        let _resolved = resolve_effect_groups(Some(&lighting_system), effect);
+        let _resolved = engine.resolve_effect_groups(effect);
     }
 
     #[test]
@@ -711,19 +634,9 @@ show "test" {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
 
-        let result = reload_timeline(
-            &[dsl_path1, dsl_path2],
-            &effect_engine,
-            &timeline,
-            &song_time,
-            None,
-            None,
-            None,
-        );
+        let result = reload_timeline(&engine, &[dsl_path1, dsl_path2], None, &HashMap::new(), 0);
         assert!(result.is_ok());
     }
 
@@ -740,19 +653,15 @@ show "test" {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
         let (tx, mut rx) = broadcast::channel(16);
 
         let _handle = start_watching(
+            Arc::downgrade(&engine),
+            0,
             vec![dsl_path.clone()],
-            effect_engine,
-            timeline.clone(),
-            song_time,
             None,
-            None,
-            None,
+            Default::default(),
             tx,
         )
         .unwrap();
@@ -776,8 +685,8 @@ show "test" {
             match rx.try_recv() {
                 Ok(msg) => {
                     assert!(
-                        msg.contains("reload"),
-                        "Expected reload message, got: {}",
+                        matches!(msg, SocketMessage::Reload(_)),
+                        "Expected reload message, got: {:?}",
                         msg
                     );
                     received = true;
@@ -793,9 +702,69 @@ show "test" {
 
         // Timeline should have been updated
         assert!(
-            timeline.lock().is_some(),
+            engine.current_song_timeline.lock().is_some(),
             "Timeline should be set after reload"
         );
+    }
+
+    #[test]
+    fn editing_an_included_file_reloads_the_show() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let common_dir = tmp_dir.path().join("common");
+        std::fs::create_dir(&common_dir).unwrap();
+        let common_path = common_dir.join("looks.light");
+        let looks = |colour: &str| {
+            format!(
+                "sequence \"wash\" {{\n    @00:00.000\n    front_wash: static color: \"{colour}\", duration: 5s\n}}\n"
+            )
+        };
+        std::fs::write(&common_path, looks("blue")).unwrap();
+        let song_dir = tmp_dir.path().join("song");
+        std::fs::create_dir(&song_dir).unwrap();
+        let dsl_path = song_dir.join("show.light");
+        std::fs::write(
+            &dsl_path,
+            "include \"../common/looks.light\"\n\nshow \"test\" {\n    @00:00.000\n    sequence \"wash\"\n}\n",
+        )
+        .unwrap();
+
+        let engine = test_engine(None, None, Duration::ZERO);
+        let (tx, mut rx) = broadcast::channel(16);
+        let _handle = start_watching(
+            Arc::downgrade(&engine),
+            0,
+            vec![dsl_path.clone()],
+            None,
+            Default::default(),
+            tx,
+        )
+        .unwrap();
+
+        // Only the included file changes; the show file is untouched.
+        std::thread::sleep(Duration::from_millis(500));
+        std::fs::write(&common_path, looks("red")).unwrap();
+
+        let start = std::time::Instant::now();
+        let mut status = None;
+        while start.elapsed() < Duration::from_secs(5) {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    status = Some(msg);
+                    break;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+        let status = status.expect("an edit to an included file reloads the show");
+        assert_eq!(
+            status,
+            SocketMessage::Reload(ShowReload::Ok),
+            "reload failed"
+        );
+        assert!(engine.current_song_timeline.lock().is_some());
     }
 
     #[test]
@@ -811,19 +780,15 @@ show "test" {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
         let (tx, mut rx) = broadcast::channel(16);
 
         let _handle = start_watching(
+            Arc::downgrade(&engine),
+            0,
             vec![dsl_path.clone()],
-            effect_engine,
-            timeline,
-            song_time,
             None,
-            None,
-            None,
+            Default::default(),
             tx,
         )
         .unwrap();
@@ -840,8 +805,8 @@ show "test" {
             match rx.try_recv() {
                 Ok(msg) => {
                     assert!(
-                        msg.contains("error"),
-                        "Expected error reload message, got: {}",
+                        matches!(msg, SocketMessage::Reload(ShowReload::Error { .. })),
+                        "Expected error reload message, got: {:?}",
                         msg
                     );
                     break;
@@ -852,6 +817,44 @@ show "test" {
                 Err(e) => panic!("Unexpected error: {:?}", e),
             }
         }
+    }
+
+    #[test]
+    fn a_watcher_let_go_reloads_nothing() {
+        // Dropping a watcher does not drain what it has taken in: an edit
+        // still in its debounce as the song changed reloaded the last
+        // song's show into the next one.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let last = tmp_dir.path().join("last.light");
+        std::fs::write(
+            &last,
+            "show \"last\" {\n    @00:00.000\n    front_wash: static color: \"red\", duration: 5s\n    @00:02.000\n    front_wash: static color: \"green\", duration: 5s\n}",
+        )
+        .unwrap();
+        let next = tmp_dir.path().join("next.light");
+        std::fs::write(
+            &next,
+            "show \"next\" {\n    @00:00.000\n    front_wash: static color: \"blue\", duration: 5s\n}",
+        )
+        .unwrap();
+        let engine = test_engine(None, None, Duration::from_secs(1));
+        let old = engine.retire_watcher();
+        // The next song starts, with a watcher of its own.
+        let new = engine.retire_watcher();
+        assert!(reload_timeline(
+            &engine,
+            std::slice::from_ref(&next),
+            None,
+            &HashMap::new(),
+            new
+        )
+        .unwrap());
+        let cues = engine.get_timeline_cues();
+        // The last song's watcher's edit lands after.
+        assert!(!reload_timeline(&engine, &[last], None, &HashMap::new(), old).unwrap());
+        assert_eq!(engine.get_timeline_cues(), cues);
+        // The next song's own still reloads.
+        assert!(reload_timeline(&engine, &[next], None, &HashMap::new(), new).unwrap());
     }
 
     #[test]
@@ -867,19 +870,15 @@ show "test" {
         )
         .unwrap();
 
-        let effect_engine = Arc::new(Mutex::new(EffectEngine::new()));
-        let timeline = Arc::new(Mutex::new(None));
-        let song_time = Arc::new(AtomicU64::new(0));
+        let engine = test_engine(None, None, Duration::ZERO);
         let (tx, _rx) = broadcast::channel(16);
 
         let result = start_watching(
+            Arc::downgrade(&engine),
+            0,
             vec![dsl_path],
-            effect_engine,
-            timeline,
-            song_time,
             None,
-            None,
-            None,
+            Default::default(),
             tx,
         );
         assert!(result.is_ok());

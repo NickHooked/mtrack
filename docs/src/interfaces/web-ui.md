@@ -7,7 +7,7 @@ port 8080 by default (`http://0.0.0.0:8080`).
 Use `--web-port` and `--web-address` to customize:
 
 ```
-$ mtrack start /path/to/project --web-port 9090 --web-address 127.0.0.1
+$ mtrack start /path/to/project --web-port 8081 --web-address 127.0.0.1
 ```
 
 The UI is fully responsive — desktop layout above 720px, phone layout (slide-in drawer + sticky
@@ -21,6 +21,14 @@ mtrack starts in **locked mode** by default. When locked, all state-altering ope
 edits, playlist changes, configuration updates, file uploads) are blocked. Save and delete
 buttons across every editor become visibly disabled, with a tooltip explaining why. Playback
 controls (play, stop, next, previous, playlist switching) always work regardless of lock state.
+
+The lock holds on every control surface, not only the web UI. While locked, the gRPC config
+and lighting write RPCs ([gRPC](grpc.md#lock-mode)) and the MCP tools that write config or project files
+([MCP](mcp.md#lock-mode)) are refused too; reads and playback controls stay open on all of
+them. Track gain faders are a performance control: a gain change still saves to the active
+profile while locked. The lock is normally toggled from the web UI (a gRPC client or a paired phone can also do it, with
+`SetLock`), so when the web UI cannot start (its address is invalid or its port is taken), mtrack
+logs it and runs unlocked.
 
 Toggle the lock from the lock icon in the top nav (or, on phone, from the mini-player). When
 locked, a thin amber **LIVE — locked** stripe surfaces under the top nav as a constant
@@ -40,23 +48,47 @@ subsystems, polled every 5 seconds:
 - **Green** — All required subsystems are connected.
 - **Amber** — Something is initializing, or a controller is in error.
 - **Red** — A required subsystem is not connected. Audio is always required; MIDI / DMX are
-  required when the active profile has them configured.
-- **Pulsing red** — The WebSocket connection itself is down. The lighting editor also shows a
+  required when the active profile has them configured. The current venue not loading is red
+  too, and puts a banner on every page (see
+  [When a venue does not load](../lighting/configuration.md#when-a-venue-does-not-load)).
+- **Pulsing red** — The web UI's `Watch` stream from the player is down. The lighting editor also shows a
   yellow warning banner in this state.
 
 Click the dot to jump to the [Status page](#status-page) for details and one-click "Configure →"
 or "Fix →" actions on subsystems that need attention.
 
-A 2px pink fill at the bottom edge of the top nav reflects elapsed/total playback position
-while a song is playing, so you can tell where you are in the song without leaving the page
-you're working on.
+A thin progress bar along the bottom edge of the top nav shows elapsed and total playback
+position while a song is playing, so you can tell where you are in the song without leaving the
+page you're working on.
+
+## Banners under the navigation
+
+A few states that matter on every page show as a full-width line under the top nav until they
+end:
+
+- **The current venue did not load** (red): no fixture will light until the venue file is fixed.
+  It names the venue and the reason, with a link to it (see
+  [When a venue does not load](../lighting/configuration.md#when-a-venue-does-not-load)).
+- **Test output is live** — a fixture test is sending to the lights, with the universe and
+  addresses, a link to the fixture's page and **Stop** (see [Testing a fixture](../lighting/web-ui.md#testing-a-fixture)).
+- **mtrack was updated** — the server now runs a newer web UI than this tab loaded, after an
+  upgrade or restart. **Reload** loads it; the tab never reloads by itself, since you may be in
+  the middle of an edit.
+
+![The red banner when the current venue did not load, naming the fixture and the reason, with a
+link to the venue](../images/banner-venue-failed.png)
+
+![The banner while a fixture test is live: universe, addresses and fixture, with Open and
+Stop](../images/banner-test-output.png)
+
+![The notice that mtrack was updated, with Reload](../images/banner-ui-updated.png)
 
 ## Unsaved-Changes Guard
 
 When you have unsaved edits in the Songs detail, Config, Playlists, or Lighting editors, the
 **Save** button shifts to a primary (cyan) treatment with an "Unsaved" pill next to it.
-Clicking a top-nav link or the back-link with unsaved changes triggers a "Discard unsaved
-changes?" confirmation; cancel restores the URL and your edits stay intact. Tab navigation
+Clicking a top-nav link or the back-link with unsaved changes asks you to confirm discarding
+them; cancel restores the URL and your edits stay intact. Tab navigation
 within the same editor (e.g. switching between Songs detail tabs) keeps the same component
 mounted and does not prompt — your edits across tabs persist.
 
@@ -68,18 +100,39 @@ The dashboard is the landing page, providing an at-a-glance view of the player s
 
 - **Playback card** — Play/stop/next/prev with a progress bar showing elapsed and total time
   (for a song with no audio, the total is when its last lighting effect ends).
+  While a song waits out its playlist entry's [auto play](../getting-started/playlists.md#auto-play)
+  gap, the card counts it down ("Opener starts in 2s"); Stop cancels it. While a looping song
+  [ends over its fade-out](../getting-started/playlists.md#ending-a-looping-song) the card says
+  so ("Walk-in loop is fading out (4s)"); Stop again cuts it. An **Ambient light**
+  badge shows while the [ambient show](../lighting/configuration.md#ambient-light) plays, and
+  **No ambient show** when the mode is On with none to play. With a DMX engine, an
+  **Auto / On / Off** switch beside it sets the
+  [ambient mode](../lighting/configuration.md#ambient-mode): On holds ambient up now, over any
+  song; Off fades it out. Like the transport, it works while the player is locked.
+  Under the song name a quiet line says what comes next and how it will arrive: "Next: Opener —
+  starts by itself after 2s", "Next: The Slow One — waits for Play", or, while a looping song
+  plays, "Next breaks the loop: fades out over 1 measure into Opener" (from the playlist's
+  [transitions](../getting-started/playlists.md#transitions)). At the last song it reads "End of
+  playlist".
+
+  ![The playback card counting down to a song's auto play, with the Ambient light
+  badge](../images/playback-auto-play.png)
+
   Displays the currently playing song name. The progress bar is clickable: click anywhere to
   seek — while playing everything (audio, MIDI, lighting) restarts in sync at that position;
   while stopped the position is remembered and used by the next Play (shown as a marker on the
-  bar). When a song has defined sections, section chips appear — tinted with the section's
+  bar). When a song has defined sections (named, colored ranges of the song such as verse or chorus,
+  edited on the [Timeline tab](#timeline-tab)), section chips appear — tinted with the section's
   color from the editor: clicking a section name seeks
   to its start, and the small loop button next to it arms a section loop. An active loop shows
-  the section name and a "Stop Loop" button. Beat/measure position is displayed when beat grid
-  data is available, along with a visual metronome: one dot per beat of the current meter with
+  the section name and a "Stop Loop" button. Beat/measure position is displayed when the song has a beat grid (the
+  detected beat and measure positions of its click track, or its tempo map), along with a visual metronome: one dot per beat of the current meter with
   the active beat highlighted, and a pulse that flashes on every beat while playing. When the
-  song's metronome defines [accent levels](#metronome-feel), the dots and the pulse follow
+  song's metronome defines [accent levels](#metronome-feel) (per-beat loudness: silent, normal,
+  half accent, accent), the dots and the pulse follow
   them — accents emphasized, half accents in amber, silent beats hollow and unflashed —
-  otherwise the downbeat is accented. Pilot hints appear as markers on the progress bar, and
+  otherwise the downbeat is accented. Pilot hints (timed on-screen cues, optionally with a spoken
+  clip, edited on the [Timeline tab](#tempo-and-pilot-layers)) appear as markers on the progress bar, and
   upcoming hint labels are shown a few seconds ahead of their position. Hints that follow each other closely
   (e.g. a "bridge" label and its "3..2..1" countdown) stay visible together, with only the
   live one highlighted — while its sample plays, or briefly at the anchor for label-only
@@ -87,31 +140,35 @@ The dashboard is the landing page, providing an at-a-glance view of the player s
 - **Playlist selector** — Dropdown to switch between all available playlists. The current
   playlist's songs are listed below. Songs are clickable to jump directly to a song during
   playback.
-- **Waveform** — Per-track waveform peak display for the current song, rendered with DPR
-  scaling for crisp display on HiDPI/Retina screens. Each track row also has a gain slider
+- **Tracks** — Per-track waveform peak display for the current song. Each track row also has a gain slider
   (double-click resets to 0 dB) and an **M** mute button. Muting silences the track
   immediately without touching the fader value, so unmuting restores the exact gain you
   had — mute state is runtime-only and resets on player restart.
 - **Stage view** — Interactive canvas with real-time RGB color rendering, glow effects, and
-  strobe animation. When the current venue carries stage positions (a `.venue` file, seeded by
-  `import-mvr` or written by hand), it is a top-down stage plot to scale: a meter grid, the
-  audience at the bottom, stage-left on the right, the venue's focus points as pins, and — for
+  strobe animation. When the current venue carries stage positions (a `.venue` file, seeded by an MVR import
+  or written by hand), it is a top-down stage plot to scale: a meter grid, the
+  audience at the bottom, stage-left on the right, the venue's focus points (named spots on the stage that cues can aim at) as pins, and — for
   each placed fixture — its beam, drawn in the color it is showing from the fixture to where the
   beam meets the deck (a dashed heading when it points up or level). A static fixture gets a beam
   too, out of its rest pose through its mounting, so the plot shows which way it is hung. Fixtures the venue has not placed
-  wait in a tray along the bottom; drag one onto the stage to place it. Dragging a fixture or a
-  focus pin writes the new coordinates to the venue file, the running engine reloads the venue,
-  and every open stage view redraws from the file. The **+ Focus point** button adds a pin, and
-  the list beneath the plot renames or deletes them — focus points are the stage points a show
-  aims at, so name them for what they are ("drummer", "center-stage"). A fixture dragged from the
-  tray is hung at 3 m; edit the venue file to correct its height. Without positions the view is
-  the older layout organized by tags (left, right, front, back), and dragging only rearranges the
-  picture in this browser's localStorage.
+  wait in a tray along the bottom. On the dashboard the plot is a live view only; placing
+  fixtures and editing focus points happens on the Lighting area's
+  [Venues](../lighting/web-ui.md#venues) page, and the card's **Edit** button goes there. Without positions the view is
+  a layout organized by tags (left, right, front, back), and dragging only rearranges the
+  picture in this browser's localStorage. With a current venue the card has a **Plot | 3D**
+  switch: **3D** shows the venue as a room, live, in place of the plot, without leaving the
+  dashboard (see [Plot and 3D](../lighting/web-ui.md#plot-and-3d)). The dashboard does not remember the switch; a
+  reload shows the plot. The **maximize** button beside it fills the browser window with the
+  card until you press it again or press Escape; a playback bar along the bottom stands in for
+  the transport the card covers.
 - **Active effects** — Lists currently running lighting effects by name.
 - **Log panel** — Streaming application logs with level filter pills
   (TRACE/DEBUG/INFO/WARN/ERROR), defaulting to INFO+. ERROR rows get a pink-tinted
   background and a left-edge stripe; WARN rows get the same treatment in amber, so they're
   hard to miss while scanning during a show.
+
+**Keyboard shortcuts** on the dashboard (inactive while a text field has focus): **Space**
+starts or stops playback, **→** goes to the next song and **←** to the previous one.
 
 ## Song Browser
 
@@ -130,21 +187,21 @@ you can then populate with tracks.
 
 ### Importing Songs
 
-Click **Import from Filesystem** to browse the server's filesystem and import existing song
-directories.
+Click **Import from Filesystem** to browse the project directory (the directory containing
+`mtrack.yaml`; the browser cannot go outside it) and import existing song directories.
 
 - **Single import** — Navigate to a directory containing audio files, click "Use This Directory"
   to generate a `song.yaml` from the detected audio, MIDI, and lighting files.
 - **Bulk import** — When viewing a directory with subdirectories, click "Import All
-  Subdirectories" to import every subdirectory as a song. Subdirectories are scanned
-  recursively, so nested structures (artist/album/song) are handled automatically. Directories
-  that already have a `song.yaml` are skipped.
+  Subdirectories" to import every subdirectory holding audio or MIDI files as a song.
+  Subdirectories are scanned recursively, so nested structures (artist/album/song) are handled
+  automatically. Directories that already have a song config are skipped.
 
 ![Bulk import results](../images/bulk-import-result.png)
 
 ### Deleting Songs
 
-Hover over a song and click the X button to remove it from the registry. This only deletes
+Hover over a song and click the X button to remove it from the song repository. This only deletes
 `song.yaml` — audio, MIDI, and lighting files are preserved. The song is also removed from
 any playlists that reference it.
 
@@ -152,7 +209,11 @@ A song that is currently playing cannot be deleted.
 
 ## Song Detail
 
-Click a song to open its detail view with five tabs:
+Click a song to open its detail view with five tabs: Tracks, Samples, Timeline, Lighting and
+Config. A **Loop Playback** checkbox above the tabs sets `loop_playback` for the song (see
+[Song Looping](#whole-song-looping)). While it is on, **Loop crossfade** sets `loop_crossfade`
+(e.g. `2measures`), and the tracks ticked under **Switch at the midpoint** go in
+`loop_crossfade_cut`.
 
 ![Song detail](../images/song-detail.png)
 
@@ -160,19 +221,29 @@ Click a song to open its detail view with five tabs:
 
 Edit track names, assign audio files, and upload new audio files via drag-and-drop or file
 picker. When uploading a file that already exists, you'll be prompted to confirm the replacement.
-The MIDI playback file is also configured here — pick from existing files, browse the server
-filesystem, or upload a new `.mid` file. When a MIDI file is configured, a 16-channel toggle
-grid lets you exclude specific channels from playback. Three preset chips above the grid —
+The MIDI playback file is also configured here — pick from existing files, browse the project
+directory, or upload a new `.mid` file. When a MIDI file is configured, a 16-channel toggle
+grid (laid out eight to a row) lets you exclude specific channels from playback. Three preset chips above the grid —
 **None / All / Drums only** — cover the common cases; "Drums only" excludes every channel
 except 10 (the General MIDI drum channel) for the live-show pattern of mtrack running drums
 while the band plays everything else.
 
-Supported audio formats: WAV, FLAC, MP3, OGG, AAC, M4A, AIFF.
+Supported audio formats: WAV, FLAC, MP3, OGG, AAC, M4A/MP4, AIFF (`.aiff` or `.aif`).
+
+### Samples Tab
+
+Per-song [sample](../configuration/samples.md) definitions, stored under `samples:` in the
+song's `song.yaml`. A sample defined here overrides the global sample of the same name for this
+song only; with none defined the tab says so. Each sample has a file (typed, browsed in the
+project directory, or uploaded), an output track or output channels, release behavior (play to
+completion, stop, or fade), retrigger mode (cut or polyphonic), a voice limit, a fade time and
+velocity handling (ignore, scale, or layers of velocity ranges). The same editor appears in
+the [Config page](#samples) for the global samples.
 
 ### Timeline Tab
 
-Named "Sections" until it grew tempo and pilot lanes, this is a canvas-based visual editor
-for the song's timeline: sections (e.g., verse, chorus, bridge).
+A canvas-based visual editor for the song's timeline: sections (e.g., verse, chorus, bridge),
+the tempo map and pilot hints.
 The timeline displays all track waveforms and beat grid measure lines. Sections can be:
 
 - **Created** by dragging on empty space
@@ -180,7 +251,7 @@ The timeline displays all track waveforms and beat grid measure lines. Sections 
   zoom makes them distinct
 - **Moved** by dragging the body, which keeps both boundaries' beat offsets
 - **Edited** by tapping a section, which opens its dialog
-- **Deleted** from that dialog, or with the Delete key
+- **Deleted** from that dialog
 
 Zoom controls include +/-, Fit, and Ctrl+scroll wheel with anchor-point zooming. Measure label
 density and snap granularity adapt to zoom level. The ruler carries two bands: measure numbers
@@ -194,7 +265,7 @@ save, so they follow tempo and feel edits immediately.
 
 ![The click and pilot lanes rendered alongside the file tracks](../images/virtual-track-waveforms.png)
 
-Sections are used for [section looping](#section-looping) during playback.
+[Section looping](#section-looping) uses these sections during playback.
 
 ![Section editor](../images/song-sections.png)
 
@@ -237,7 +308,8 @@ match, so the part you are in is recognisable at a glance from across a stage.
 When the song being edited is the one loaded in the player, the editor grows a playhead — a
 draggable line across every lane — plus play/pause and stop buttons and a readout of the
 musical position, time, BPM and meter under it. Drag the line to seek, or use the arrow keys
-for five-second jumps. Auditioning a boundary no longer means switching to the player and back.
+for five-second jumps (the arrow keys work while the playhead has focus). You can audition a
+boundary without switching to the player.
 
 ![Preview transport and playhead](../images/section-preview-transport.png)
 
@@ -245,8 +317,12 @@ for five-second jumps. Auditioning a boundary no longer means switching to the p
 
 Under the timeline, the song's metronome panel routes and shapes its click. The tri-state at
 the top — **Default / On / Off** — decides whether the song follows the player-wide default
-(see [the config editor](#configuration-editor)) or overrides it, which is `enabled` in the
-song's `metronome:` block: absent to follow, `true` or `false` to override.
+(see [Metronome defaults](#metronome-defaults)) or overrides it:
+
+- **Default** removes the song's `metronome:` block, so the song follows the player-wide default.
+- **On** writes a `metronome:` block (with no `enabled` key), which turns the click on for this
+  song whatever the default is.
+- **Off** writes `enabled: false` in the block, keeping the block's other settings.
 
 Below it: the track name the click is routed to, the click volume, presets, and the four click
 sounds. Volume and sounds both start _inherited from player defaults_ rather than silenced or
@@ -284,8 +360,9 @@ The [section dialog](#the-section-dialog) above shows two of them, with the capt
 
 #### Tempo and pilot layers
 
-Above the section lane the timeline shows two DAW-style marker layers, so the song's tempo map
-and pilot voice-hints can be authored against the same beat grid:
+The timeline shows two DAW-style marker layers, the tempo layer above the section lane and the
+pilot layer below it, so the song's tempo map and pilot hints can be authored against the same
+beat grid:
 
 - **Tempo layer** — one marker per tempo event (the starting `bpm`/`time_signature` plus each
   `change`). Clicking a marker opens the **tempo change** dialog to edit the measure/beat
@@ -294,17 +371,16 @@ and pilot voice-hints can be authored against the same beat grid:
 - **Pilot layer** — one marker per voice hint. Clicking a marker opens the **pilot hint** dialog
   to edit the label, the position — anchored to a beat or to an absolute time, converted through
   the beat grid when you switch — and an optional audio clip; a hint with no clip is a visual cue
-  only. Adjacent hints group together when their display
-  windows overlap.
+  only.
 
 ![Section timeline with tempo and pilot layers](../images/section-timeline-editor.png)
 
 ![Tempo change dialog](../images/section-timeline-tempo-dialog.png)
 
-The base marker's dialog also imports: **Guess from beat grid** estimates a map from the
-detected clicks, and **Import from _file_** appears for every light show that has its own
-`tempo` block. Light shows predate song-level tempo maps, so an existing show is usually the
-best seed a song has. Measure-anchored changes copy across as they are; time-anchored ones
+The base marker's dialog also imports: **Detect from MIDI** reads the map from the song's MIDI
+file (or **Guess from beat grid**, which estimates one from the detected clicks, when the song
+has no MIDI file), and **Import from _file_** appears for every light show that has its own
+`tempo` block, which makes an existing show a useful seed for the song's map. Measure-anchored changes copy across as they are; time-anchored ones
 snap to the nearest beat on the grid, and the dialog says how many were snapped and how many
 had to be dropped — a lossy import is never silent. A show is also free to list its changes
 in any order and to put two of them on one position, neither of which a song's `tempo:` block
@@ -349,8 +425,10 @@ levels, so what you see matches what the click plays.
 The lighting tab contains the **timeline editor** — a DAW-style visual editor for authoring
 lighting cue shows. See [Timeline Editor](#timeline-editor) below.
 
-Light show files (`.light`) can be added and removed directly from this tab. Adding or removing
-files is deferred until Save, so navigating away without saving leaves the disk untouched.
+Light show files (`.light`) can be added and removed directly from this tab. **+ DSL** prompts
+for a name and creates an empty show; the tab has no picker for existing `.light` files. Adding or
+removing files is deferred until Save, so navigating away without saving leaves the disk
+untouched.
 
 ### Config Tab
 
@@ -361,8 +439,8 @@ individual songs, with section names autocompleting from the song's defined sect
 ### Saving
 
 The **Save** button in the tab bar saves both the song configuration and any lighting file
-changes. The button shows "Unsaved" when there are pending changes. Ctrl+S / Cmd+S keyboard
-shortcut is also supported.
+changes. The button shows "Unsaved" when there are pending changes. Changes to the song's samples are
+saved by the same button.
 
 ## Timeline Editor
 
@@ -399,8 +477,10 @@ The toolbar includes a full transport:
 **Keyboard shortcuts:**
 
 - **Space** — Toggle play/pause
-- **Home** — Skip to start
-- **End** — Skip to end
+- **Home** — Skip to start (while stopped or paused)
+- **End** — Skip to end (while stopped or paused)
+
+The shortcuts apply while the timeline has focus and no text field does.
 
 When you press **Play**, mtrack plays the song's audio with synchronized lighting effects.
 The green playhead line animates across the timeline and all show lanes, and the stage
@@ -417,7 +497,7 @@ resumes from that point. Pressing **Stop** resets the cursor to the beginning.
 The bottom-left panel shows a compact stage visualization with real-time fixture RGB output,
 glow effects, strobe animation, and active effect names. It draws the same picture as the
 dashboard stage view: a stage plot with focus pins when the venue has positions, the tag layout
-otherwise. Positions are edited on the dashboard; here, dragging only rearranges the tag layout.
+otherwise. Fixture positions are edited on the Lighting area's [Venues](../lighting/web-ui.md#venues) page; here, dragging only rearranges the tag layout.
 
 ### Editing Cues
 
@@ -438,9 +518,9 @@ otherwise. Positions are edited on the dashboard; here, dragging only rearranges
 When a cue is selected, the properties panel shows its effects, commands, and sequences.
 Each effect has:
 
-- **Group** — A dropdown populated from the venue's fixture groups, with free-text entry
-  for custom groups.
-- **Effect type** — Static, cycle, chase, strobe, pulse, dimmer, rainbow.
+- **Group** — A text field that suggests the venue's fixture groups; any group name can be
+  typed.
+- **Effect type** — Static, cycle, strobe, pulse, chase, dimmer, rainbow, move.
 - **Parameters** — Type-specific controls (colors, speed, frequency, direction, etc.)
   with appropriate dropdowns for constrained values.
 - **Layer & blend** — Layer assignment and blend mode for compositing effects.
@@ -460,13 +540,14 @@ Each effect has:
 The tempo lane in the timeline shows the song's tempo map. Clicking it opens the tempo editor
 with controls for BPM, time signature, start offset, and tempo changes.
 
-- **Detect from MIDI** — When the song has a MIDI file, the editor can extract an authoritative
+- **Detect from MIDI** — When the song has a MIDI file, the tempo marker dialog can extract an authoritative
   tempo map directly from MIDI `SetTempo` and `TimeSignature` meta events. Consecutive
   monotonic BPM changes (ritardandos/accelerandos) are automatically collapsed. If the
   MIDI-predicted beat positions don't align well with click-track detections (RMSE > 15ms),
   a warning badge indicates the MIDI file may not match the recording.
 - **Guess from beat grid** — When no MIDI file is available but the song has a click track,
-  the editor can estimate a tempo map from the detected beat grid. Results are displayed with
+  the button reads **Guess from beat grid** instead and estimates a tempo map from the detected
+  beat grid. Results are displayed with
   an "estimated from beat grid" badge.
 - **Copy from song timeline** — When the song already carries a tempo map of its own, the
   show can take it wholesale rather than being authored twice.
@@ -484,11 +565,48 @@ sequences from show cues to reuse patterns.
 Switch to the **Raw DSL** tab to edit the lighting DSL text directly. A **Validate** button
 checks the syntax without saving. Switching back to the Timeline tab re-parses the DSL.
 
+### Palette
+
+Above the timeline, a collapsed **Palette** card edits each of the song's `.light` files'
+[`palette { }`](../lighting/cueing.md#palettes) block: add a slot (a name and its default
+colour), change its colour, rename it, or remove it. Renaming rewrites every `palette.<slot>`
+the file writes; removing a slot that something still uses is refused, and the uses are listed.
+A colour input in an effect or a sequence reference's colour argument then offers **Palette:
+slot** beside **Custom color**, and a timeline block paints the colour of the slot its effect
+uses.
+
+Under the song's **Lighting** tab, **Palette overrides** lists every slot the song's shows
+declare, with the show's default as a swatch and a picker that writes the song's `palette:`
+(**Reset** removes the key). An override for a slot no show declares is kept and marked **Not
+declared**. See [Palette overrides](../configuration/song-config.md#palette-overrides).
+
 ## Playlist Editor
 
 The playlist editor provides a left panel for browsing, creating, and deleting playlists,
 and a right panel for editing song order (reorder, add, remove) with a searchable
-available-songs list.
+available-songs list. Each song has an **Auto play** box (and a gap once ticked), and the
+playlist an **Ambient light** setting: the profile's, none, or its own. See
+[Playlists](../getting-started/playlists.md#auto-play).
+
+Each song's **Transitions** button opens a panel under it for its fade out and fade in: a length
+(`3s`, `500ms`, `6beats`, `1measure`; empty for none), the curve, the song's tracks that do not
+fade, and for the fade out how long the lights take to cross. Closed, the button sums the fades
+up ("fade out 1 measure · fade in 4 beats"). The fade out applies only to loop breaks of a
+looping song. A save the player would not load (a bad length or curve, or a track the song does
+not have) is refused and nothing is written. See
+[Transitions](../getting-started/playlists.md#transitions).
+
+When any song in the playlist has a [palette](../lighting/cueing.md#palettes), a **Colors across
+the set** strip sits above the song list: one column per song, in playing order, with a band for
+each of the song's palette slots, painted in the colour it will play in (the show's default,
+then the song's override, then this entry's). A set full of the same colour shows as a row of
+matching columns. Click a column to open that entry's panel, where **Colors for this song**
+has a picker for each of the song's slots; **Reset** drops an override. An override naming a
+slot the song's shows do not declare is kept and marked **Not declared**. See
+[Palette overrides](../getting-started/playlists.md#palette-overrides).
+
+![The playlist editor: two songs set to auto play, one after a 2s gap, and the playlist's own
+ambient show](../images/playlist-auto-play.png)
 
 ![Playlist editor](../images/playlist-editor.png)
 
@@ -498,27 +616,45 @@ playlist is always present and auto-generated from the song repository.
 Use the **Activate** button to switch the player to a playlist. This can also be done from
 the dashboard's playlist dropdown.
 
+## Lighting
+
+The **Lighting** item in the top navigation holds everything about lights, as five tabbed pages
+plus an import wizard. [Lighting in the Web UI](../lighting/web-ui.md) covers each page in
+detail; [First Light](../lighting/first-light.md) is a walkthrough from a GDTF file to a show.
+
+| Page | What it holds |
+|---|---|
+| Overview | The readiness checks: will your show reach the lights? |
+| Fixture types | The kinds of fixture in your rig: GDTF files and hand-written types |
+| Venues | Where fixtures sit, the stage plot and the 3D view; the MVR import and export |
+| Groups | Logical groups and the current venue, for one hardware profile |
+| Fit shows | Fit your shows to the venue and the rig: tags, focus points, outputs |
+
 ## Configuration Editor
 
-The config editor provides a profile-based hardware configuration UI with tabs for:
+The config editor lists hardware profiles (add one with **Add Profile**), followed by two
+top-level sections that belong to the whole project rather than one profile: **Samples** and
+**Metronome defaults**. Ctrl+S / Cmd+S saves the open profile.
+
+Opening a profile shows its settings in tabs:
 
 - **Audio** — Device selection, sample rate, format, buffer size, track mappings
-- **MIDI** — Device selection, beat clock, MIDI-to-DMX passthrough mappings with Note Mapper
-  and CC Mapper transformer editors
-- **DMX** — OLA host/port, universe mappings
-- **Lighting** — Fixture types, venues, profile settings with constraint editors. Both
-  fixture-type file forms are listed: a `.light` type opens in the channel-map form, a
-  `.fixture` type (rich channels, or distilled from a GDTF archive) as the text of its file
-- **Triggers** — Audio and MIDI trigger inputs with calibration
-- **Controllers** — gRPC, OSC, and MIDI controller configuration. The MIDI controller section
-  supports full editing of event mappings (play, prev, next, stop, all_songs, playlist) with
-  optional section_ack and stop_section_loop events, plus Morningstar preset naming integration
-- **Status Events** — MIDI events emitted on player state changes (off/idling/playing) for
-  hardware LED feedback
+- **MIDI** — Device selection, playback delay, beat clock
+- **Lighting** — The DMX hardware: the olad port and universe mappings. Below it, a summary of
+  the profile's current venue and group count, with an **Edit in Lighting** link. Fixture types,
+  venues and groups are edited in the [Lighting area](../lighting/web-ui.md)
+- **Triggers** — Audio and MIDI trigger inputs with [calibration](#calibrating-a-trigger-input)
+- **Controllers** — gRPC, OSC, MIDI, and Bluetooth controller configuration. The MIDI controller
+  section supports full editing of event mappings (play, prev, next, stop, all_songs, playlist)
+  with optional section_ack, stop_section_loop, ambient_on, ambient_off, ambient_auto and
+  cancel_auto_play events, plus Morningstar preset naming integration. The Bluetooth card sets
+  the advertised name and, once the configuration is saved, opens the pairing window and lists
+  and forgets paired phones ([Bluetooth Control](bluetooth.md#pairing-a-phone-from-the-web-ui))
 - **Notifications** — Custom audio files for loop armed, break requested, loop exited, and
   section entering events, plus per-section-name overrides
-- **Metronome defaults** — the click sounds every song starts from, and whether the click is
-  on by default
+- **Status Events** — MIDI events emitted on player state changes (off/idling/playing) for
+  hardware LED feedback, plus optional auto-play events, sent in place of the idling events
+  while an auto play waits to start its song
 
 ![Configuration editor](../images/config-editor.png)
 
@@ -552,6 +688,28 @@ What it cannot prove is that sound reached the room. A device can accept every b
 produce nothing; this rules mtrack out, not the rig. The same check is available headless as
 `mtrack test-audio <config>`, which exits non-zero when the device cannot stream.
 
+### Calibrating a trigger input
+
+Each audio trigger input on the Triggers tab has a **Calibrate** button that opens a wizard
+beside it. Pick the input device, the channel and a duration, then **Start**:
+
+1. **Measuring noise floor** — keep all pads silent while the countdown runs.
+2. **Hit your trigger now** — play the pad for the rest of the duration, then **Stop**.
+3. **Calibration Results** — the hits detected and the suggested threshold, gain, scan time,
+   retrigger time and, when relevant, highpass, dynamic threshold and maximum hit amplitude.
+   **Apply** copies them into the input; **Discard** throws them away. With no hits detected,
+   the wizard says so and suggests stronger hits or a quieter setup.
+
+### Samples
+
+The Samples section edits the global sample definitions (`samples:` in `mtrack.yaml`, or the
+file named by `samples_file`; when the samples come from a separate file, a banner names the
+file, there is no Save button and you edit the file directly). It also holds **Max Sample Voices** (default 32).
+Add a sample, give it a file and optionally an output track or channels, release behavior,
+retrigger mode, voice limit, fade time and velocity handling; **Save Samples** writes it.
+See [Samples](../configuration/samples.md) for what each setting does. A song can override
+a sample by name from its [Samples tab](#samples-tab).
+
 ### Metronome defaults
 
 With a dozen songs, click levels and sounds are a player decision rather than a per-song one.
@@ -573,24 +731,34 @@ mtrack supports two levels of looping:
 ### Whole-Song Looping
 
 Songs with `loop_playback: true` in their `song.yaml` loop indefinitely. Audio crossfades
-seamlessly at loop boundaries (100ms linear fade), MIDI restarts from the beginning, and
+seamlessly at loop boundaries (a 10 ms crossfade), MIDI restarts from the beginning, and
 lighting/DMX timelines reset cleanly. During a looping song, pressing Play or Next breaks out
-of the loop, advances the playlist, and auto-plays the next song.
+of the loop, advances the playlist, and auto-plays the next song. Next on the last song, or
+Stop when its playlist entry has a `fade_out`, ends it instead (see
+[Ending a looping song](../getting-started/playlists.md#ending-a-looping-song)).
+
+With `loop_crossfade` set, consecutive passes overlap instead: the audio, lights and MIDI cross
+from one pass to the next over seconds or measures. See
+[Long crossfades](../configuration/song-config.md#long-crossfades).
 
 ### Section Looping
 
 Named sections (defined by measure — and optionally beat — ranges in the Timeline tab or
 `song.yaml`) can be looped
 during playback. Activate a section loop from the dashboard's section buttons, or via gRPC
-(`LoopSection`/`StopSectionLoop`) or MIDI controller events (`section_ack`, `stop_section_loop`).
+(`LoopSection`/`StopSectionLoop`, see the [RPC table](grpc.md#rpcs)) or MIDI controller events
+(`section_ack`, `stop_section_loop`).
 
 When a section loop is active:
 
-- Audio crossfades at section boundaries (100ms linear fade)
+- Audio crossfades at section boundaries (a 10 ms crossfade)
 - MIDI restarts from the section start with hard cut
 - DMX/lighting timelines reset to the section's start time
-- A confirmation tone plays through the `mtrack:looping` track mapping
+- A confirmation tone plays on the outputs mapped to the reserved track name `mtrack:looping` in
+  the profile's track mappings (see [Hardware Profiles](../configuration/hardware-profiles.md))
 - Next/Prev navigation is allowed during looping
+- In a looping song, the section loop comes first, even in one with `loop_crossfade`: the song's
+  own loop waits until the section loop is broken
 
 Section activation is rejected if playback has already passed the section end.
 
@@ -599,14 +767,20 @@ Section activation is rejected if playback has already passed the section end.
 The status page shows build information and hardware subsystem status in a two-column grid
 layout:
 
-- **Audio, MIDI, DMX, Trigger** — Each shows "connected", "initializing", "not connected",
-  or "not configured" with the device name when connected. Subsystems that aren't currently
+- **Audio, MIDI, DMX, Trigger** — Each shows "connected", "initializing", "failed",
+  "not connected" or "not configured", with the device name when connected. Audio can also show
+  "Open, but not playing out" (the stream is open but stalled) or "Reconnecting to the
+  interface" (it is recovering). "Failed" means
+  initialization gave up and needs attention. Subsystems that aren't currently
   connected get a **Configure →** or **Fix →** pill that deep-links to the relevant section
   in the config editor for the active profile.
 - **Controllers** — Per-controller status (running / error) with a Restart button.
 - **Profile** — The matched hostname and active profile name.
 
-The page auto-refreshes every 5 seconds with an "Updated Xs ago" indicator. The top nav
+The page is live: the player sends its status when the page opens and again whenever it changes
+(within about a second), and the page says "Updating live" while it does. If the stream is lost
+it says how long ago the status it still shows was current. **Refresh** opens the stream again,
+which sends the status as it is now. The top nav
 health dot reflects the worst-case state of all required subsystems on this page (see
 [Connection & Health Indicator](#connection--health-indicator)).
 
@@ -616,12 +790,10 @@ health dot reflects the worst-case state of all required subsystems on this page
 
 Below 720px viewport width, the UI swaps in phone-friendly chrome:
 
-- The top nav's tabs collapse behind a **hamburger drawer** (slide-in from the left, 280px
-  wide). Tab and Shift-Tab cycle focus inside the drawer; Esc and a backdrop click close it.
+- The top nav's tabs collapse behind a **hamburger drawer** (slide-in from the left). Tab and Shift-Tab cycle focus inside the drawer; Esc and a backdrop click close it.
 - A sticky bottom **mini-player** with prev / play / next, a song title that taps through to
   the Dashboard, and a lock toggle stays visible across all pages.
-- The Songs detail tab bar scrolls horizontally with a fade on the right edge; the MIDI
-  channel grid reflows from 16-up to 8-up; and the Lighting tab swaps the timeline editor
+- The Songs detail tab bar scrolls horizontally with a fade on the right edge, and the Lighting tab swaps the timeline editor
   (which needs at least ~1000px to be usable) for a read-only summary listing tempo, show
   and sequence cue counts, and the distinct effect types in the song.
 - Editing the Lighting timeline is desktop-only by design. Use a laptop or tablet in
@@ -644,11 +816,48 @@ mtrack must have **write access** to the project root and its contents for manag
 to work. Read-only filesystems will allow playback but not song creation, file uploads, or
 configuration changes from the web UI.
 
-## REST API
+## The web UI's API
 
-The web UI exposes a comprehensive REST API for all management operations. Playback control
-uses gRPC-Web (PlayerService). Real-time state streaming uses WebSocket (`/ws`).
+The web UI has no REST API: nothing is served under `/api`. Every call it makes is gRPC-Web on
+the web port, the same services, behind the same lock, as native gRPC on the gRPC port.
+Playback control uses gRPC-Web (PlayerService), and so do the playlists, the song list, the lock toggle and the
+config store with its profiles (see [gRPC](grpc.md)), and the samples, the metronome defaults, the
+profile files, the device lists, the audio device test, the trigger calibration, the controller
+restart, and a song's config, files, waveform and tempo guess with the browsing and importing of
+songs, which are `ConfigService` calls; the light show files with their validation and evaluation, the
+Lighting overview's readiness checks, the Fit shows page, the groups a cue can target, the
+fixture test, the fixture types with their GDTF details and settings, and the venues with the MVR
+export's summary and keep, and the GDTF and MVR imports, which are `LightingService` calls; and so does everything the page watches: the `Watch` stream
+carries the playback status, log lines, the waveform, show reload notices and the build, hardware
+and controller status (one stream per tab), and the light view (the stage plot and 3D) reads the
+`WatchStage` stream, opened when a page first shows the stage (see [gRPC](grpc.md)). There is no
+websocket, and no `/api/status`: the player's status is the `hardware` event of `Watch`.
 
-All mutating REST endpoints are blocked when the player is in lock mode, returning
-HTTP 423 (Locked). Read endpoints, playback control, playlist activation, and validation
-endpoints always work.
+What is left of HTTP is bytes. A file the page sends (a track, a sample, a GDTF, an MVR) is
+announced with `BeginUpload`, sent as the body of `PUT /uploads/{id}` on the web server, and used
+by the call that takes it (`AddTrackFiles`, `AddSampleFile`, `ImportGdtf`, `InspectMvr`,
+`ImportMvr`); an MVR export is staged by `ExportMvr` and fetched with `GET /downloads/{id}`,
+which the browser saves; and the 3D models and thumbnails are `GET /lighting-assets/...`. Beside the page itself, those
+three are the only HTTP the web server answers, and none of them is checked against the lock: an
+upload or download id was issued by a call that was, and the assets are a read.
+The upload and download paths are served by the web port only, not the gRPC port (see
+[gRPC](grpc.md#files)). A reverse proxy in front of the web UI must let a request body through
+at the size of the file (for nginx, `client_max_body_size 0;` for `/uploads/`).
+
+A reverse proxy in front of the web UI must pass streamed responses without buffering them
+(for nginx, `proxy_buffering off;` for these paths), or the live feeds stall.
+
+To check that a player is up from a script, fetch the page (`curl -sf http://host:8080/`), or use
+the standard gRPC health service (`grpc.health.v1.Health`) on either gRPC port.
+
+The gRPC calls that write refuse with `FAILED_PRECONDITION` when the player is in lock mode
+(there is no other way to write). So do the announcements of files to send
+(`BeginUpload`), except that of an MVR to inspect; the `PUT` of the bytes of an upload that was
+announced is not checked again. These always work: read calls, playback control, the lock toggle
+(`SetLock`), playlist activation (`SwitchToPlaylist`), the light show validation
+(`ValidateLightShow`), the controller restart (`RestartControllers`), and the lighting calls that
+only compute or inspect and write nothing (preview evaluation, `EvaluateSongLighting`, MVR
+inspection, `InspectMvr`, and staging an MVR export for download, `ExportMvr`). Releasing a fixture test
+(`StopFixtureTest`) also works, since it only returns the lights to the
+show. Opening the Bluetooth pairing window and forgetting a paired phone are refused, since they
+change who may control the player.

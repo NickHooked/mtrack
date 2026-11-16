@@ -14,13 +14,15 @@
      * -->
 <script lang="ts">
   /* eslint-disable @typescript-eslint/no-explicit-any */
+  import type { Controller } from "../../gen/rules/mtrack_rules";
   import { t } from "svelte-i18n";
   import Tooltip from "./Tooltip.svelte";
-  import MidiEventEditor from "./MidiEventEditor.svelte";
-  import type { MidiEvent } from "./MidiEventEditor.svelte";
+  import { rules } from "../../lib/rules";
+  import MidiEventEditor, { newMidiEvent } from "./MidiEventEditor.svelte";
+  import BluetoothPairing from "./BluetoothPairing.svelte";
 
   interface Props {
-    controllers: any[];
+    controllers: Controller[];
     onchange: () => void;
   }
 
@@ -100,6 +102,10 @@
     ["section_ack", "/mtrack/section_ack"],
     ["stop_section_loop", "/mtrack/stop_section_loop"],
     ["loop_section", "/mtrack/loop_section"],
+    ["ambient_on", "/mtrack/ambient/on"],
+    ["ambient_off", "/mtrack/ambient/off"],
+    ["ambient_auto", "/mtrack/ambient/auto"],
+    ["cancel_auto_play", "/mtrack/auto_play/cancel"],
     ["status", "/mtrack/status"],
     ["playlist_current", "/mtrack/playlist/current"],
     ["playlist_current_song", "/mtrack/playlist/current_song"],
@@ -140,7 +146,7 @@
     onchange();
   }
 
-  function getMorningstarModel(ctrl: any): string {
+  function getMorningstarModel(ctrl: Controller): string {
     const ms = ctrl.morningstar;
     if (!ms?.model) return "mc4pro";
     if (typeof ms.model === "string") return ms.model;
@@ -162,7 +168,7 @@
     onchange();
   }
 
-  function getCustomModelId(ctrl: any): number {
+  function getCustomModelId(ctrl: Controller): number {
     const model = ctrl.morningstar?.model;
     if (typeof model === "object" && model.custom) {
       return model.custom.model_id ?? 0;
@@ -188,21 +194,24 @@
     ["playlist", "controllers.midiPlaylist", true],
     ["section_ack", "controllers.midiSectionAck", false],
     ["stop_section_loop", "controllers.midiStopSectionLoop", false],
+    ["ambient_on", "controllers.midiAmbientOn", false],
+    ["ambient_off", "controllers.midiAmbientOff", false],
+    ["ambient_auto", "controllers.midiAmbientAuto", false],
+    ["cancel_auto_play", "controllers.midiCancelAutoPlay", false],
   ];
 
-  function defaultMidiEvent(): MidiEvent {
-    return { type: "note_on", channel: 1, key: 60, velocity: 127 };
-  }
+  /** A 7-bit MIDI data byte's range, as the player reads one. */
+  const dataByte = rules.midi_event_shapes().ranges.value;
 
   function addMidiController() {
     const newCtrl: any = {
       kind: "midi",
-      play: defaultMidiEvent(),
-      prev: { ...defaultMidiEvent(), key: 61 },
-      next: { ...defaultMidiEvent(), key: 62 },
-      stop: { ...defaultMidiEvent(), key: 63 },
-      all_songs: { ...defaultMidiEvent(), key: 64 },
-      playlist: { ...defaultMidiEvent(), key: 65 },
+      play: newMidiEvent(),
+      prev: { ...newMidiEvent(), key: 61 },
+      next: { ...newMidiEvent(), key: 62 },
+      stop: { ...newMidiEvent(), key: 63 },
+      all_songs: { ...newMidiEvent(), key: 64 },
+      playlist: { ...newMidiEvent(), key: 65 },
     };
     controllers = [...controllers, newCtrl];
     controllerKeys = [...controllerKeys, nextId++];
@@ -218,7 +227,7 @@
     if (controllers[ci][field]) {
       delete controllers[ci][field];
     } else {
-      controllers[ci][field] = defaultMidiEvent();
+      controllers[ci][field] = newMidiEvent();
     }
     onchange();
   }
@@ -253,6 +262,23 @@
             }}
           />
         </div>
+      {:else if ctrl.kind === "ble"}
+        <div class="field">
+          <label for="ctrl-ble-name-{i}"
+            >{$t("controllers.bleName")}
+            <Tooltip text={$t("tooltips.controllers.bleName")} /></label
+          >
+          <input
+            id="ctrl-ble-name-{i}"
+            type="text"
+            class="input"
+            placeholder={$t("controllers.bleNamePlaceholder")}
+            value={ctrl.name ?? ""}
+            onchange={(e) =>
+              updateField(i, "name", (e.target as HTMLInputElement).value)}
+          />
+        </div>
+        <BluetoothPairing />
       {:else if ctrl.kind === "osc"}
         <div class="field">
           <label for="ctrl-osc-port-{i}"
@@ -418,8 +444,8 @@
                     id="ms-custom-id-{i}"
                     type="number"
                     class="input"
-                    min="0"
-                    max="127"
+                    min={dataByte[0]}
+                    max={dataByte[1]}
                     value={getCustomModelId(ctrl)}
                     onchange={(e) =>
                       setCustomModelId(
@@ -466,6 +492,12 @@
       class="btn"
       title={$t("tooltips.controllers.addMidi")}
       onclick={addMidiController}>{$t("controllers.addMidi")}</button
+    >
+    <button
+      class="btn"
+      title={$t("tooltips.controllers.addBle")}
+      disabled={controllers.some((c) => c.kind === "ble")}
+      onclick={() => addController("ble")}>{$t("controllers.addBle")}</button
     >
   </div>
 </div>

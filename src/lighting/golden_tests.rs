@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use crate::config::lighting::{Directories, GroupConstraint, Lighting, LogicalGroup};
 use crate::lighting::effects::DmxCommand;
-use crate::lighting::evaluate::{apply_timeline_update, evaluate_show, Evaluation};
+use crate::lighting::evaluate::{apply_timeline_update, evaluate_show, start_from, Evaluation};
 use crate::lighting::gdtf::{build_zip, SYNTHETIC_DESCRIPTION};
 use crate::lighting::parser::parse_light_shows;
 use crate::lighting::system::LightingSystem;
@@ -66,7 +66,8 @@ const PIXEL_GDTF: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 /// The GDTF mover: pan 1/2 over -270..270°, tilt 3/4 over -135..135°
 /// (from the synthetic description's "Mover 16bit" mode).
-const MOVER_FIXTURE: &str = "fixture_type \"Mover\"\n  from gdtf(\"lighting/library/mover.gdtf\", mode \"Mover 16bit\")\n{ }\n";
+const MOVER_FIXTURE: &str =
+    "fixture_type \"Mover\"\n  from gdtf(\"lighting/library/mover.gdtf\")\n{ }\n";
 
 /// A hand-written mover with the same travel and a slew limit, so both
 /// sources of a degree range are on the wire.
@@ -77,7 +78,7 @@ const CHEAP_FIXTURE: &str = "fixture_type \"Cheap\" {\n  \
   movement { max_pan_speed: 240deg/s }\n}\n";
 
 const BAR_FIXTURE: &str =
-    "fixture_type \"Bar\"\n  from gdtf(\"lighting/library/pixel.gdtf\", mode \"Pixel\")\n{ }\n";
+    "fixture_type \"Bar\"\n  from gdtf(\"lighting/library/pixel.gdtf\")\n{ }\n";
 
 /// The same bar in the hand-written cell form, cells 0.3 m apart.
 const HAND_BAR_FIXTURE: &str = "fixture_type \"HandBar\" {\n  channel \"dimmer\" @ 1\n  \
@@ -92,11 +93,11 @@ const HAND_BAR_FIXTURE: &str = "fixture_type \"HandBar\" {\n  channel \"dimmer\"
 /// stage-left with a yaw and a pitch, so the rotation order matters.
 /// Bar2 is hung backwards, so its cell "1" ends up furthest stage-left.
 const VENUE: &str = "venue \"golden\" {\n  \
-  fixture \"M1\" Mover @ 1:1 tags [\"movers\", \"rear\"] position (-2, 3.5, 4.2) rotation (0, 0, 180)\n  \
-  fixture \"M2\" Mover @ 1:11 tags [\"movers\", \"rear\"] position (2, 3.5, 4.2) rotation (0, 0, 180)\n  \
+  fixture \"M1\" Mover mode \"Mover 16bit\" @ 1:1 tags [\"movers\", \"rear\"] position (-2, 3.5, 4.2) rotation (0, 0, 180)\n  \
+  fixture \"M2\" Mover mode \"Mover 16bit\" @ 1:11 tags [\"movers\", \"rear\"] position (2, 3.5, 4.2) rotation (0, 0, 180)\n  \
   fixture \"M3\" Cheap @ 1:21 tags [\"movers\", \"front\"] position (0, 0.5, 3.0) rotation (30, 0, 0)\n  \
   fixture \"M4\" Cheap @ 1:31 tags [\"movers\", \"front\"] position (3, 2, 4) rotation (0, 20, 90)\n  \
-  fixture \"Bar1\" Bar @ 1:101 tags [\"bars\"] position (-1, 1, 0.5)\n  \
+  fixture \"Bar1\" Bar mode \"Pixel\" @ 1:101 tags [\"bars\"] position (-1, 1, 0.5)\n  \
   fixture \"Bar2\" HandBar @ 1:121 tags [\"bars\"] position (1, 1, 0.5) rotation (0, 0, 180)\n  \
   focus \"drummer\" (0, 2.8, 1.4)\n  \
   focus \"singer\" (0.4, 0.9, 1.6)\n  \
@@ -260,7 +261,7 @@ fn project() -> Project {
     }
     std::fs::write(
         base.join("lighting/library/mover.gdtf"),
-        build_zip(&[("description.xml", SYNTHETIC_DESCRIPTION.as_bytes())]),
+        crate::testutil::lighting::synthetic_gdtf(),
     )
     .unwrap();
     std::fs::write(
@@ -294,7 +295,6 @@ fn project() -> Project {
         .collect();
     let config = Lighting::new(
         Some("golden".to_string()),
-        None,
         Some(groups),
         Some(Directories::new(
             Some("fixture_types".to_string()),
@@ -335,7 +335,7 @@ fn live_frames(project: &mut Project) -> Vec<[u8; 513]> {
             .collect();
         effect
     };
-    apply_timeline_update(&mut engine, timeline.start_at(Duration::ZERO), &mut resolve);
+    start_from(&mut engine, timeline.start_at(Duration::ZERO), &mut resolve);
 
     let step = Duration::from_millis(10);
     let mut universe = [0u8; 513];
@@ -557,4 +557,218 @@ fn the_rig_kinematics_send_the_beam_where_the_pointing_math_aims() {
             );
         }
     }
+}
+
+/// A CMY mover from its `.fixture`, a venue and a show, run live to the
+/// wire: the universe after each instant in `at`.
+fn cmy_frames(show: &str, at: &[Duration]) -> Vec<[u8; 513]> {
+    frames_for(CMY_SPOT, show, at)
+}
+
+const CMY_SPOT: &str =
+    "fixture_type \"CmySpot\" {\n  channel \"dimmer\" @ 1\n  channel \"cyan\" @ 2\n  \
+     channel \"magenta\" @ 3\n  channel \"yellow\" @ 4\n}\n";
+
+/// One fixture of `fixture_type` (named `CmySpot`) in a room, run live.
+fn frames_for(fixture_type: &str, show: &str, at: &[Duration]) -> Vec<[u8; 513]> {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path();
+    for sub in ["fixture_types", "venues"] {
+        std::fs::create_dir_all(base.join(sub)).unwrap();
+    }
+    std::fs::write(base.join("fixture_types/spot.fixture"), fixture_type).unwrap();
+    std::fs::write(
+        base.join("venues/room.venue"),
+        "venue \"room\" {\n  fixture \"S1\" CmySpot @ 1:1 tags [\"spots\"] position (0, 3, 4)\n}\n",
+    )
+    .unwrap();
+    let groups: HashMap<String, LogicalGroup> = [(
+        "spots".to_string(),
+        LogicalGroup::new(
+            "spots".to_string(),
+            vec![GroupConstraint::AllOf(vec!["spots".to_string()])],
+        ),
+    )]
+    .into_iter()
+    .collect();
+    let config = Lighting::new(
+        Some("room".to_string()),
+        Some(groups),
+        Some(Directories::new(
+            Some("fixture_types".to_string()),
+            Some("venues".to_string()),
+        )),
+    );
+    let mut system = LightingSystem::new();
+    system.load(&config, base).unwrap();
+
+    let mut engine = EffectEngine::new();
+    for fixture in system.get_current_venue_fixtures().unwrap() {
+        engine.register_fixture(fixture);
+    }
+    let shows = parse_light_shows(show).unwrap().into_values().collect();
+    let mut timeline = LightingTimeline::new(shows);
+    let mut resolve = |mut effect: crate::lighting::effects::EffectInstance| {
+        effect.target_fixtures = effect
+            .target_fixtures
+            .iter()
+            .flat_map(|g| system.resolve_logical_group_graceful(g))
+            .collect();
+        effect
+    };
+    start_from(&mut engine, timeline.start_at(Duration::ZERO), &mut resolve);
+    let step = Duration::from_millis(10);
+    let mut universe = [0u8; 513];
+    let mut frames = Vec::new();
+    let mut now = Duration::ZERO;
+    while now <= *at.last().unwrap() {
+        apply_timeline_update(&mut engine, timeline.update(now), &mut resolve);
+        for command in engine.update(step, Some(now)).unwrap().to_vec() {
+            universe[command.channel as usize] = command.value;
+        }
+        if at.contains(&now) {
+            frames.push(universe);
+        }
+        now += step;
+    }
+    frames
+}
+
+#[test]
+fn a_cmy_fixture_shows_colour_as_its_complement_on_the_wire() {
+    let show = "show \"cmy\" {\n    @00:00.000\n    spots: static color: \"red\", dimmer: 100%, duration: 2s\n    \
+                @00:03.000\n    spots: static dimmer: 100%, duration: 2s\n    \
+                @00:06.000\n    spots: static color: \"#00ff80\", dimmer: 50%, duration: 2s\n}\n";
+    let at = [
+        Duration::from_millis(1000),
+        Duration::from_millis(2500),
+        Duration::from_millis(4000),
+        Duration::from_millis(7000),
+    ];
+    let frames = cmy_frames(show, &at);
+    let cmy = |f: &[u8; 513]| [f[1], f[2], f[3], f[4]];
+    // Red: cyan (which removes red) open, magenta and yellow in full.
+    assert_eq!(cmy(&frames[0]), [255, 0, 255, 255], "red");
+    // Nothing running leaves the last frame on the wire.
+    assert_eq!(cmy(&frames[1]), [255, 0, 255, 255], "after red ends");
+    // A level with no colour beneath it is white (design 3.4, rule 7), not
+    // whatever flags were last sent: all three open.
+    assert_eq!(cmy(&frames[2]), [255, 0, 0, 0], "dimmer only");
+    // A mix: green full, blue half, red none.
+    let f = cmy(&frames[3]);
+    assert_eq!(f[0], 128, "dimmer 50%");
+    assert_eq!(f[1], 255, "cyan removes all the red");
+    assert_eq!(f[2], 0, "no magenta: green is full");
+    assert!(
+        (126..=128).contains(&f[3]),
+        "yellow takes half the blue: {}",
+        f[3]
+    );
+}
+
+/// A mover with a red channel but no green or blue takes a `red:` cue:
+/// its dimmer goes up and its red with it, alongside the move (what the
+/// rig's mover checks drive; 0.18.0 to 0.18.3 refused the cue outright).
+#[test]
+fn a_red_only_mover_takes_a_red_cue_while_it_moves() {
+    let mover =
+        "fixture_type \"CmySpot\" {\n  channel \"pan\"    @ 1 fine 2 range -270deg..270deg\n  \
+                 channel \"tilt\"   @ 3 fine 4 range -135deg..135deg\n  channel \"dimmer\" @ 5\n  \
+                 channel \"red\"    @ 6\n}\n";
+    let show = "show \"s\" {\n    @00:00.000\n    spots: static red: 100%, duration: 10s\n    \
+                @00:00.000\n    spots: move from_pan: -60deg, pan: 60deg, tilt: 0deg, duration: 6s, easing: linear\n}\n";
+    let frame = &frames_for(mover, show, &[Duration::from_millis(1000)])[0];
+    assert_eq!((frame[5], frame[6]), (255, 255), "dimmer and red");
+    assert_ne!(frame[1], 0, "and the head is moving");
+}
+
+/// The same colour on every fixture that mixes one: whatever form a cue
+/// gives it in (a hex value, `rgb()`, a name, the three levels, one level
+/// alone) and whatever the level, a CMY fixture's flags are exactly the
+/// complement of an RGB fixture's bytes, with a dimmer channel and without.
+/// Pink (255, 192, 203) is cyan 0, magenta 63, yellow 52.
+#[test]
+fn every_colour_is_the_same_colour_on_rgb_and_cmy_fixtures() {
+    let pairs = [
+        (
+            "fixture_type \"CmySpot\" {\n  channel \"dimmer\" @ 1\n  channel \"red\" @ 2\n  \
+             channel \"green\" @ 3\n  channel \"blue\" @ 4\n}\n",
+            CMY_SPOT,
+        ),
+        (
+            "fixture_type \"CmySpot\" {\n  channel \"red\" @ 1\n  channel \"green\" @ 2\n  \
+             channel \"blue\" @ 3\n}\n",
+            "fixture_type \"CmySpot\" {\n  channel \"cyan\" @ 1\n  channel \"magenta\" @ 2\n  \
+             channel \"yellow\" @ 3\n}\n",
+        ),
+    ];
+    let cues = [
+        "static color: \"#ffc0cb\"",
+        "static color: rgb(255, 192, 203)",
+        "static color: \"pink\"",
+        "static color: cmy(0%, 25%, 20%)",
+        "static color: \"cmyk(0%, 25%, 20%, 10%)\"",
+        "static red: 100%, green: 0.753, blue: 0.796",
+        "static red: 100%",
+        "static green: 100%",
+        "static red: 100%, blue: 50%",
+        "static color: \"#ffc0cb\", dimmer: 50%",
+        "static red: 100%, dimmer: 40%",
+        "cycle color: \"pink\", color: \"orange\", speed: 0.1, duration: 10s, transition: fade",
+    ];
+    for (rgb_type, cmy_type) in pairs {
+        let colour_channels = if rgb_type.contains("dimmer") {
+            2..5
+        } else {
+            1..4
+        };
+        for cue in cues {
+            let cue = if cue.contains("duration") {
+                cue.to_string()
+            } else {
+                format!("{cue}, duration: 10s")
+            };
+            let show = format!("show \"s\" {{\n    @00:00.000\n    spots: {cue}\n}}\n");
+            let at = [Duration::from_millis(1000)];
+            let rgb = frames_for(rgb_type, &show, &at)[0];
+            let cmy = frames_for(cmy_type, &show, &at)[0];
+            let complement: Vec<u8> = colour_channels.clone().map(|c| 255 - rgb[c]).collect();
+            let flags: Vec<u8> = colour_channels.clone().map(|c| cmy[c]).collect();
+            assert_eq!(
+                flags,
+                complement,
+                "{cue}: RGB {:?}",
+                &rgb[colour_channels.clone()]
+            );
+            if colour_channels.start == 2 {
+                assert_eq!(cmy[1], rgb[1], "{cue}: the dimmer");
+            }
+        }
+    }
+    let pink = frames_for(
+        CMY_SPOT,
+        "show \"s\" {\n    @00:00.000\n    spots: static color: \"pink\", duration: 10s\n}\n",
+        &[Duration::from_millis(1000)],
+    )[0];
+    assert_eq!(&pink[2..5], &[0, 63, 52], "pink");
+}
+
+/// A colour given in CMY is the colour it prints as, on every fixture: on
+/// an RGB fixture the RGB it converts to, on a CMY head the inks as written
+/// (to the byte), and so from a palette slot too.
+#[test]
+fn a_cmy_colour_is_its_inks_on_a_cmy_head_and_their_rgb_on_an_rgb_fixture() {
+    const RGB_PAR: &str = "fixture_type \"CmySpot\" {\n  channel \"dimmer\" @ 1\n  \
+                           channel \"red\" @ 2\n  channel \"green\" @ 3\n  channel \"blue\" @ 4\n}\n";
+    let show = "palette {\n    accent: cmy(0%, 25%, 20%)\n}\n\nshow \"s\" {\n    @00:00.000\n    \
+                spots: static color: palette.accent, duration: 10s\n}\n";
+    let at = [Duration::from_millis(1000)];
+    let rgb = frames_for(RGB_PAR, show, &at)[0];
+    let cmy = cmy_frames(show, &at)[0];
+    assert_eq!(&rgb[2..5], &[255, 191, 204], "the RGB it prints as");
+    assert_eq!(
+        &cmy[2..5],
+        &[0, 64, 51],
+        "the inks as written: 25% and 20% of 255"
+    );
 }

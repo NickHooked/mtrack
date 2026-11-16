@@ -15,6 +15,9 @@
 <script lang="ts">
   import { t } from "svelte-i18n";
   import type { SequenceRef } from "../../lib/lighting/types";
+  import { rules } from "../../lib/rules";
+  import { isColorText, useSequenceParams } from "../../lib/lighting/palette";
+  import ColorInput from "./ColorInput.svelte";
 
   interface Props {
     ref: SequenceRef;
@@ -27,6 +30,30 @@
 
   function update(key: string, value: unknown) {
     onchange({ ...ref, [key]: value });
+  }
+
+  const sequenceParams = useSequenceParams();
+
+  /** The color arguments of the sequence this plays: each parameter whose
+   *  default or bound value is a color or a palette slot, with the value
+   *  the pass takes (the one bound here, else the default). */
+  let colorArgs = $derived(
+    (sequenceParams()[ref.name] ?? []).flatMap((param) => {
+      const bound = ref.args?.find((a) => a.name === param.name)?.value;
+      return isColorText(bound) || isColorText(param.value)
+        ? [{ name: param.name, value: bound ?? param.value ?? "" }]
+        : [];
+    }),
+  );
+
+  /** Binds argument `name` to `color`, as written in the file. */
+  function setColorArg(name: string, color: string) {
+    const value = rules.quote_value(color);
+    const args = [...(ref.args ?? [])];
+    const at = args.findIndex((a) => a.name === name);
+    if (at >= 0) args[at] = { ...args[at], value };
+    else args.push({ name, value });
+    update("args", args);
   }
 </script>
 
@@ -68,10 +95,9 @@
         }}
       >
         <option value="">--</option>
-        <option value="once">{$t("effect.once")}</option>
-        <option value="loop">{$t("effect.loopOption")}</option>
-        <option value="pingpong">{$t("effect.pingpong")}</option>
-        <option value="random">{$t("effect.random")}</option>
+        {#each rules.vocabulary().loops as l (l)}
+          <option value={l}>{l}</option>
+        {/each}
       </select>
     </label>
     <div class="field checkbox-field">
@@ -93,9 +119,31 @@
       &#10005;
     </button>
   </div>
+  {#if colorArgs.length > 0}
+    <div class="seq-args" data-testid="sequence-color-args">
+      {#each colorArgs as arg (arg.name)}
+        <div class="field">
+          <span class="field-label">{arg.name}</span>
+          <ColorInput
+            colors={[rules.unquote_value(arg.value)]}
+            multi={false}
+            onchange={(colors) => setColorArg(arg.name, colors[0] ?? "")}
+          />
+        </div>
+      {/each}
+    </div>
+  {/if}
 </div>
 
 <style>
+  .seq-args {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
   .seq-ref-form {
     background: var(--bg-input);
     border: 1px solid var(--border);

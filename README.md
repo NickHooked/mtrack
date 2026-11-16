@@ -17,7 +17,7 @@ a phone, or any device with a browser — so you never have to babysit a compute
 
 ## Features
 
-- **Multi-format audio playback** — WAV, FLAC, MP3, OGG, AAC, M4A, AIFF via Symphonia.
+- **Multi-format audio playback** — WAV, FLAC, MP3, OGG, AAC/M4A, AIFF via Symphonia.
   Automatic transcoding to match your audio device.
 - **MIDI playback and control** — Play back MIDI files, emit MIDI events on song selection, and
   control the player via MIDI. Beat clock output for syncing external gear.
@@ -29,7 +29,7 @@ a phone, or any device with a browser — so you never have to babysit a compute
 - **Zero-config startup** — Point mtrack at a directory of songs and it works. No config file
   required. Bulk import entire song libraries from the filesystem.
 - **Lock mode** — Safety mechanism for live shows. Lock the player to prevent accidental
-  configuration changes while keeping playback controls active.
+  configuration changes from the web UI, gRPC, or MCP while keeping playback controls active.
 - **MIDI-triggered samples** — Low-latency sample playback via MIDI or piezo audio triggers
   with velocity scaling, voice management, and release groups.
 - **Terminal UI** — Optional ratatui-based TUI with playlist, now-playing, fixture colors,
@@ -40,42 +40,42 @@ a phone, or any device with a browser — so you never have to babysit a compute
 - **Systemd integration** — Generated service file with security hardening for production
   deployments.
 
+## What you need
+
+- A computer that runs Linux or macOS. A Raspberry Pi 3 or newer is a common choice for the
+  stage; a [pre-built Pi image](docs/src/getting-started/installation.md) is available.
+- For multitrack playback, an audio interface with as many outputs as you want to route
+  separately. mtrack uses the operating system's audio drivers, so a class-compliant interface
+  works without extra drivers.
+- For lighting, an [OLA](https://www.openlighting.org/ola/) installation (the `olad` daemon)
+  and a DMX interface it supports.
+- For MIDI playback or control, a MIDI interface or controller the operating system can see.
+- A web browser on any device that can reach the player.
+
+## What mtrack is not
+
+- Not a DAW: it plays back prepared songs and does not record, edit audio, or mix live.
+- Not a lighting console: lighting is authored ahead of time as cues that play in sync with
+  songs.
+- Not released for Windows: the pre-built binaries are for Linux and macOS.
+
 ## Quick Start
 
-Download a pre-built binary from the [latest release](https://github.com/mdwn/mtrack/releases/latest)
-for your platform (Linux x86_64/aarch64, macOS Intel/Apple Silicon), extract it, and put
-`mtrack` somewhere on your `PATH`. On Linux you'll need `libasound2` and `libudev1`
-installed (present by default on most desktop distros; `sudo apt install libasound2 libudev1`
-on a minimal server).
-
-Alternatively, install from source via cargo — this requires a Rust toolchain and a
-handful of system libraries; see [Building](#building) below:
-
-```
-$ cargo install mtrack --locked
-```
-
-Start the player (zero-config):
+[Install mtrack](docs/src/getting-started/installation.md) (pre-built binaries, a Raspberry Pi
+image, a `.deb` package, or `cargo install mtrack --locked`), then start the player
+(zero-config):
 
 ```
 $ cd /path/to/my/songs
 $ mtrack start
 ```
 
-Or point at a specific directory:
-
-```
-$ mtrack start /path/to/my/songs
-```
-
-Existing config files still work:
-
-```
-$ mtrack start /path/to/mtrack.yaml
-```
+Or point at a specific directory (`mtrack start /path/to/my/songs`) or an existing config file
+(`mtrack start /path/to/mtrack.yaml`).
 
 The web UI will be available at `http://localhost:8080`. Use the web UI to import songs,
-create playlists, configure hardware, and author lighting shows.
+create playlists, configure hardware, and author lighting shows. The
+[Quick Start guide](docs/src/getting-started/quick-start.md) walks through a first song.
 
 ![Timeline editor](docs/src/images/timeline-editor.png)
 
@@ -111,7 +111,12 @@ Then build:
 $ make build
 ```
 
-Other useful targets: `make test`, `make lint`, `make fmt`, `make docs`, `make docs-serve`.
+The web UI is built into the binary from `src/webui/svelte/dist`, which `make build` refreshes
+(with the gRPC bindings in `src/webui/svelte/src/gen`) whenever the UI sources change. Both are
+generated and ignored by git, so a plain `cargo build` or `cross build` embeds whatever UI was
+last built: run `make build-ui` first after pulling.
+
+Other useful targets: `make test`, `make lint`, `make fmt`, `make docs`, `make docs-serve`. The Makefile lists the rest, including the web UI journey tests.
 
 ## Get support!
 

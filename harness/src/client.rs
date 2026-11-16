@@ -13,14 +13,20 @@
 //
 //! Talks to a running mtrack over the interfaces a real controller would use.
 //!
-//! Both transports are needed: the web API is the only place hardware and
-//! controller status is exposed, while gRPC carries playback control and the
-//! config mutations the persistence checks depend on.
+//! Both transports are needed: the web port is the only place a player whose
+//! gRPC port never opened can be observed (its hardware status is read from
+//! `Watch` over gRPC-Web, as the web UI reads it), while gRPC carries
+//! playback control and the config mutations the persistence checks depend
+//! on.
 
 use std::time::{Duration, Instant};
 
+use mtrack::proto::player::v1::config_service_client::ConfigServiceClient;
 use mtrack::proto::player::v1::player_service_client::PlayerServiceClient;
-use mtrack::proto::player::v1::{StatusRequest, StatusResponse};
+use mtrack::proto::player::v1::{
+    HardwareSnapshot, HardwareStatus, SetLockRequest, SetLockResponse, StatusRequest,
+    StatusResponse, SubsystemStatus,
+};
 use tonic::transport::Channel;
 
 use crate::server::Server;
@@ -31,6 +37,8 @@ pub struct Client {
     base_url: String,
     /// Absent for clients built with [`Client::connect_http_only`].
     grpc: Option<PlayerServiceClient<Channel>>,
+    /// The editor service, on the same channel as `grpc`.
+    config: Option<ConfigServiceClient<Channel>>,
 }
 
 impl Client {
@@ -40,9 +48,13 @@ impl Client {
         // starts answering, so the first connect is retried rather than
         // treated as a failure.
         let deadline = Instant::now() + Duration::from_secs(15);
-        let grpc = loop {
-            match PlayerServiceClient::connect(server.grpc_url()).await {
-                Ok(client) => break client,
+        let channel = loop {
+            let connecting = Channel::from_shared(server.grpc_url())
+                .map_err(|e| format!("bad gRPC address {}: {e}", server.grpc_url()))?
+                .connect()
+                .await;
+            match connecting {
+                Ok(channel) => break channel,
                 Err(e) if Instant::now() >= deadline => {
                     return Err(
                         format!("could not reach gRPC at {}: {e}", server.grpc_url()).into(),
@@ -51,11 +63,13 @@ impl Client {
                 Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
             }
         };
+        let channel_for_player = channel.clone();
 
         let client = Client {
             http: reqwest::Client::new(),
             base_url: server.base_url(),
-            grpc: Some(grpc),
+            config: Some(ConfigServiceClient::new(channel)),
+            grpc: Some(PlayerServiceClient::new(channel_for_player)),
         };
 
         // The player boots locked so a live show cannot be altered by accident.
@@ -66,15 +80,18 @@ impl Client {
 
     /// Sets the player's lock, which gates every state-altering endpoint.
     pub async fn set_locked(&self, locked: bool) -> Result<(), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/lock", self.base_url);
-        let response = self
-            .http
-            .put(&url)
-            .json(&serde_json::json!({ "locked": locked }))
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            return Err(format!("could not set lock={locked}: HTTP {}", response.status()).into());
+        // Over the web port's gRPC-Web, which answers for a player whose
+        // gRPC port is not open as well.
+        let answer: SetLockResponse = crate::grpc_web::unary(
+            &self.http,
+            &self.base_url,
+            "SetLock",
+            &SetLockRequest { locked },
+        )
+        .await
+        .map_err(|e| format!("could not set lock={locked}: {e}"))?;
+        if answer.locked != locked {
+            return Err(format!("set lock={locked}, but the player says {}", answer.locked).into());
         }
         Ok(())
     }
@@ -89,6 +106,7 @@ impl Client {
             http: reqwest::Client::new(),
             base_url: server.base_url(),
             grpc: None,
+            config: None,
         };
         client.set_locked(false).await?;
         Ok(client)
@@ -101,97 +119,55 @@ impl Client {
             .expect("this client was built without gRPC; use the HTTP API instead")
     }
 
+    /// A mutable handle to the editor service's gRPC client.
+    pub fn config(&mut self) -> &mut ConfigServiceClient<Channel> {
+        self.config
+            .as_mut()
+            .expect("this client was built without gRPC; use the HTTP API instead")
+    }
+
+    /// Calls a method of the editor service over the web port's gRPC-Web,
+    /// which answers for a player whose gRPC port is not open as well (a
+    /// client built with [`Client::connect_http_only`] has no other way).
+    pub async fn config_call<Req: prost::Message, Resp: prost::Message + Default>(
+        &self,
+        method: &str,
+        request: &Req,
+    ) -> Result<Resp, crate::grpc_web::CallError> {
+        crate::grpc_web::call(&self.http, &self.base_url, "ConfigService", method, request).await
+    }
+
+    /// Calls a method of the lighting service over the web port's
+    /// gRPC-Web, as [`Client::config_call`] calls the editor service's.
+    pub async fn lighting_call<Req: prost::Message, Resp: prost::Message + Default>(
+        &self,
+        method: &str,
+        request: &Req,
+    ) -> Result<Resp, crate::grpc_web::CallError> {
+        crate::grpc_web::call(
+            &self.http,
+            &self.base_url,
+            "LightingService",
+            method,
+            request,
+        )
+        .await
+    }
+
     /// Fetches the player status over gRPC.
     pub async fn status(&mut self) -> Result<StatusResponse, Box<dyn std::error::Error>> {
         Ok(self.grpc().status(StatusRequest {}).await?.into_inner())
     }
 
-    /// Fetches `GET /api/<path>` as JSON.
-    pub async fn get_json(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let url = format!("{}/api/{}", self.base_url, path.trim_start_matches('/'));
-        let response = self.http.get(&url).send().await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(format!("GET {url} returned {status}: {body}").into());
-        }
-        Ok(serde_json::from_str(&body)?)
+    /// The build, hardware and controllers as the player reports them: the
+    /// hardware event `Watch` opens with.
+    pub async fn hardware_status(&self) -> Result<HardwareStatus, Box<dyn std::error::Error>> {
+        Ok(crate::watch::read_hardware(&self.http, &self.base_url).await?)
     }
 
-    /// POSTs JSON and returns the status alongside the parsed body.
-    ///
-    /// Separate from [`Self::send_text`] because axum's `Json` extractor
-    /// rejects anything not sent as `application/json`, and because the status
-    /// is part of what these endpoints are saying.
-    pub async fn post_json(
-        &self,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<(reqwest::StatusCode, serde_json::Value), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/{}", self.base_url, path.trim_start_matches('/'));
-        let response = self.http.post(&url).json(&body).send().await?;
-        let status = response.status();
-        let text = response.text().await?;
-        let parsed = serde_json::from_str(&text).map_err(|e| {
-            format!("POST {url} returned {status} with a non-JSON body: {e}: {text}")
-        })?;
-        Ok((status, parsed))
-    }
-
-    /// PUTs a JSON body and returns the status and parsed response.
-    ///
-    /// Separate from [`Self::post_json`] because several config endpoints are
-    /// PUT-only, and they reject anything that is not `application/json`.
-    pub async fn put_json(
-        &self,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<(reqwest::StatusCode, serde_json::Value), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/{}", self.base_url, path.trim_start_matches('/'));
-        let response = self.http.put(&url).json(&body).send().await?;
-        let status = response.status();
-        let text = response.text().await?;
-        let parsed = serde_json::from_str(&text).map_err(|e| {
-            format!("PUT {url} returned {status} with a non-JSON body: {e}: {text}")
-        })?;
-        Ok((status, parsed))
-    }
-
-    /// Sends a request with a raw body and returns the status and body text.
-    ///
-    /// The lighting endpoints take and return DSL text rather than JSON, and
-    /// several respond with a meaningful non-2xx, so the status is handed back
-    /// rather than treated as an error.
-    pub async fn send_text(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: String,
-    ) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/{}", self.base_url, path.trim_start_matches('/'));
-        let response = self
-            .http
-            .request(method, &url)
-            .header("content-type", "text/plain")
-            .body(body)
-            .send()
-            .await?;
-        let status = response.status();
-        Ok((status, response.text().await?))
-    }
-
-    /// Fetches a path as raw text along with its status.
-    pub async fn get_text(
-        &self,
-        path: &str,
-    ) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error>> {
-        let url = format!("{}/api/{}", self.base_url, path.trim_start_matches('/'));
-        let response = self.http.get(&url).send().await?;
-        let status = response.status();
-        Ok((status, response.text().await?))
+    /// The hardware snapshot of [`Self::hardware_status`].
+    pub async fn hardware(&self) -> Result<HardwareSnapshot, Box<dyn std::error::Error>> {
+        Ok(self.hardware_status().await?.hardware.unwrap_or_default())
     }
 
     /// The reported status of a hardware subsystem: `connected`,
@@ -200,40 +176,26 @@ impl Client {
         &self,
         subsystem: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let status = self.get_json("status").await?;
-        Ok(status
-            .get("hardware")
-            .and_then(|h| h.get(subsystem))
-            .and_then(|s| s.get("status"))
-            .and_then(|s| s.as_str())
-            .unwrap_or("missing")
-            .to_string())
+        let hardware = self.hardware().await?;
+        Ok(subsystem_of(&hardware, subsystem)
+            .map(|s| s.status.clone())
+            .unwrap_or_else(|| "missing".to_string()))
     }
 
     /// The device name the player reports for a subsystem. This is what proves
-    /// a given profile actually took effect, since the status API's `profile`
+    /// a given profile actually took effect, since the status's `profile`
     /// field carries the profile's hostname (or `"default"`), not a name.
     pub async fn subsystem_device(
         &self,
         subsystem: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let status = self.get_json("status").await?;
-        Ok(status
-            .get("hardware")
-            .and_then(|h| h.get(subsystem))
-            .and_then(|s| s.get("name"))
-            .and_then(|n| n.as_str())
-            .map(|s| s.to_string()))
+        let hardware = self.hardware().await?;
+        Ok(subsystem_of(&hardware, subsystem).and_then(|s| s.name.clone()))
     }
 
     /// The name of the active hardware profile.
     pub async fn active_profile(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let status = self.get_json("status").await?;
-        Ok(status
-            .get("hardware")
-            .and_then(|h| h.get("profile"))
-            .and_then(|p| p.as_str())
-            .map(|s| s.to_string()))
+        Ok(self.hardware().await?.profile)
     }
 
     /// Waits until the player reports it is playing.
@@ -297,6 +259,20 @@ impl Client {
         } else {
             crate::outcome::CheckError::before_assertion(message)
         })
+    }
+}
+
+/// One of the hardware snapshot's subsystems, by its name in the status.
+pub fn subsystem_of<'a>(
+    hardware: &'a HardwareSnapshot,
+    subsystem: &str,
+) -> Option<&'a SubsystemStatus> {
+    match subsystem {
+        "audio" => hardware.audio.as_ref(),
+        "midi" => hardware.midi.as_ref(),
+        "dmx" => hardware.dmx.as_ref(),
+        "trigger" => hardware.trigger.as_ref(),
+        _ => None,
     }
 }
 

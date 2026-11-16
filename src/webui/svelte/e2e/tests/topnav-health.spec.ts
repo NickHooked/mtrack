@@ -13,18 +13,13 @@
 //
 
 import { test, expect, type Page } from "@playwright/test";
+import type {
+  ControllerStatus,
+  SubsystemStatus,
+} from "../../src/gen/rules/mtrack_rules";
+import { broadcastWatch, setWatchOpening } from "../support/watch";
 
-interface SubsystemStatus {
-  status: "connected" | "initializing" | "not_connected" | "not_configured";
-  name: string | null;
-}
-
-interface ControllerStatus {
-  kind: string;
-  status: string;
-  detail: string | null;
-  error: string | null;
-}
+type WatchStatus = ReturnType<typeof statusFixture>;
 
 function statusFixture(overrides: {
   audio?: SubsystemStatus;
@@ -58,20 +53,18 @@ function statusFixture(overrides: {
   };
 }
 
-async function mockStatus(page: Page, body: unknown) {
-  await page.route("**/api/status", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify(body),
-    });
-  });
+let counter = 0;
+
+/** Opens the app with the player saying `body` as its status. */
+async function openWithStatus(page: Page, body: WatchStatus) {
+  const id = `topnav-${test.info().parallelIndex}-${++counter}-${Date.now()}`;
+  await setWatchOpening(page, id, { type: "hardware", ...body });
+  await page.goto(`/?wsId=${id}#/`);
 }
 
 test.describe("Topnav health dot", () => {
   test("green when all required subsystems connected", async ({ page }) => {
-    await mockStatus(page, statusFixture({}));
-    await page.goto("/#/");
+    await openWithStatus(page, statusFixture({}));
 
     const dot = page.locator(".topnav__conn");
     await expect(dot).toBeVisible();
@@ -81,13 +74,12 @@ test.describe("Topnav health dot", () => {
   });
 
   test("red when audio is not_connected", async ({ page }) => {
-    await mockStatus(
+    await openWithStatus(
       page,
       statusFixture({
         audio: { status: "not_connected", name: "Default Audio Device" },
       }),
     );
-    await page.goto("/#/");
     await expect(page.locator(".topnav__conn")).toHaveClass(
       /topnav__conn--error/,
     );
@@ -96,33 +88,31 @@ test.describe("Topnav health dot", () => {
   test("red when a configured MIDI device is not_connected", async ({
     page,
   }) => {
-    await mockStatus(
+    await openWithStatus(
       page,
       statusFixture({
         midi: { status: "not_connected", name: "Some MIDI Device" },
       }),
     );
-    await page.goto("/#/");
     await expect(page.locator(".topnav__conn")).toHaveClass(
       /topnav__conn--error/,
     );
   });
 
   test("amber while a subsystem is initializing", async ({ page }) => {
-    await mockStatus(
+    await openWithStatus(
       page,
       statusFixture({
         audio: { status: "initializing", name: "Default Audio Device" },
       }),
     );
-    await page.goto("/#/");
     await expect(page.locator(".topnav__conn")).toHaveClass(
       /topnav__conn--warn/,
     );
   });
 
   test("amber when a controller is in error", async ({ page }) => {
-    await mockStatus(
+    await openWithStatus(
       page,
       statusFixture({
         controllers: [
@@ -135,7 +125,6 @@ test.describe("Topnav health dot", () => {
         ],
       }),
     );
-    await page.goto("/#/");
     await expect(page.locator(".topnav__conn")).toHaveClass(
       /topnav__conn--warn/,
     );
@@ -144,8 +133,7 @@ test.describe("Topnav health dot", () => {
   test("does NOT mark unconfigured MIDI/DMX as red", async ({ page }) => {
     // The default mock has midi/dmx as `not_connected` with `name: null`,
     // i.e. "not configured". That should remain green.
-    await mockStatus(page, statusFixture({}));
-    await page.goto("/#/");
+    await openWithStatus(page, statusFixture({}));
     await expect(page.locator(".topnav__conn")).not.toHaveClass(
       /topnav__conn--error/,
     );
@@ -153,17 +141,15 @@ test.describe("Topnav health dot", () => {
 });
 
 test.describe("Logs row tinting", () => {
-  // Helper to push a log line via the mock server's WS injection endpoint.
+  // Helper to push a log line via the mock server's Watch stream.
   async function pushLog(
     page: Page,
     level: "INFO" | "WARN" | "ERROR" | "DEBUG" | "TRACE",
     message: string,
   ) {
-    await page.request.post("http://127.0.0.1:3111/test/send-ws", {
-      data: {
-        type: "logs",
-        lines: [{ level, target: "mtrack::test", message }],
-      },
+    await broadcastWatch(page, {
+      type: "logs",
+      lines: [{ level, target: "mtrack::test", message }],
     });
   }
 

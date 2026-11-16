@@ -12,6 +12,8 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
+#[cfg(feature = "hub")]
+mod hub;
 mod local;
 mod migrate;
 mod remote;
@@ -91,7 +93,9 @@ RestrictNamespaces=true
 RestrictSUIDSGID=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK is how the player reads its own network addresses, which it
+# tells a phone connected over Bluetooth so the phone can find it on Wi-Fi.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
@@ -117,6 +121,26 @@ enum Commands {
         /// Initialize song directories with YAML files containing default values.
         #[arg(long)]
         init: bool,
+        /// A project directory or its mtrack.yaml. Light shows are read against the
+        /// lighting layers this host's profile configures; without it, the defaults.
+        #[arg(short, long)]
+        config: Option<String>,
+    },
+    /// Lists where an upgrade changes how a project's lighting shows look.
+    ///
+    /// The lighting engine now brightens every fixture the same way, with or
+    /// without a dimmer channel. A show written against the old behaviour can
+    /// come out brighter, or white where it was dark. Run this before
+    /// upgrading to see which cues to look at. Prints findings by song;
+    /// exits 0 either way.
+    BrightnessChanges {
+        /// The project directory, or its config file. Defaults to the
+        /// current directory.
+        #[arg(default_value = ".")]
+        project: String,
+        /// Override the hostname used to select a hardware profile.
+        #[arg(long)]
+        hostname: Option<String>,
     },
     /// Lists the available audio output devices.
     Devices {},
@@ -141,6 +165,10 @@ enum Commands {
         repository_path: String,
         /// The path to the playlist.
         playlist_path: String,
+        /// A project directory or its mtrack.yaml. Light shows are read against the
+        /// lighting layers this host's profile configures; without it, the defaults.
+        #[arg(short, long)]
+        config: Option<String>,
     },
     /// Start will start the multitrack player.
     Start {
@@ -166,12 +194,12 @@ enum Commands {
         /// The host and port of the gRPC server.
         #[arg(short = 'H', long)]
         host_port: Option<String>,
-        /// Start playback from a specific time (e.g., "1:23.456" or "45.5s").
+        /// Start playback from a specific time (e.g., "1:23.456", "45.5s" or "90").
         #[arg(long)]
         from: Option<String>,
     },
-    /// Seeks within the current song to a time (e.g. "1:23.456" or "45.5s")
-    /// or to the start of a named section (e.g. "chorus").
+    /// Seeks within the current song to a time (e.g. "1:23.456", "45.5s" or
+    /// "90") or to the start of a named section (e.g. "chorus").
     Seek {
         /// The host and port of the gRPC server.
         #[arg(short = 'H', long)]
@@ -202,7 +230,8 @@ enum Commands {
         /// The host and port of the gRPC server.
         #[arg(short = 'H', long)]
         host_port: Option<String>,
-        /// The name of the playlist to switch to. Currently only supports "all_songs" and "playlist."
+        /// The name of the playlist to switch to: "all_songs" or any playlist loaded from
+        /// `playlists_dir`. Refused while a song is playing.
         playlist_name: String,
     },
     /// Gets the current status of the player from the gRPC server.
@@ -227,29 +256,37 @@ enum Commands {
         /// excepts exactly these paths.
         paths: Vec<String>,
     },
-    /// Imports a GDTF fixture file: lists its modes, or (with --mode)
-    /// copies the archive into the project library and writes a
-    /// GDTF-referential .fixture definition.
+    /// Imports a GDTF fixture file: copies it into the project's library,
+    /// after which a venue fixture can use it in any of its modes (`mode
+    /// "..."` on the fixture line). With --list-modes, only lists the
+    /// archive's modes.
     ImportGdtf {
         /// Path to the .gdtf archive to import.
         gdtf_path: String,
-        /// The DMX mode to distill. Omit to list the archive's modes.
-        #[arg(short, long)]
-        mode: Option<String>,
-        /// Name for the fixture type (defaults to the GDTF's fixture name).
+        /// Name for the fixture type (defaults to the GDTF's fixture name,
+        /// with the archive's file stem added when another fixture already
+        /// has it).
         #[arg(short, long)]
         name: Option<String>,
-        /// Project directory the import writes into.
+        /// List the archive's modes and their footprints; import nothing.
+        #[arg(long)]
+        list_modes: bool,
+        /// The project the import writes into: its directory (its
+        /// mtrack.yaml says where the lighting files are) or its config
+        /// file. The library is the project's lighting/library.
         #[arg(short, long, default_value = ".")]
         project: String,
-        /// Fixture types directory, relative to the project.
-        #[arg(long, default_value = "lighting/fixture_types")]
-        fixture_types_dir: String,
+        /// Fixture types directory, relative to the project (default: the
+        /// one the project's config gives this host's profile, else
+        /// lighting/fixture_types).
+        #[arg(long)]
+        fixture_types_dir: Option<String>,
     },
     /// Imports an MVR venue file: reports what the import would do, or
     /// (with --write) copies the MVR and its embedded GDTFs into the
-    /// project library, writes a .fixture per referenced type, and seeds
-    /// a .venue file — or merges a revised MVR into one seeded earlier.
+    /// project library (each GDTF is a fixture type; every fixture line
+    /// states its mode), and seeds a .venue file — or merges a revised MVR
+    /// into one seeded earlier.
     ImportMvr {
         /// Path to the .mvr archive to import.
         mvr_path: String,
@@ -264,15 +301,21 @@ enum Commands {
         /// the venue's recorded origin on a re-import, else 0,0,0.
         #[arg(long)]
         origin: Option<String>,
-        /// Project directory the import writes into.
+        /// The project the import writes into: its directory (its
+        /// mtrack.yaml says where the lighting files are) or its config
+        /// file. The library is the project's lighting/library.
         #[arg(short, long, default_value = ".")]
         project: String,
-        /// Fixture types directory, relative to the project.
-        #[arg(long, default_value = "lighting/fixture_types")]
-        fixture_types_dir: String,
-        /// Venues directory, relative to the project.
-        #[arg(long, default_value = "lighting/venues")]
-        venues_dir: String,
+        /// Fixture types directory, relative to the project (default: the
+        /// one the project's config gives this host's profile, else
+        /// lighting/fixture_types).
+        #[arg(long)]
+        fixture_types_dir: Option<String>,
+        /// Venues directory, relative to the project (default: the one the
+        /// project's config gives this host's profile, else
+        /// lighting/venues).
+        #[arg(long)]
+        venues_dir: Option<String>,
     },
     /// Exports a venue as an .mvr archive: the patch with positions,
     /// rotations and focus points, every fixture type's GDTF embedded
@@ -287,15 +330,20 @@ enum Commands {
         /// Put each fixture on a layer named after its first tag.
         #[arg(long)]
         layers_from_tags: bool,
-        /// Project directory.
+        /// The project: its directory (its mtrack.yaml says where the
+        /// lighting files are) or its config file.
         #[arg(short, long, default_value = ".")]
         project: String,
-        /// Fixture types directory, relative to the project.
-        #[arg(long, default_value = "lighting/fixture_types")]
-        fixture_types_dir: String,
-        /// Venues directory, relative to the project.
-        #[arg(long, default_value = "lighting/venues")]
-        venues_dir: String,
+        /// Fixture types directory, relative to the project (default: the
+        /// one the project's config gives this host's profile, else
+        /// lighting/fixture_types).
+        #[arg(long)]
+        fixture_types_dir: Option<String>,
+        /// Venues directory, relative to the project (default: the one the
+        /// project's config gives this host's profile, else
+        /// lighting/venues).
+        #[arg(long)]
+        venues_dir: Option<String>,
     },
     /// Verifies the syntax of a light show file.
     VerifyLightShow {
@@ -341,13 +389,21 @@ enum Commands {
     Verify {
         /// The path to the mtrack.yaml player config file.
         config: String,
-        /// Only check specific categories (e.g., "track-mappings"). Runs all checks if omitted.
-        #[arg(long)]
-        check: Option<Vec<String>>,
-        /// Hostname to verify against. When audio_profiles are used, this filters which profiles
+        /// Only check specific categories. Runs all checks if omitted.
+        #[arg(long, value_enum)]
+        check: Option<Vec<crate::verify::Check>>,
+        /// Hostname to verify against. When profiles are used, this filters which profiles
         /// to check. If omitted, all profiles are verified.
         #[arg(long)]
         hostname: Option<String>,
+    },
+    /// Pairs a project with the mtrack hub, uploads it, or pulls it. Hidden,
+    /// and so out of `--help` and the CLI reference, while it has no UI.
+    #[cfg(feature = "hub")]
+    #[command(hide = true)]
+    Hub {
+        #[clap(subcommand)]
+        command: hub::HubCommand,
     },
 }
 
@@ -475,7 +531,10 @@ pub async fn run(tui_mode: bool) -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Songs { path, init } => local::songs(&path, init)?,
+        Commands::Songs { path, init, config } => local::songs(&path, init, config.as_deref())?,
+        Commands::BrightnessChanges { project, hostname } => {
+            local::brightness_changes(&project, hostname)?
+        }
         // `list_device_info` rather than `list_devices`: the latter builds every
         // device, and each one holds an ALSA handle that stops its siblings
         // being described, so it under-reports itself -- 8 of 19 on the test
@@ -486,7 +545,8 @@ pub async fn run(tui_mode: bool) -> Result<(), Box<dyn Error>> {
         Commands::Playlist {
             repository_path,
             playlist_path,
-        } => local::playlist(&repository_path, &playlist_path)?,
+            config,
+        } => local::playlist(&repository_path, &playlist_path, config.as_deref())?,
         Commands::Start {
             path,
             playlist_path,
@@ -534,16 +594,16 @@ pub async fn run(tui_mode: bool) -> Result<(), Box<dyn Error>> {
         )?,
         Commands::ImportGdtf {
             gdtf_path,
-            mode,
             name,
+            list_modes,
             project,
             fixture_types_dir,
         } => local::import_gdtf(
             &gdtf_path,
-            mode.as_deref(),
             name.as_deref(),
+            list_modes,
             &project,
-            &fixture_types_dir,
+            fixture_types_dir,
         )?,
         Commands::ImportMvr {
             mvr_path,
@@ -587,6 +647,8 @@ pub async fn run(tui_mode: bool) -> Result<(), Box<dyn Error>> {
             check,
             hostname,
         } => local::verify(&config, check, hostname)?,
+        #[cfg(feature = "hub")]
+        Commands::Hub { command } => hub::run(command).await?,
     }
 
     Ok(())
@@ -596,6 +658,29 @@ pub async fn run(tui_mode: bool) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// The CLI reference names every subcommand, and only those.
+    #[test]
+    fn the_cli_reference_names_every_command() {
+        use clap::CommandFactory;
+        let reference = include_str!("../docs/src/reference/cli.md");
+        let mut documented: Vec<&str> = reference
+            .split("`mtrack ")
+            .skip(1)
+            .filter_map(|rest| rest.split([' ', '`']).next())
+            .filter(|word| word.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+            .filter(|word| !word.is_empty())
+            .collect();
+        documented.sort();
+        documented.dedup();
+        let mut commands: Vec<String> = Cli::command()
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name().to_string())
+            .collect();
+        commands.sort();
+        assert_eq!(documented, commands);
+    }
 
     mod format_device_list_tests {
         use super::*;
@@ -1033,7 +1118,7 @@ mod tests {
         fn parse_songs_command() {
             let cli = Cli::try_parse_from(["mtrack", "songs", "/path/to/songs"]).unwrap();
             match cli.command {
-                Commands::Songs { path, init } => {
+                Commands::Songs { path, init, .. } => {
                     assert_eq!(path, "/path/to/songs");
                     assert!(!init);
                 }
@@ -1225,7 +1310,10 @@ mod tests {
                     hostname,
                 } => {
                     assert_eq!(config, "mtrack.yaml");
-                    assert_eq!(check.as_deref(), Some(&["track-mappings".to_string()][..]));
+                    assert_eq!(
+                        check.as_deref(),
+                        Some(&[crate::verify::Check::TrackMappings][..])
+                    );
                     assert_eq!(hostname.as_deref(), Some("stage-left"));
                 }
                 _ => panic!("expected Verify command"),
@@ -1263,6 +1351,7 @@ mod tests {
                 Commands::Playlist {
                     repository_path,
                     playlist_path,
+                    ..
                 } => {
                     assert_eq!(repository_path, "/path/to/songs");
                     assert_eq!(playlist_path, "playlist.yaml");
@@ -1555,26 +1644,19 @@ mod tests {
         }
 
         #[test]
-        fn parse_verify_with_multiple_checks() {
-            let cli = Cli::try_parse_from([
+        fn parse_verify_refuses_an_unknown_check() {
+            // A typo used to run no checks and exit 0.
+            let err = Cli::try_parse_from([
                 "mtrack",
                 "verify",
                 "mtrack.yaml",
                 "--check",
-                "track-mappings",
-                "--check",
-                "other-check",
+                "track_mappings",
             ])
-            .unwrap();
-            match cli.command {
-                Commands::Verify { check, .. } => {
-                    let checks = check.unwrap();
-                    assert_eq!(checks.len(), 2);
-                    assert!(checks.contains(&"track-mappings".to_string()));
-                    assert!(checks.contains(&"other-check".to_string()));
-                }
-                _ => panic!("expected Verify command"),
-            }
+            .err()
+            .expect("an unknown check is refused");
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+            assert!(err.to_string().contains("track-mappings"), "{err}");
         }
 
         #[test]

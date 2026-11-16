@@ -11,6 +11,7 @@
 // You should have received a copy of the GNU General Public License along with
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
+pub use crate::device_info::{AudioDeviceInfo, SupportedFormat};
 use std::{
     collections::HashMap,
     error::Error,
@@ -22,6 +23,8 @@ use std::{
     thread,
     time::Duration,
 };
+
+use std::ops::ControlFlow;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use tracing::{debug, error, info, span, warn, Level};
@@ -35,7 +38,9 @@ use crate::playsync::CancelHandle;
 use crate::songs::Song;
 
 use super::manager::OutputManager;
-use super::stream::CpalOutputStreamFactory;
+use super::stream::{CpalOutputStreamFactory, PeriodSetting};
+
+mod loop_scheduler;
 
 /// Maps a TargetFormat to the corresponding cpal::SampleFormat.
 fn target_to_cpal_sample_format(format: SampleFormat, bits_per_sample: u16) -> cpal::SampleFormat {
@@ -107,26 +112,23 @@ fn validate_channel_count(
     Ok(())
 }
 
-/// Resolves the output buffer size for the CPAL stream based on the config setting.
-/// Returns `None` for default (let CPAL decide), or `Some(size)` for a fixed frame count.
+/// Resolves the output buffer size for the CPAL stream based on the config setting:
+/// `None` for default (let CPAL decide), or `Some(size)` for a fixed frame count,
+/// with the setting that chose it, which the underrun warning's advice names.
 fn resolve_buffer_size(
     stream_buffer_size: Option<StreamBufferSize>,
     fallback_buffer_size: u32,
     min_supported: Option<u32>,
-) -> Option<u32> {
+) -> (Option<u32>, PeriodSetting) {
     match stream_buffer_size {
-        None => Some(fallback_buffer_size),
-        Some(StreamBufferSize::Default) => None,
-        Some(StreamBufferSize::Min) => min_supported.or(Some(fallback_buffer_size)),
-        Some(StreamBufferSize::Fixed(n)) => Some(n as u32),
+        None => (Some(fallback_buffer_size), PeriodSetting::BufferSize),
+        Some(StreamBufferSize::Default) => (None, PeriodSetting::BackendDefault),
+        Some(StreamBufferSize::Min) => match min_supported {
+            Some(min) => (Some(min), PeriodSetting::Min),
+            None => (Some(fallback_buffer_size), PeriodSetting::MinFallback),
+        },
+        Some(StreamBufferSize::Fixed(n)) => (Some(n as u32), PeriodSetting::Fixed),
     }
-}
-
-/// A supported sample format for an audio device.
-#[derive(serde::Serialize, Clone, PartialEq, Eq, Hash)]
-pub struct SupportedFormat {
-    pub sample_format: String,
-    pub bits_per_sample: u32,
 }
 
 /// Standard sample rates to check against device-reported ranges.
@@ -134,43 +136,195 @@ const STANDARD_SAMPLE_RATES: &[u32] = &[
     8000, 11025, 16000, 22050, 44100, 48000, 88200, 96000, 176400, 192000,
 ];
 
-/// Serialises the device walks that silence ALSA's chatter.
+/// Serialises the device walks.
 ///
-/// `shh` redirects the process's stdout and stderr by swapping file descriptors
-/// and restores them on drop, so two threads silencing at once each restore what
-/// the other installed and the process loses its real stdout for good. This is
-/// reachable in production -- a web UI device refresh can land while the player
-/// is resolving its configured device -- and it surfaced first in the test
-/// suite, where concurrent enumeration tests silenced the test harness itself
-/// and it reported a failure with no output to explain it.
-///
-/// The window is wider than it looks: the output thread re-resolves a device
-/// during stream recovery, so this is a lock rather than a hope.
+/// ALSA will not describe a device while one of its siblings is held open, so
+/// two walks at once each see part of the hardware: a web UI device refresh
+/// landing while the player resolves its configured device could make the
+/// player miss the very device it is looking for. The output thread also
+/// re-resolves a device during stream recovery, so the window is wider than it
+/// looks, and this is a lock rather than a hope.
 static ENUMERATION_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// Silences ALSA's enumeration chatter for as long as the returned guard lives.
+/// Serialises the walk and silences ALSA's enumeration chatter for as long as
+/// the returned guard lives.
 ///
-/// Holds [`ENUMERATION_LOCK`] alongside the redirect guards so the two cannot be
-/// taken apart. The redirects are declared first so they are restored *before*
+/// Only the chatter of the thread that walks is silenced, and nothing else:
+/// see [`alsa_quiet`]. The silence is declared first, so it is lifted *before*
 /// the lock is released.
 ///
-/// Never call this while a guard is already alive on the same thread: the walks
-/// that use it are siblings rather than nested, and `parking_lot::Mutex` is not
-/// reentrant.
-fn silence_enumeration() -> Result<Silenced, Box<dyn Error>> {
+/// Must not be nested: calling this while a guard from it is still alive on the
+/// same thread deadlocks, because `parking_lot::Mutex` is not reentrant. (The
+/// ALSA silence underneath, `AlsaErrorsSilenced`, nests correctly on its own;
+/// it is the lock that does not.) The walks that use it are siblings, and none
+/// calls another. The guard must be dropped on the thread that took it.
+///
+/// The lock is per process. The hardware harness runs the player as a child
+/// process, so this does not make the harness take turns with the player's
+/// walks; it serialises the harness's own walks against each other and
+/// silences their chatter, which is why it is public.
+pub fn silence_enumeration() -> Silenced {
     let lock = ENUMERATION_LOCK.lock();
-    Ok(Silenced {
-        _stdout: shh::stdout()?,
-        _stderr: shh::stderr()?,
+    Silenced {
+        #[cfg(target_os = "linux")]
+        _alsa: alsa_quiet::AlsaErrorsSilenced::install(),
         _lock: lock,
-    })
+    }
 }
 
-/// Field order is drop order: redirects first, lock last.
-struct Silenced {
-    _stdout: shh::ShhStdout,
-    _stderr: shh::ShhStderr,
+/// A device walk in progress; see [`silence_enumeration`].
+///
+/// Field order is drop order: the silence first, the lock last.
+pub struct Silenced {
+    #[cfg(target_os = "linux")]
+    _alsa: alsa_quiet::AlsaErrorsSilenced,
     _lock: parking_lot::MutexGuard<'static, ()>,
+}
+
+/// ALSA's enumeration chatter, silenced on the walking thread alone.
+///
+/// alsa-lib reports what it cannot open ("ALSA lib pcm.c:...: Unknown PCM",
+/// a missing card, a busy device) through its error handler, which by default
+/// prints to stderr. Walking every device makes a lot of that, and none of it
+/// is news. The handler is replaced for the walking thread only
+/// (`snd_lib_error_set_local` is thread-local), and the one it replaced is put
+/// back when the walk ends.
+///
+/// alsa-lib 1.2.15 added a logging API beside it (`snd_lib_log`), whose own
+/// thread-local handler (`snd_lib_log_set_local`) takes precedence over the
+/// error handler and also carries the warning, info and debug priorities the
+/// error handler never sees. alsa-sys 0.4 does not bind it, and the rig runs
+/// alsa-lib 1.2.8 and 1.2.14, which do not have it, so it is looked up at
+/// runtime: where the running alsa-lib has it, a local log handler is installed
+/// and restored alongside the error handler; where it does not, only the error
+/// handler is, and that is all those versions report through.
+///
+/// This used to swap the whole process's stdout and stderr for a pipe (`shh`)
+/// instead. Whatever any other thread wrote in that window went into the pipe
+/// and was lost: at startup, everything the DMX engine and the web server
+/// logged while the audio device opened, and on any thread, panics and real
+/// ALSA errors (a MIDI port failing to open) during a web UI device refresh.
+#[cfg(target_os = "linux")]
+mod alsa_quiet {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::marker::PhantomData;
+    use std::sync::OnceLock;
+
+    /// The handler `snd_lib_error_set_local` takes.
+    pub(super) type Handler = unsafe extern "C" fn(
+        file: *const c_char,
+        line: c_int,
+        func: *const c_char,
+        err: c_int,
+        fmt: *const c_char,
+        arg: *mut alsa_sys::__va_list_tag,
+    );
+
+    /// The handler `snd_lib_log_set_local` takes (`snd_lib_log_handler_t`,
+    /// alsa-lib 1.2.15+).
+    pub(super) type LogHandler = unsafe extern "C" fn(
+        prio: c_int,
+        interface: c_int,
+        file: *const c_char,
+        line: c_int,
+        func: *const c_char,
+        err: c_int,
+        fmt: *const c_char,
+        arg: *mut alsa_sys::__va_list_tag,
+    );
+
+    /// `snd_lib_log_set_local`: sets this thread's log handler and returns the
+    /// one it replaced.
+    type SetLocalLog = unsafe extern "C" fn(Option<LogHandler>) -> Option<LogHandler>;
+
+    /// `snd_lib_log_set_local` from the running alsa-lib, if it has one.
+    pub(super) fn set_local_log() -> Option<SetLocalLog> {
+        static SET_LOCAL_LOG: OnceLock<Option<SetLocalLog>> = OnceLock::new();
+        *SET_LOCAL_LOG.get_or_init(|| {
+            // SAFETY: a symbol lookup in the objects already loaded; libasound
+            // is among them, since alsa-sys links it.
+            let symbol =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"snd_lib_log_set_local".as_ptr()) };
+            if symbol.is_null() {
+                None
+            } else {
+                // SAFETY: the symbol is alsa-lib's `snd_lib_log_set_local`,
+                // whose C signature `SetLocalLog` mirrors.
+                Some(unsafe { std::mem::transmute::<*mut c_void, SetLocalLog>(symbol) })
+            }
+        })
+    }
+
+    /// While alive, ALSA errors (and, on alsa-lib 1.2.15+, log messages of any
+    /// priority) raised on this thread go to handlers of ours rather than
+    /// stderr.
+    ///
+    /// Nests correctly on its own: each guard restores what it replaced.
+    pub(super) struct AlsaErrorsSilenced {
+        previous: alsa_sys::snd_local_error_handler_t,
+        /// The log handler replaced, when the running alsa-lib has one.
+        previous_log: Option<(SetLocalLog, Option<LogHandler>)>,
+        /// The handler is per thread, so the guard must be dropped on the
+        /// thread that made it.
+        _not_send: PhantomData<*const ()>,
+    }
+
+    impl AlsaErrorsSilenced {
+        pub(super) fn install() -> Self {
+            Self::with_handlers(discard, discard_log)
+        }
+
+        pub(super) fn with_handlers(handler: Handler, log_handler: LogHandler) -> Self {
+            // SAFETY: each sets this thread's handler and returns the one it
+            // replaced; the handlers are plain functions that touch nothing
+            // ALSA owns.
+            let previous = unsafe { alsa_sys::snd_lib_error_set_local(Some(handler)) };
+            let previous_log = set_local_log().map(|set| (set, unsafe { set(Some(log_handler)) }));
+            Self {
+                previous,
+                previous_log,
+                _not_send: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for AlsaErrorsSilenced {
+        fn drop(&mut self) {
+            // SAFETY: as above; puts back what was installed before.
+            unsafe {
+                if let Some((set, previous_log)) = self.previous_log {
+                    set(previous_log);
+                }
+                alsa_sys::snd_lib_error_set_local(self.previous);
+            }
+        }
+    }
+
+    /// Says nothing. The arguments are never read, so the `va_list` is never
+    /// walked.
+    unsafe extern "C" fn discard(
+        _file: *const c_char,
+        _line: c_int,
+        _func: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+        _arg: *mut alsa_sys::__va_list_tag,
+    ) {
+    }
+
+    /// Says nothing, for the log API. As with [`discard`], the `va_list` is
+    /// never walked.
+    unsafe extern "C" fn discard_log(
+        _prio: c_int,
+        _interface: c_int,
+        _file: *const c_char,
+        _line: c_int,
+        _func: *const c_char,
+        _err: c_int,
+        _fmt: *const c_char,
+        _arg: *mut alsa_sys::__va_list_tag,
+    ) {
+    }
 }
 
 /// The channel count cpal reports for a device whose real maximum it does not
@@ -251,6 +405,65 @@ fn is_virtual_node(device_name: &str) -> bool {
         .any(|prefix| pcm_id.starts_with(prefix))
 }
 
+/// Whether a device name is a raw ALSA hardware node (`hw:...`): the one node
+/// whose channel count is the card's own.
+fn is_hw_node(device_name: &str) -> bool {
+    pcm_id(device_name).starts_with("hw:")
+}
+
+/// The card whose `hw` node a device may take its width from: any ALSA node
+/// naming a card that is not the raw `hw` node itself, nor an `hdmi:` node.
+///
+/// ALSA only: another host's device id can hold colons too (a CoreAudio UID),
+/// and parsing a "card" out of it cost two full walks on every open and a
+/// warning about hardware that was never there to ask. `hdmi:CARD=X,DEV=n`
+/// numbers HDMI outputs, not `hw` subdevices, so its `DEV` would pair it with
+/// the wrong `hw` node; it reports its own width honestly anyway.
+///
+/// Not only [`is_virtual_node`]'s plugins. ALSA's route nodes -- `front:`,
+/// `surround40:`, `surround71:` -- are left off that list because most report
+/// a width of their own (`front` is two channels on an eight-channel HDA card),
+/// but `surround71` on a USB card is a plug/route chain that accepts any
+/// channel count, so it reports cpal's clamp like any plug node. Whether its
+/// count is borrowed is then decided by `channels_known`, the same for the
+/// listing ([`resolve_virtual_channel_counts`]) and the open
+/// ([`Device::find_cpal_device`]): an honest report stays, the clamp does not.
+fn width_source_card(device_name: &str) -> Option<String> {
+    let (host, pcm_id) = device_name.split_once(':')?;
+    if host != "alsa" || is_hw_node(device_name) || pcm_id.starts_with("hdmi:") {
+        return None;
+    }
+    card_token(device_name)
+}
+
+/// Why a node opening at its own report has no known width, where that is
+/// worth a log line.
+#[derive(Debug, PartialEq, Eq)]
+enum UnresolvedWidth {
+    /// It names no card (a desktop's `alsa:default`): nothing to ask, every
+    /// startup, so that is how it is rather than a fault.
+    NoCard,
+    /// It names a card, but the hardware's width could not be read (busy or
+    /// absent).
+    Unread,
+}
+
+/// Whether opening `name` at its `reported` width, with `channels_known` as
+/// resolved, is one of the [`UnresolvedWidth`] cases. Only a node that could
+/// borrow a width -- a plugin, or an ALSA node [`width_source_card`] pairs with
+/// a card -- reporting cpal's clamp: a 64-channel device on another host is
+/// taken at its word, as before.
+fn unresolved_width(name: &str, channels_known: bool, reported: u16) -> Option<UnresolvedWidth> {
+    if channels_known || reported < CPAL_CHANNEL_CLAMP {
+        return None;
+    }
+    match width_source_card(name) {
+        Some(_) => Some(UnresolvedWidth::Unread),
+        None if is_virtual_node(name) => Some(UnresolvedWidth::NoCard),
+        None => None,
+    }
+}
+
 /// The card identity inside a device name, used to pair a plug node with the
 /// hardware node behind it.
 ///
@@ -277,23 +490,6 @@ fn dev_index(device_name: &str) -> Option<u16> {
         .unwrap_or(second_field)
         .parse()
         .ok()
-}
-
-/// Serializable info about an audio device for the web UI.
-#[derive(serde::Serialize)]
-pub struct AudioDeviceInfo {
-    pub name: String,
-    pub max_channels: u16,
-    pub host_name: String,
-    pub supported_sample_rates: Vec<u32>,
-    pub supported_formats: Vec<SupportedFormat>,
-    /// Whether this is an ALSA plug/virtual node. Such a node is a legitimate
-    /// and sometimes mandatory choice, so this labels it rather than hiding it.
-    pub virtual_node: bool,
-    /// Whether `max_channels` is the device's real maximum. False when the
-    /// count is cpal's clamp and no hardware node was available to resolve it,
-    /// in which case the true figure is `max_channels` or more.
-    pub channels_known: bool,
 }
 
 impl AudioDeviceInfo {
@@ -388,115 +584,222 @@ pub(super) struct ResolvedOutputDevice {
 pub(super) fn resolve_output_device(
     name: &str,
 ) -> Result<Option<ResolvedOutputDevice>, Box<dyn Error>> {
+    let mut found = None;
+    walk_output_devices(|host_id, device, device_id| {
+        // Name first: a non-match is dropped here, before its configurations
+        // are queried and before anything is built from it, so its handle is
+        // released immediately.
+        if device_id.trim() != name.trim() {
+            return ControlFlow::Continue(());
+        }
+        let Some(configs) = output_configs(&device) else {
+            debug!(
+                device_name = %device_id,
+                "Device matched by name but reports no output configurations"
+            );
+            return ControlFlow::Continue(());
+        };
+        found = Some(ResolvedOutputDevice {
+            name: device_id,
+            host_id,
+            device,
+            configs,
+        });
+        ControlFlow::Break(())
+    })?;
+    Ok(found)
+}
+
+/// The cpal output device called `name`, if there is one: [`resolve_output_device`]
+/// without the configurations, for callers outside the player that open the
+/// device themselves (the hardware harness).
+///
+/// A device whose name matches but which reports no output configurations
+/// (an input-only id, which `devices()` lists too) is skipped: the scan goes on
+/// past it, and if nothing else matches the answer is "not found".
+pub fn find_output_device(name: &str) -> Result<Option<cpal::Device>, Box<dyn Error>> {
+    Ok(resolve_output_device(name)?.map(|resolved| resolved.device))
+}
+
+/// The cpal input device called `name`, if there is one. Holds no other device
+/// open, as [`resolve_output_device`] does not.
+pub fn find_input_device(name: &str) -> Result<Option<cpal::Device>, Box<dyn Error>> {
+    let mut found = None;
+    walk_input_devices(|_, device, device_id| {
+        if device_id.trim() != name.trim() {
+            return ControlFlow::Continue(());
+        }
+        found = Some(device);
+        ControlFlow::Break(())
+    })?;
+    Ok(found)
+}
+
+/// An audio device with input channels, as [`list_input_device_info`] lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputDeviceInfo {
+    pub name: String,
+    pub max_channels: u16,
+    pub host_name: String,
+}
+
+/// Lists the devices that capture audio, with their widest input channel
+/// count. Devices reporting no input channels are left out.
+///
+/// [`list_device_info`] lists only devices that play, so an input-only
+/// interface appears here alone.
+pub fn list_input_device_info() -> Result<Vec<InputDeviceInfo>, Box<dyn Error>> {
+    let mut infos = Vec::new();
+    walk_input_devices(|host_id, device, name| {
+        let max_channels = device
+            .supported_input_configs()
+            .map(|configs| configs.map(|c| c.channels()).max().unwrap_or(0))
+            .unwrap_or(0);
+        if max_channels > 0 {
+            infos.push(InputDeviceInfo {
+                name,
+                max_channels,
+                host_name: host_id.name().to_string(),
+            });
+        }
+        ControlFlow::Continue(())
+    })?;
+    Ok(infos)
+}
+
+/// Every host's devices, visited one at a time in host then device order:
+/// the one enumeration behind the listing, the search and the open, with
+/// each caller's filter in `visit`. A device `visit` declines is dropped
+/// before anything else is asked of it, so its handle is held no longer
+/// than its id takes to read; a host whose devices will not list is logged
+/// and skipped. `visit` says whether to go on.
+///
+/// Every device a host lists, not only outputs: callers filter on the
+/// output configurations they need.
+fn walk_output_devices(
+    visit: impl FnMut(cpal::HostId, cpal::Device, String) -> ControlFlow<()>,
+) -> Result<(), Box<dyn Error>> {
+    walk_devices("", |host| Ok(Box::new(host.devices()?)), visit)
+}
+
+/// [`walk_output_devices`] over the devices that capture.
+fn walk_input_devices(
+    visit: impl FnMut(cpal::HostId, cpal::Device, String) -> ControlFlow<()>,
+) -> Result<(), Box<dyn Error>> {
+    walk_devices("input ", |host| Ok(Box::new(host.input_devices()?)), visit)
+}
+
+/// One host's devices, as a walk lists them.
+type HostDevices = Box<dyn Iterator<Item = cpal::Device>>;
+
+/// The walk behind [`walk_output_devices`] and [`walk_input_devices`], under
+/// [`silence_enumeration`]. `kind` names the devices in the log line for a
+/// host whose list fails.
+fn walk_devices(
+    kind: &str,
+    list: impl Fn(&cpal::Host) -> Result<HostDevices, cpal::Error>,
+    mut visit: impl FnMut(cpal::HostId, cpal::Device, String) -> ControlFlow<()>,
+) -> Result<(), Box<dyn Error>> {
     // Suppress noisy output here.
-    let _silenced = silence_enumeration()?;
+    let _silenced = silence_enumeration();
 
     for host_id in cpal::available_hosts() {
-        let host_devices = match cpal::host_from_id(host_id)?.devices() {
+        let host_devices = match list(&cpal::host_from_id(host_id)?) {
             Ok(host_devices) => host_devices,
             Err(e) => {
                 error!(
                     err = e.to_string(),
                     host = host_id.name(),
-                    "Unable to list devices for host"
+                    "Unable to list {kind}devices for host"
                 );
                 continue;
             }
         };
-
         for device in host_devices {
-            // Name first: a non-match is dropped here, before its configurations
-            // are queried and before anything is built from it, so its handle is
-            // released immediately.
-            let device_id = match device.id() {
-                Ok(id) => id.to_string(),
-                Err(_) => continue,
-            };
-            if device_id.trim() != name.trim() {
-                continue;
+            let Ok(id) = device.id() else { continue };
+            if visit(host_id, device, id.to_string()).is_break() {
+                return Ok(());
             }
-
-            let Some(configs) = output_configs(&device) else {
-                debug!(
-                    device_name = %device_id,
-                    "Device matched by name but reports no output configurations"
-                );
-                continue;
-            };
-
-            return Ok(Some(ResolvedOutputDevice {
-                name: device_id,
-                host_id,
-                device,
-                configs,
-            }));
         }
     }
-
-    Ok(None)
+    Ok(())
 }
 
 /// Lists audio devices as simple info structs (no trait objects).
 pub fn list_device_info() -> Result<Vec<AudioDeviceInfo>, Box<dyn Error>> {
-    // Suppress noisy output here.
-    let _silenced = silence_enumeration()?;
-
     let mut infos: Vec<AudioDeviceInfo> = Vec::new();
-    for host_id in cpal::available_hosts() {
-        let host_devices = match cpal::host_from_id(host_id)?.devices() {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        for device in host_devices {
-            let Some(output_configs) = output_configs(&device) else {
-                continue;
-            };
-            let max_channels = max_output_channels(&output_configs);
-
-            let mut sample_rates = std::collections::BTreeSet::new();
-            let mut formats = std::collections::BTreeSet::new();
-
-            for cfg in output_configs {
-                let min_rate = cfg.min_sample_rate();
-                let max_rate = cfg.max_sample_rate();
-                for &rate in STANDARD_SAMPLE_RATES {
-                    if rate >= min_rate && rate <= max_rate {
-                        sample_rates.insert(rate);
-                    }
-                }
-
-                let mapped = map_cpal_format(cfg.sample_format());
-                formats.insert((mapped.sample_format.clone(), mapped.bits_per_sample));
-            }
-            if max_channels > 0 {
-                if let Ok(id) = device.id() {
-                    let name = id.to_string();
-                    let virtual_node = is_virtual_node(&name);
-                    infos.push(AudioDeviceInfo {
-                        name,
-                        max_channels,
-                        host_name: host_id.name().to_string(),
-                        supported_sample_rates: sample_rates.into_iter().collect(),
-                        supported_formats: formats
-                            .into_iter()
-                            .map(|(sample_format, bits_per_sample)| SupportedFormat {
-                                sample_format,
-                                bits_per_sample,
-                            })
-                            .collect(),
-                        virtual_node,
-                        channels_known: channels_are_known(virtual_node, max_channels),
-                    });
-                }
-            }
+    walk_output_devices(|host_id, device, name| {
+        if let Some(output_configs) = output_configs(&device) {
+            infos.push(device_info(host_id, name, &output_configs));
         }
-    }
-    resolve_virtual_channel_counts(&mut infos);
+        ControlFlow::Continue(())
+    })?;
+    resolve_virtual_channel_counts_on_system(&mut infos, None);
     infos.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(infos)
 }
 
+/// One device's entry, from the output configurations it reports, before
+/// [`resolve_virtual_channel_counts`] has looked for a hardware sibling.
+fn device_info(
+    host_id: cpal::HostId,
+    name: String,
+    output_configs: &[cpal::SupportedStreamConfigRange],
+) -> AudioDeviceInfo {
+    let max_channels = max_output_channels(output_configs);
+
+    let mut sample_rates = std::collections::BTreeSet::new();
+    let mut formats = std::collections::BTreeSet::new();
+
+    for cfg in output_configs {
+        let min_rate = cfg.min_sample_rate();
+        let max_rate = cfg.max_sample_rate();
+        for &rate in STANDARD_SAMPLE_RATES {
+            if rate >= min_rate && rate <= max_rate {
+                sample_rates.insert(rate);
+            }
+        }
+
+        let mapped = map_cpal_format(cfg.sample_format());
+        formats.insert((mapped.sample_format.clone(), mapped.bits_per_sample));
+    }
+    let virtual_node = is_virtual_node(&name);
+    AudioDeviceInfo {
+        name,
+        max_channels,
+        host_name: host_id.name().to_string(),
+        supported_sample_rates: sample_rates.into_iter().collect(),
+        supported_formats: formats
+            .into_iter()
+            .map(|(sample_format, bits_per_sample)| SupportedFormat {
+                sample_format,
+                bits_per_sample,
+            })
+            .collect(),
+        virtual_node,
+        channels_known: channels_are_known(virtual_node, max_channels),
+    }
+}
+
+/// The channel count a device is opened with: the listing's, once
+/// [`resolve_virtual_channel_counts`] has looked for a hardware sibling, where
+/// that is known, and otherwise the device's own report.
+///
+/// A plug node's own report is cpal's clamp, so opening it at that width had
+/// the mixer fill 64 channels on every callback for ALSA's plug layer to drop
+/// all but the hardware's eight.
+fn open_channel_count(listed: Option<&AudioDeviceInfo>, reported: u16) -> u16 {
+    match listed {
+        Some(info) if info.channels_known => info.max_channels,
+        _ => reported,
+    }
+}
+
 /// Fills in plug nodes' channel counts from the hardware behind them.
+///
+/// "Plug node" here is any node [`width_source_card`] pairs with a card whose
+/// count is not known: the plugins, and a route node such as `surround71:`
+/// that reported cpal's clamp.
 ///
 /// Asking a plug node directly only ever yields [`CPAL_CHANNEL_CLAMP`], because
 /// it accepts any channel count -- but `plughw:CARD=MAT` plays out of the same
@@ -510,7 +813,17 @@ pub fn list_device_info() -> Result<Vec<AudioDeviceInfo>, Box<dyn Error>> {
 /// count stays marked unknown rather than being guessed at. cpal exposes channel
 /// counts only inside `SupportedStreamConfigRange`, so a device it cannot
 /// format-match yields no channel information to borrow.
-fn resolve_virtual_channel_counts(infos: &mut [AudioDeviceInfo]) {
+///
+/// `hw_channels` is asked first, for `(card, subdevice)`: what the raw `hw`
+/// node offers by ALSA's own hw_params ([`alsa_hw_channels`] on a real system).
+/// That answers where cpal cannot -- the WING's raw node, whose formats cpal
+/// does not know -- and a hardware node at cpal's clamp. `None` (busy, absent,
+/// not ALSA) falls back to the listed sibling, then to unknown. Each
+/// `(card, subdevice)` is asked at most once.
+fn resolve_virtual_channel_counts(
+    infos: &mut [AudioDeviceInfo],
+    mut hw_channels: impl FnMut(&str, u16) -> Option<u16>,
+) {
     // (card, subdevice) -> real channel count, because subdevices on one card
     // are not interchangeable. An Intel HDA card exposes `hw:CARD=PCH,DEV=0`
     // (analog, 2ch) beside `hw:CARD=PCH,DEV=3` (HDMI, 8ch), and every
@@ -521,7 +834,12 @@ fn resolve_virtual_channel_counts(infos: &mut [AudioDeviceInfo]) {
     let mut lowest_subdevice: HashMap<String, (u16, u16)> = HashMap::new();
 
     for info in infos.iter() {
-        if info.virtual_node || !info.channels_known {
+        // Only the raw `hw:` node is the hardware. `front:`, `surround71:` and
+        // the like are not plugins by [`is_virtual_node`]'s list, but they name
+        // the same card and subdevice with a width of their own -- `front` is
+        // two channels on an eight-channel HDA card -- and whichever of them
+        // came last in the walk used to win the subdevice.
+        if !info.channels_known || !is_hw_node(&info.name) {
             continue;
         }
         let Some(card) = card_token(&info.name) else {
@@ -539,28 +857,185 @@ fn resolve_virtual_channel_counts(infos: &mut [AudioDeviceInfo]) {
             .or_insert((dev, info.max_channels));
     }
 
+    let mut asked: HashMap<(String, u16), Option<u16>> = HashMap::new();
     for info in infos.iter_mut() {
-        if info.channels_known || !info.virtual_node {
+        // Unknown and not the hardware itself: every plugin node, and a route
+        // node (`surround71:`) that reported cpal's clamp.
+        if info.channels_known {
             continue;
         }
-        let Some(card) = card_token(&info.name) else {
+        let Some(card) = width_source_card(&info.name) else {
             continue;
         };
         // A plug node that names a subdevice routes to *that* one. Looking up by
         // card alone handed `plughw:CARD=PCH,DEV=3` the analog node's 2 channels
         // and marked it known — a confidently wrong number, which is the one
         // outcome this whole labelling exists to avoid.
-        let resolved = match dev_index(&info.name) {
+        let key = (card.clone(), dev_index(&info.name).unwrap_or(0));
+        let queried = *asked
+            .entry(key)
+            .or_insert_with_key(|(card, dev)| hw_channels(card, *dev));
+        let resolved = queried.or_else(|| match dev_index(&info.name) {
             Some(dev) => by_subdevice.get(&(card, dev)).copied(),
             None => lowest_subdevice.get(&card).map(|(_, channels)| *channels),
-        };
+        });
         // No sibling for that subdevice means no honest answer, so it stays
         // unknown rather than falling back to a different subdevice's count.
+        //
+        // The node's own report caps it. A plug node reports cpal's clamp, so
+        // the hardware's count is the answer; a `dmix` node reports the width
+        // its slave was configured at -- `dmix:CARD=Headphones,DEV=0` is two
+        // channels in front of an eight-channel `hw` node -- and opens at that
+        // and nothing wider. Taking the sibling's count outright opened it at
+        // eight, which ALSA refused.
         if let Some(channels) = resolved {
-            info.max_channels = channels;
+            info.max_channels = info.max_channels.min(channels);
             info.channels_known = true;
         }
     }
+}
+
+/// [`resolve_virtual_channel_counts`] against this machine's ALSA, at
+/// `sample_rate` where one is configured.
+///
+/// Must run while the virtual node is not held: ALSA will not hand out the
+/// `hw` node's hw_params while a plug in front of it has it open.
+fn resolve_virtual_channel_counts_on_system(
+    infos: &mut [AudioDeviceInfo],
+    sample_rate: Option<u32>,
+) {
+    resolve_virtual_channel_counts(infos, |card, dev| alsa_hw_channels(card, dev, sample_rate));
+}
+
+/// The most channels `hw:CARD=<card>,DEV=<dev>` offers for playback, from
+/// ALSA's hw_params, at `sample_rate` where the node accepts it.
+///
+/// The one channel count that does not depend on cpal knowing the node's
+/// formats: a Behringer WING's raw node is `S24_3LE` only, which cpal cannot
+/// use, so it never lists and its plug node had nothing to borrow from. Opened
+/// non-blocking and closed at once; a node that is busy (EBUSY: something is
+/// playing through it), absent, or refuses is `None`, never a guess.
+#[cfg(target_os = "linux")]
+fn alsa_hw_channels(card: &str, dev: u16, sample_rate: Option<u32>) -> Option<u16> {
+    let node = format!("hw:CARD={card},DEV={dev}");
+    let query = || -> Result<u32, alsa::Error> {
+        let pcm = alsa::PCM::new(&node, alsa::Direction::Playback, true)?;
+        let params = alsa::pcm::HwParams::any(&pcm)?;
+        if let Some(rate) = sample_rate {
+            // Narrows the space where the rate is offered; where it is not,
+            // the node's overall maximum is still the honest answer.
+            let _ = params.set_rate(rate, alsa::ValueOr::Nearest);
+        }
+        params.get_channels_max()
+    };
+    let result = {
+        // alsa-lib reports a failed open through its error handler; quiet on
+        // this thread, and serialised with the walks.
+        let _silenced = silence_enumeration();
+        query()
+    };
+    match result {
+        Ok(channels) => {
+            debug!(node = %node, channels, "Read hardware channel count from ALSA");
+            Some(u16::try_from(channels).unwrap_or(u16::MAX))
+        }
+        Err(e) => {
+            debug!(node = %node, err = %e, "Could not read hardware channel count from ALSA");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn alsa_hw_channels(_card: &str, _dev: u16, _sample_rate: Option<u32>) -> Option<u16> {
+    None
+}
+
+/// What finding a virtual node's width needs from the system, so that the
+/// order and the cost of it can be tested.
+trait NodeProbe {
+    /// Whether a device of this name is listed at all. Name only: nothing is
+    /// asked of any device, so a device still missing costs no probing.
+    fn exists(&mut self, name: &str) -> Result<bool, Box<dyn Error>>;
+    /// The listing entries of `name` and of the raw `hw` nodes on `card`,
+    /// probed and released; no other device is asked anything.
+    fn card_nodes(
+        &mut self,
+        name: &str,
+        card: &str,
+    ) -> Result<Vec<AudioDeviceInfo>, Box<dyn Error>>;
+    /// See [`alsa_hw_channels`].
+    fn hw_channels(&mut self, card: &str, dev: u16) -> Option<u16>;
+}
+
+/// Whether `device_id` is one of the nodes [`NodeProbe::card_nodes`] probes
+/// for `name`: the node itself, or a raw `hw` node on its `card`.
+fn is_card_node(device_id: &str, name: &str, card: &str) -> bool {
+    device_id.trim() == name.trim()
+        || (is_hw_node(device_id) && card_token(device_id).as_deref() == Some(card))
+}
+
+/// [`NodeProbe`] on this machine.
+struct SystemProbe {
+    sample_rate: Option<u32>,
+}
+
+impl NodeProbe for SystemProbe {
+    fn exists(&mut self, name: &str) -> Result<bool, Box<dyn Error>> {
+        let mut exists = false;
+        walk_output_devices(|_, _, device_id| {
+            if device_id.trim() == name.trim() {
+                exists = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(exists)
+    }
+
+    fn card_nodes(
+        &mut self,
+        name: &str,
+        card: &str,
+    ) -> Result<Vec<AudioDeviceInfo>, Box<dyn Error>> {
+        let mut infos = Vec::new();
+        walk_output_devices(|host_id, device, device_id| {
+            if is_card_node(&device_id, name, card) {
+                if let Some(configs) = output_configs(&device) {
+                    infos.push(device_info(host_id, device_id, &configs));
+                }
+            }
+            ControlFlow::Continue(())
+        })?;
+        Ok(infos)
+    }
+
+    fn hw_channels(&mut self, card: &str, dev: u16) -> Option<u16> {
+        alsa_hw_channels(card, dev, self.sample_rate)
+    }
+}
+
+/// A virtual node's listing entry, its width resolved against only its own
+/// card: `None` if no such device is listed.
+///
+/// Name first, and nothing probed until the name exists: `retry_until_ready`
+/// asks for a missing device twice a second, at boot until the WING appears,
+/// and a full listing calls `supported_output_configs()` on every device of
+/// every host. Then only the node and its card's `hw` nodes are probed, and
+/// ALSA asked for the `hw` node's width, all before the node is held.
+fn listed_virtual_node(
+    name: &str,
+    card: &str,
+    probe: &mut impl NodeProbe,
+) -> Result<Option<AudioDeviceInfo>, Box<dyn Error>> {
+    if !probe.exists(name)? {
+        return Ok(None);
+    }
+    let mut infos = probe.card_nodes(name, card)?;
+    resolve_virtual_channel_counts(&mut infos, |card, dev| probe.hw_channels(card, dev));
+    Ok(infos
+        .into_iter()
+        .find(|info| info.name.trim() == name.trim()))
 }
 
 /// How long a built hint is reused before being rebuilt.
@@ -643,6 +1118,10 @@ pub struct Device {
     /// `None` when the backend was left to choose and did not say, which is what
     /// `BufferSize::Default` gives. Used only to size the liveness window.
     output_buffer_size: Option<u32>,
+    /// Whether `max_channels` is the real width behind the device -- hardware
+    /// reporting under cpal's clamp, or a virtual node whose hardware was
+    /// read -- rather than a plugin's or cpal's figure.
+    channels_known: bool,
     /// Player-wide metronome defaults, set at hardware init.
     metronome_defaults: parking_lot::Mutex<Option<config::MetronomeDefaults>>,
 }
@@ -660,6 +1139,232 @@ impl fmt::Display for Device {
 }
 
 impl Device {
+    /// Takes in the next pass of a crossfading song loop if its build has
+    /// finished.
+    fn collect_pass(song_loop: &mut SongLoopCrossfade) {
+        if let Some((from, rx)) = song_loop.build_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok((sources, took))) => {
+                    song_loop.prebuilt = Some((from, sources));
+                    // A slow build is remembered for a few more: a fast
+                    // one (its files cached) is no promise the next will be.
+                    let remembered = song_loop
+                        .build_took
+                        .map_or(Duration::ZERO, |slowest| slowest.mul_f64(0.75));
+                    song_loop.build_took = Some(took.max(remembered));
+                }
+                Ok(Err(e)) => {
+                    error!(err = %e, "Failed to pre-build the next loop pass; will retry")
+                }
+                Err(mpsc::TryRecvError::Empty) => song_loop.build_rx = Some((from, rx)),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+    }
+
+    /// Where in the song the pass built, or building, starts.
+    fn pass_from(song_loop: &SongLoopCrossfade) -> Option<Duration> {
+        song_loop
+            .prebuilt
+            .as_ref()
+            .map(|(from, _)| *from)
+            .or(song_loop.build_rx.as_ref().map(|(from, _)| *from))
+    }
+
+    /// Keeps a pass begun late (inside the crossfade) on a build that can
+    /// make it: one built, or building, from a point playback has yet to
+    /// reach is joined there rather than thrown away for the plan of the
+    /// moment; and with nothing building, a plan too near to build for, as
+    /// long as builds have been taking, is made again further ahead. Gives
+    /// the pass's target on the playback timeline, if it moved.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_late_pass(
+        song_loop: &mut SongLoopCrossfade,
+        section: &crate::section_loop::EffectiveSection,
+        trigger: &mut crate::section_loop::SectionLoopTrigger,
+        effective: Option<&crate::section_loop::EffectiveSection>,
+        elapsed: Duration,
+        lookahead: Duration,
+    ) -> Option<Duration> {
+        Self::collect_pass(song_loop);
+        let needs = song_loop
+            .build_took
+            .map(|took| took * 3 / 2 + lookahead)
+            .unwrap_or_default();
+        trigger.join_ahead_by(needs);
+        let target = trigger.arm(effective, elapsed)?;
+        let planned = trigger.past_end(target);
+        match Self::pass_from(song_loop) {
+            // Only a pass begun late: one on time builds from the top.
+            Some(built)
+                if !planned.is_zero()
+                    && built != planned
+                    && built <= section.overlap
+                    && trigger
+                        .join_time(built)
+                        .is_some_and(|join| join >= elapsed + lookahead) =>
+            {
+                trigger.join_from(built);
+            }
+            None if !planned.is_zero() && target < elapsed + needs => {
+                trigger.reset();
+            }
+            _ => {}
+        }
+        trigger.arm(effective, elapsed)
+    }
+
+    /// Has the next pass of a crossfading song loop built from `from` in
+    /// the song (the top, or part way in for one begun late), if it is not
+    /// built or building already. One built or building from elsewhere is
+    /// dropped.
+    fn prebuild_pass(
+        song: &Arc<Song>,
+        song_loop: &mut SongLoopCrossfade,
+        playback_context: &crate::audio::PlaybackContext,
+        mappings: &HashMap<String, Vec<u16>>,
+        from: Duration,
+    ) {
+        Self::collect_pass(song_loop);
+        if song_loop
+            .prebuilt
+            .as_ref()
+            .is_some_and(|(at, _)| *at != from)
+        {
+            song_loop.prebuilt = None;
+        }
+        // One build at a time: one under way from elsewhere is seen out
+        // (a build cannot be stopped part way) before another starts.
+        if song_loop.prebuilt.is_some() || song_loop.build_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let song = song.clone();
+        let context = playback_context.clone();
+        let mappings = mappings.clone();
+        let _ = thread::Builder::new()
+            .name("mtrack-loop-pass-prebuild".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let built = build_pass_sources(
+                    &song,
+                    &context,
+                    &mappings,
+                    from,
+                    from,
+                    song.loop_crossfade_cut(),
+                );
+                let _ = tx.send(built.map(|sources| (sources, started.elapsed())));
+            });
+        song_loop.build_rx = Some((from, rx));
+    }
+
+    /// Sees out a loop break's fade that the pass playing out does not, as
+    /// `carry` plans: the pass's sources (`pass_ids`, those of them fading)
+    /// cross out over its last overlap, and as many more passes as it takes
+    /// start from the top and carry the fade on. The fade's excluded tracks,
+    /// cut at the break, stay out. The new sources join the ones a stop
+    /// cuts.
+    #[allow(clippy::too_many_arguments)]
+    fn carry_break_fade(
+        &self,
+        song: &Arc<Song>,
+        playback_context: &crate::audio::PlaybackContext,
+        mappings: &HashMap<String, Vec<u16>>,
+        cancel_handle: &CancelHandle,
+        pass_ids: &[u64],
+        carry: crate::audio::song_loop::BreakCarry,
+        timing: &crate::audio::song_loop::BreakCarryTiming,
+        fade: &crate::playsync::BreakFade,
+        break_fade_ids: &parking_lot::Mutex<Vec<u64>>,
+    ) {
+        use crate::audio::crossfade::GainEnvelope;
+        let mixer = &self.output_manager.mixer;
+        // The pass playing out keeps its own envelope (a crossover under
+        // way goes on); its break fade becomes the one that crosses it out.
+        // The fade's excluded tracks, cut at the break, stay out.
+        if let Some(outgoing) = &carry.outgoing {
+            let fading = break_fade_ids.lock().clone();
+            let ids: Vec<u64> = pass_ids
+                .iter()
+                .filter(|id| fading.contains(id))
+                .copied()
+                .collect();
+            mixer.replace_break_envelopes(
+                &ids,
+                &GainEnvelope::piecewise(outgoing.clone().into()).with_start_sample(timing.now),
+                |labels| !crate::audio::song_loop::only_tracks_in(labels, &fade.exclude),
+            );
+        }
+        info!(
+            song = song.name(),
+            passes = carry.passes.len(),
+            "Loop break: carrying the fade-out into more passes"
+        );
+        for (start, knots) in &carry.passes {
+            let sources = match build_pass_sources(
+                song,
+                playback_context,
+                mappings,
+                Duration::ZERO,
+                Duration::ZERO,
+                &fade.exclude,
+            ) {
+                Ok(sources) => sources,
+                Err(e) => {
+                    error!(err = %e, "Failed to carry a loop break's fade into the next pass");
+                    return;
+                }
+            };
+            let knots: Arc<[(u64, f32)]> = knots.clone().into();
+            let start = (*start).max(mixer.current_sample());
+            for (source, group) in sources {
+                if group == PassGroup::Cut {
+                    continue;
+                }
+                let envelope = GainEnvelope::piecewise(knots.clone()).with_start_sample(start);
+                let (mut active_source, _) =
+                    build_active_source(source, mappings, cancel_handle, Some(Arc::new(envelope)));
+                active_source.start_at_sample = Some(start);
+                break_fade_ids.lock().push(active_source.id);
+                self.output_manager.add_source_now(active_source);
+            }
+        }
+    }
+
+    /// Ends a crossfading song loop's playback mid-crossfade: a pass not yet
+    /// started never starts, and, unless the player is already fading
+    /// everything out for a loop break, the outgoing pass -- whose fade-out
+    /// would otherwise keep it playing through a cancel for the rest of a
+    /// long overlap -- fades over the short crossfade instead. Only this
+    /// song's sources are touched.
+    fn end_song_loop_crossfade(
+        &self,
+        song_loop: &SongLoopCrossfade,
+        crossfade_samples: u64,
+        loop_broken: bool,
+    ) {
+        use crate::audio::crossfade::{CrossfadeCurve, GainEnvelope};
+        let mixer = &self.output_manager.mixer;
+        let now_sample = mixer.current_sample();
+        // A loop break lets a pass already scheduled start, under its fade:
+        // the notes and lights make that jump too.
+        if let Some((start_sample, ids)) = &song_loop.latest_start {
+            if !loop_broken && now_sample < *start_sample {
+                mixer.set_cancel_at_sample(ids, now_sample.max(1));
+            }
+        }
+        if !loop_broken && !song_loop.outgoing_ids.is_empty() {
+            mixer.set_gain_envelope(
+                &song_loop.outgoing_ids,
+                Arc::new(GainEnvelope::fade_out(
+                    crossfade_samples,
+                    CrossfadeCurve::Linear,
+                )),
+            );
+        }
+    }
+
     /// Lists cpal devices and produces the Device trait.
     pub fn list() -> Result<Vec<Box<dyn AudioDevice>>, Box<dyn Error>> {
         Ok(Device::list_cpal_devices()?
@@ -673,9 +1378,6 @@ impl Device {
 
     /// Lists cpal devices.
     fn list_cpal_devices() -> Result<Vec<Device>, Box<dyn Error>> {
-        // Suppress noisy output here.
-        let _silenced = silence_enumeration()?;
-
         // Enumerate first, and build nothing while doing it.
         //
         // Constructing the placeholder `OutputManager` inside this walk reserves
@@ -685,83 +1387,63 @@ impl Device {
         // what the web UI's picker (which only queries) advertises. On the test
         // rig that was 8 devices against 19, and choosing one of the missing 11
         // failed with "no device found with name ..." (#357).
-        let mut found: Vec<(cpal::HostId, cpal::Device, u16)> = Vec::new();
-        for host_id in cpal::available_hosts() {
-            let host_devices = match cpal::host_from_id(host_id)?.devices() {
-                Ok(host_devices) => host_devices,
-                Err(e) => {
-                    error!(
-                        err = e.to_string(),
-                        host = host_id.name(),
-                        "Unable to list devices for host"
-                    );
-                    continue;
-                }
-            };
-
-            for device in host_devices {
-                let Some(configs) = output_configs(&device) else {
-                    continue;
-                };
-                found.push((host_id, device, max_output_channels(&configs)));
+        let mut found: Vec<ResolvedOutputDevice> = Vec::new();
+        walk_output_devices(|host_id, device, name| {
+            if let Some(configs) = output_configs(&device) {
+                found.push(ResolvedOutputDevice {
+                    name,
+                    host_id,
+                    device,
+                    configs,
+                });
             }
-        }
+            ControlFlow::Continue(())
+        })?;
 
         // Now build. The manager here is a placeholder that `get` replaces, so
         // it holds nothing anyone depends on -- it just must not exist while the
         // enumeration above is still running.
-        let mut devices: Vec<Device> = Vec::new();
-        for (host_id, device, max_channels) in found {
-            let default_format = TargetFormat::new(44100, SampleFormat::Int, 32)?;
-            let temp_output_manager = Arc::new(OutputManager::new(
-                max_channels,
-                default_format.sample_rate,
-            )?);
-
-            devices.push(Device {
-                name: device.id()?.to_string(),
-                playback_delay: Duration::ZERO,
-                max_channels,
-                host_id,
-                device,
-                target_format: default_format,
-                output_manager: temp_output_manager,
-                audio_config: config::Audio::new("default"), // Default config for listing
-                metronome_defaults: parking_lot::Mutex::new(None),
-                output_buffer_size: None,
+        //
+        // The listing's channel counts, resolved the same way, from the
+        // configurations read above rather than another walk.
+        let mut infos: Vec<AudioDeviceInfo> = found
+            .iter()
+            .map(|resolved| device_info(resolved.host_id, resolved.name.clone(), &resolved.configs))
+            .collect();
+        // The walk above holds every device, so ALSA's answer here is often
+        // "busy" and the cpal siblings stand in; `get` opens through
+        // `find_cpal_device`, which asks before holding anything.
+        resolve_virtual_channel_counts_on_system(&mut infos, None);
+        let mut devices = found
+            .into_iter()
+            .zip(&infos)
+            .map(|(resolved, info)| {
+                let reported = max_output_channels(&resolved.configs);
+                let mut device =
+                    Device::placeholder(resolved, open_channel_count(Some(info), reported))?;
+                device.channels_known = info.channels_known;
+                Ok::<_, Box<dyn Error>>(device)
             })
-        }
-
+            .collect::<Result<Vec<Device>, _>>()?;
         devices.sort_by_key(|device| device.name.to_string());
         Ok(devices)
     }
 
-    /// Whether a device of this name can be located for opening.
+    /// A `Device` for a resolved output device, with a placeholder format
+    /// and output manager that `get` replaces: what a listing holds, and
+    /// what a find hands to `get`.
     ///
-    /// The cheap half of [`Device::get`]: it resolves the device the same way
-    /// but starts no output thread, so it can be asked about every advertised
-    /// device without disturbing a rig.
-    pub fn is_findable(name: &str) -> bool {
-        matches!(Device::find_cpal_device(name), Ok(Some(_)))
-    }
-
-    /// Finds one output device by name and wraps it in a `Device`.
-    ///
-    /// See [`resolve_output_device`] for why this scans rather than searching
-    /// `list_cpal_devices()`.
-    fn find_cpal_device(name: &str) -> Result<Option<Device>, Box<dyn Error>> {
-        let Some(resolved) = resolve_output_device(name)? else {
-            return Ok(None);
-        };
-
-        let max_channels = max_output_channels(&resolved.configs);
+    /// `max_channels` is the width it is opened at, from [`open_channel_count`].
+    fn placeholder(
+        resolved: ResolvedOutputDevice,
+        max_channels: u16,
+    ) -> Result<Device, Box<dyn Error>> {
         let default_format = TargetFormat::new(44100, SampleFormat::Int, 32)?;
         let output_manager = Arc::new(OutputManager::new(
             max_channels,
             default_format.sample_rate,
         )?);
-
-        Ok(Some(Device {
+        Ok(Device {
             name: resolved.name,
             playback_delay: Duration::ZERO,
             max_channels,
@@ -772,7 +1454,84 @@ impl Device {
             audio_config: config::Audio::new("default"),
             metronome_defaults: parking_lot::Mutex::new(None),
             output_buffer_size: None,
-        }))
+            channels_known: false,
+        })
+    }
+
+    /// Whether a device of this name can be located for opening.
+    ///
+    /// The cheap half of [`Device::get`]: it starts no output thread, so it can
+    /// be asked about every advertised device without disturbing a rig. It is
+    /// not the whole of [`Device::find_cpal_device`]: it matches the name and
+    /// asks only that device for output configurations, and does not resolve
+    /// a virtual node's width (no hardware sibling, no ALSA query). A name it
+    /// finds, `find_cpal_device` finds too.
+    pub fn is_findable(name: &str) -> bool {
+        matches!(resolve_output_device(name), Ok(Some(_)))
+    }
+
+    /// Finds one output device by name and wraps it in a `Device`, at the width
+    /// it is opened with.
+    ///
+    /// See [`resolve_output_device`] for why this scans rather than searching
+    /// `list_cpal_devices()`.
+    ///
+    /// A virtual node naming a card takes its width from
+    /// [`listed_virtual_node`], which reads it from the hardware behind the
+    /// node before the node is held -- ALSA will not describe the hardware
+    /// while a plug in front of it is open. A node it does not find is not
+    /// there to open either.
+    fn find_cpal_device(
+        name: &str,
+        sample_rate: Option<u32>,
+    ) -> Result<Option<Device>, Box<dyn Error>> {
+        let virtual_node = is_virtual_node(name);
+        let listed = match width_source_card(name) {
+            Some(card) => {
+                match listed_virtual_node(name, &card, &mut SystemProbe { sample_rate })? {
+                    Some(info) => Some(info),
+                    None => return Ok(None),
+                }
+            }
+            None => None,
+        };
+        let Some(resolved) = resolve_output_device(name)? else {
+            return Ok(None);
+        };
+        let reported = max_output_channels(&resolved.configs);
+        let channels = open_channel_count(listed.as_ref(), reported);
+        let channels_known = match &listed {
+            Some(info) => info.channels_known,
+            None => channels_are_known(virtual_node, reported),
+        };
+        if channels != reported {
+            info!(
+                device = %resolved.name,
+                channels,
+                reported,
+                "Opening this node at the width of the hardware behind it"
+            );
+        } else {
+            match unresolved_width(name, channels_known, reported) {
+                Some(UnresolvedWidth::Unread) => warn!(
+                    device = %resolved.name,
+                    channels,
+                    "Could not read the channel count of the hardware behind this node \
+                     (busy or absent); opening it at cpal's clamped width, and track \
+                     mappings are not checked against the hardware"
+                ),
+                Some(UnresolvedWidth::NoCard) => info!(
+                    device = %resolved.name,
+                    channels,
+                    "This node names no card, so its hardware's channel count is \
+                     unknown; opening it at cpal's clamped width"
+                ),
+                None => {}
+            }
+        }
+        let mut device = Device::placeholder(resolved, channels)?;
+        device.channels_known = channels_known;
+        Ok(Some(device))
     }
 
     /// Gets the given cpal device.
@@ -790,7 +1549,7 @@ impl Device {
         );
         // Enumeration failing is neither of the two cases below: nothing is
         // known about the device yet, so it stays retryable.
-        let found = Device::find_cpal_device(&name)
+        let found = Device::find_cpal_device(&name, Some(config.sample_rate()))
             .map_err(|e| crate::audio::AudioError::Playback(e.to_string()))?;
         match found {
             Some(device) => {
@@ -841,34 +1600,27 @@ impl Device {
         // Resolve stream buffer size for CPAL (default / min / fixed)
         let min_size =
             min_supported_buffer_size(&device.device, &device.target_format, device.max_channels);
-        let output_buffer_size = resolve_buffer_size(
+        let (output_buffer_size, period_setting) = resolve_buffer_size(
             config.stream_buffer_size(),
             config.buffer_size() as u32,
             min_size,
         );
-        if let (Some(StreamBufferSize::Min), Some(s)) =
-            (config.stream_buffer_size(), output_buffer_size)
-        {
-            if min_size.is_some() {
-                // Report the period in milliseconds as well as frames. "12
-                // frames" is what the MAT's minimum resolves to on the test rig
-                // and it means nothing on its own; "0.2ms" is immediately legible
-                // as the callback deadline it actually is. `min` reads as a
-                // recommendation, so the number behind it should not need
-                // arithmetic to interpret.
-                let period_ms = crate::audio::health::callback_period(
-                    Some(s),
-                    device.target_format.sample_rate,
-                )
-                .map(|p| p.as_secs_f64() * 1000.0)
-                .unwrap_or(0.0);
-                info!(
-                    stream_buffer_size = s,
-                    period_ms = format!("{period_ms:.2}"),
-                    "Using minimum supported stream buffer size — lowest latency, \
-                     and the least tolerance for scheduling jitter"
-                );
-            }
+        if let (PeriodSetting::Min, Some(s)) = (period_setting, output_buffer_size) {
+            // Report the period in milliseconds as well as frames. "12
+            // frames" is what the MAT's minimum resolves to on the test rig
+            // and it means nothing on its own; "0.2ms" is immediately legible
+            // as the callback deadline it actually is. `min` reads as a
+            // recommendation, so the number behind it should not need
+            // arithmetic to interpret.
+            let period_ms =
+                crate::audio::health::callback_period_ms(Some(s), device.target_format.sample_rate)
+                    .unwrap_or(0.0);
+            info!(
+                stream_buffer_size = s,
+                period_ms = format!("{period_ms:.2}"),
+                "Using minimum supported stream buffer size — lowest latency, \
+                 and the least tolerance for scheduling jitter"
+            );
         }
 
         // Start the output thread with resolved buffer size
@@ -877,6 +1629,7 @@ impl Device {
             device.name.clone(),
             device.target_format.clone(),
             output_buffer_size,
+            period_setting,
         ));
         output_manager.start_output_thread(factory)?;
 
@@ -893,28 +1646,85 @@ impl Device {
 /// Every call site in `play_from` follows the same pattern: allocate a source ID,
 /// create an `is_finished` flag, build the struct, and hand back the flag for
 /// monitoring. This helper captures that boilerplate.
-/// Finds the section the playhead currently sits inside, if any, resolved to
-/// absolute time bounds via the song's beat grid.
-///
-/// This is the loop-back candidate: whichever section the performer is hearing
-/// could be armed at any moment, and arming loops back to its `start_time`. The
-/// audio monitor uses this to prewarm the loop-back sources speculatively, so
-/// they are ready the instant the loop is armed — even on the last beat of the
-/// section — rather than incurring a file-open/seek/warmup stall at the first
-/// boundary.
-fn current_playhead_section(
+use crate::audio::song_loop::PassGroup;
+
+type GroupedSources = Vec<(
+    Box<dyn crate::audio::sample_source::ChannelMappedSampleSource>,
+    PassGroup,
+)>;
+
+/// One pass of a looping song's sources, in its two groups: the fading tracks
+/// from `fade_from`, the cut tracks from `cut_from`. A file holding tracks of
+/// both groups is opened once for each, each copy carrying only its group's
+/// tracks; a copy left carrying none is dropped.
+fn build_pass_sources(
     song: &Song,
-    elapsed: Duration,
-) -> Option<crate::player::SectionBounds> {
-    song.sections().iter().find_map(|s| {
-        let (start_time, end_time) = song.resolve_section(&s.name)?;
-        (elapsed >= start_time && elapsed < end_time).then(|| crate::player::SectionBounds {
-            name: s.name.clone(),
-            start_time,
-            end_time,
-        })
-    })
+    context: &crate::audio::PlaybackContext,
+    mappings: &HashMap<String, Vec<u16>>,
+    fade_from: Duration,
+    cut_from: Duration,
+    cut: &[String],
+) -> Result<GroupedSources, String> {
+    let in_group = |group: PassGroup| -> HashMap<String, Vec<u16>> {
+        mappings
+            .iter()
+            .filter(|(track, _)| cut.contains(track) == (group == PassGroup::Cut))
+            .map(|(track, channels)| (track.clone(), channels.clone()))
+            .collect()
+    };
+    let mut grouped = Vec::new();
+    for (group, from) in [(PassGroup::Fade, fade_from), (PassGroup::Cut, cut_from)] {
+        let group_mappings = in_group(group);
+        if group_mappings.is_empty() {
+            continue;
+        }
+        let sources = song
+            .create_channel_mapped_sources_from(context, from, &group_mappings)
+            .map_err(|e| e.to_string())?;
+        grouped.extend(
+            sources
+                .into_iter()
+                .filter(|s| s.channel_mappings().iter().any(|labels| !labels.is_empty()))
+                .map(|s| (s, group)),
+        );
+    }
+    Ok(grouped)
 }
+
+/// The state of a looping song's crossfade between passes (`loop_crossfade`):
+/// the current pass's sources by group, and the next pass's, built ahead.
+struct SongLoopCrossfade {
+    /// How long passes overlap.
+    overlap: Duration,
+    /// The current pass's sources, by group.
+    fade_ids: Vec<u64>,
+    cut_ids: Vec<u64>,
+    /// The next pass's sources, built and waiting for the boundary.
+    prebuilt: Option<(Duration, GroupedSources)>,
+    /// A build of the next pass's sources in flight.
+    build_rx: Option<PassBuild>,
+    /// How long builds have been taking, timed where they are built: the
+    /// latest, or a slower one before it, fading by a quarter a build.
+    build_took: Option<Duration>,
+    /// The sample the latest pass starts at, and its sources' ids, to cancel
+    /// them outright if playback ends before they have started.
+    latest_start: Option<(u64, Vec<u64>)>,
+    /// Whether a missing build at the boundary has been reported.
+    warned_late: bool,
+    /// The outgoing pass's sources, still fading while the next plays.
+    outgoing_ids: Vec<u64>,
+}
+
+/// How far ahead of a pass boundary its sources are built: long enough for a
+/// cold file open, seek and buffer warmup.
+const PASS_PREBUILD_AHEAD: Duration = Duration::from_secs(5);
+
+/// A pass being built: from where in the song, and where its sources come,
+/// with how long they took to build.
+type PassBuild = (
+    Duration,
+    mpsc::Receiver<Result<(GroupedSources, Duration), String>>,
+);
 
 fn build_active_source(
     source: Box<dyn crate::audio::sample_source::ChannelMappedSampleSource + Send + Sync>,
@@ -941,6 +1751,7 @@ fn build_active_source(
         cancel_at_sample: Some(Arc::new(std::sync::atomic::AtomicU64::new(0))),
         gain: Default::default(),
         gain_envelope,
+        break_envelope: None,
     };
     (active, flag)
 }
@@ -973,6 +1784,10 @@ impl AudioDevice for Device {
                 || wanted.eq_ignore_ascii_case(self.name.trim()))
     }
 
+    fn channels(&self) -> Option<u16> {
+        self.channels_known.then_some(self.max_channels)
+    }
+
     fn set_metronome_defaults(&self, defaults: Option<config::MetronomeDefaults>) {
         *self.metronome_defaults.lock() = defaults;
     }
@@ -995,8 +1810,18 @@ impl AudioDevice for Device {
             loop_break,
             active_section,
             section_loop_break,
-            loop_time_consumed,
+            break_fade,
+            break_fade_ids,
+            start_fade,
+            section_jumps,
+            ..
         } = loop_control;
+        // Only for the song it was meant for, from the top.
+        let start_fade = start_fade
+            .lock()
+            .take()
+            .filter(|fade| fade.song == song.name() && start_time.is_zero())
+            .map(|fade| fade.fade);
         let span = span!(Level::INFO, "play song (cpal)");
         let _enter = span.enter();
 
@@ -1050,9 +1875,47 @@ impl AudioDevice for Device {
         .with_metronome_defaults(self.metronome_defaults.lock().clone());
 
         // Create channel mapped sources for each track in the song, starting from start_time.
-        let channel_mapped_sources = song
-            .create_channel_mapped_sources_from(&playback_context, start_time, mappings)
-            .map_err(|e| crate::audio::AudioError::Playback(e.to_string()))?;
+        // A song that loops with a crossfade keeps its cut tracks in sources of
+        // their own, so each group can cross the pass boundary its own way.
+        let mut song_loop = song.loop_crossfade().map(|overlap| SongLoopCrossfade {
+            overlap,
+            fade_ids: Vec::new(),
+            cut_ids: Vec::new(),
+            prebuilt: None,
+            build_rx: None,
+            build_took: None,
+            latest_start: None,
+            warned_late: false,
+            outgoing_ids: Vec::new(),
+        });
+        // How the song goes round as a whole when no section loop is armed:
+        // passes the trigger times as it times a section's jumps.
+        let whole_song = crate::section_loop::WholeSongLoop::of(&song, song.duration());
+        // The tracks a pass switches over at its crossfade's midpoint: every
+        // build of the song's sources keeps them apart, a section loop's
+        // too, so a pass after one crosses each group its own way.
+        let cut_tracks: Vec<String> = if song_loop.is_some() {
+            song.loop_crossfade_cut().to_vec()
+        } else {
+            Vec::new()
+        };
+        let channel_mapped_sources: GroupedSources = if song_loop.is_some() {
+            build_pass_sources(
+                &song,
+                &playback_context,
+                mappings,
+                start_time,
+                start_time,
+                song.loop_crossfade_cut(),
+            )
+            .map_err(crate::audio::AudioError::Playback)?
+        } else {
+            song.create_channel_mapped_sources_from(&playback_context, start_time, mappings)
+                .map_err(|e| crate::audio::AudioError::Playback(e.to_string()))?
+                .into_iter()
+                .map(|s| (s, PassGroup::Fade))
+                .collect()
+        };
 
         // Add all sources to the output manager
         if channel_mapped_sources.is_empty() {
@@ -1086,13 +1949,36 @@ impl AudioDevice for Device {
             None
         };
 
-        for source in channel_mapped_sources.into_iter() {
-            let (active_source, flag) = build_active_source(
-                source,
-                mappings,
-                &cancel_handle,
-                song_crossfade_envelope.clone(),
-            );
+        // Starting under a song a loop break is fading out, with a playlist
+        // `fade_in`: everything but its excluded tracks fades in over it, each
+        // source on an envelope of its own.
+        let start_fade_samples = start_fade.as_ref().map(|fade| {
+            crate::audio::duration_to_samples(fade.length, self.output_manager.mixer.sample_rate())
+        });
+        for (source, group) in channel_mapped_sources.into_iter() {
+            let envelope = match (&start_fade, start_fade_samples) {
+                (Some(fade), Some(samples))
+                    if !crate::audio::song_loop::only_tracks_in(
+                        source.channel_mappings(),
+                        &fade.exclude,
+                    ) =>
+                {
+                    Some(Arc::new(crate::audio::crossfade::GainEnvelope::fade_in(
+                        samples, fade.curve,
+                    )))
+                }
+                _ => song_crossfade_envelope
+                    .as_ref()
+                    .map(|e| Arc::new(e.fresh())),
+            };
+            let (active_source, flag) =
+                build_active_source(source, mappings, &cancel_handle, envelope);
+            if let Some(song_loop) = song_loop.as_mut() {
+                match group {
+                    PassGroup::Fade => song_loop.fade_ids.push(active_source.id),
+                    PassGroup::Cut => song_loop.cut_ids.push(active_source.id),
+                }
+            }
             source_finish_flags.push(flag);
             self.output_manager
                 .add_source(active_source)
@@ -1118,9 +2004,10 @@ impl AudioDevice for Device {
         // inherit the same alignment, so all handoffs — first included — stay
         // seamless. (The resampler group delay is symmetric between the outgoing
         // and incoming sources and cancels, so it needs no correction.)
-        let audio_clock_skew_samples = (clock.elapsed().as_secs_f64()
-            * self.output_manager.mixer.sample_rate() as f64)
-            .round() as u64;
+        let audio_clock_skew_samples = crate::audio::duration_to_samples(
+            clock.elapsed(),
+            self.output_manager.mixer.sample_rate(),
+        );
         debug!(
             audio_clock_skew_samples,
             skew_us = clock.elapsed().as_micros() as u64,
@@ -1133,41 +2020,35 @@ impl AudioDevice for Device {
         );
         let mixer_sample_rate = self.output_manager.mixer.sample_rate();
 
-        // Look-ahead for the section-loop trigger. Must exceed the 10ms poll
-        // sleep below so the trigger is always detected *before* the ideal
-        // loop boundary; we then schedule the actual crossfade at the exact
-        // sample via `start_at_sample`/`cancel_at_sample`, eliminating
-        // polling jitter from the audible loop point. The cost is a small
-        // race window for break-after-trigger, which we accept.
-        let loop_trigger_lookahead = Duration::from_millis(30);
+        // Playing now, the audio commits the playback's loop jumps, section
+        // and whole-song alike, which the notes, lights and beat clock follow.
+        let publishes_jumps = section_jumps.claim(crate::playsync::JumpPublisherRole::Audio);
 
-        let mut section_trigger = crate::section_loop::SectionLoopTrigger::new();
+        let mut scheduler = loop_scheduler::LoopScheduler::new(
+            loop_scheduler::LoopContext {
+                device: self,
+                song: &song,
+                playback_context: &playback_context,
+                mappings,
+                cancel_handle: &cancel_handle,
+                loop_break: &loop_break,
+                section_jumps: publishes_jumps.then_some(&*section_jumps),
+                // Must exceed the 10ms poll sleep below so the trigger is
+                // always detected *before* the ideal loop boundary; the
+                // crossfade is then scheduled at the exact sample via
+                // `start_at_sample`/`cancel_at_sample`, eliminating polling
+                // jitter from the audible loop point. The cost is a small
+                // race window for break-after-trigger, which we accept.
+                lookahead: Duration::from_millis(30),
+                skew_samples: audio_clock_skew_samples,
+                crossfade_samples,
+                cut_tracks,
+            },
+            song_loop,
+            source_finish_flags,
+        );
 
-        type PrebuiltSources = Vec<Box<dyn crate::audio::sample_source::ChannelMappedSampleSource>>;
-
-        // Sources pre-built for the next loop iteration, keyed by section name
-        // so a section change invalidates them. Ready to swap in with zero I/O.
-        let mut pending_sources: Option<(String, PrebuiltSources)> = None;
-
-        // In-flight background build (section name + result channel). The build
-        // runs on a detached worker thread rather than inline because
-        // `create_channel_mapped_sources_from` blocks on BufferedSampleSource
-        // warmup (file open/seek/decode). Doing that on the monitor thread
-        // could delay the *first* loop boundary — the loop can be armed close
-        // to the section end and the first build hits a cold file cache — which
-        // showed up as a one-off stutter on the first iteration.
-        let mut build_rx: Option<(String, mpsc::Receiver<Result<PrebuiltSources, String>>)> = None;
-
-        // Deferred `loop_time_consumed` bumps. Each entry is the sample at
-        // which the audio actually loops (so the reported elapsed only jumps
-        // when the listener crosses the boundary, not when the monitor
-        // detected it).
-        let mut pending_consumption: Vec<(u64, Duration)> = Vec::new();
-
-        // DIAGNOSTIC: per-swap counter to compare the first loop against later ones.
-        let mut loop_iteration: u64 = 0;
-
-        'monitor: loop {
+        loop {
             if cancel_handle.is_cancelled() || loop_break.load(Ordering::Relaxed) {
                 break;
             }
@@ -1237,247 +2118,56 @@ impl AudioDevice for Device {
                 )));
             }
 
-            // Apply any deferred loop_time_consumed bumps whose sample has
-            // been reached by the audio callback.
-            if !pending_consumption.is_empty() {
-                let now_sample = self.output_manager.mixer.current_sample();
-                pending_consumption.retain(|&(apply_at, amount)| {
-                    if now_sample >= apply_at {
-                        *loop_time_consumed.lock() += amount;
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
+            let armed = active_section.read().clone();
+            let break_requested = section_loop_break.load(Ordering::Relaxed);
+            // The one section looping now: the armed one, or else the whole
+            // song for a song that loops (see `effective_section`).
+            let effective = crate::section_loop::effective_section(
+                armed,
+                break_requested,
+                whole_song,
+                loop_break.load(Ordering::Relaxed),
+            );
 
-            // Check if all sources have finished (EOF).
-            let all_finished = source_finish_flags
-                .iter()
-                .all(|flag| flag.load(Ordering::Relaxed));
-            if all_finished {
+            // Check if all sources have finished (EOF). A song going round as
+            // a whole, or a section looping, waits for its next time round
+            // instead, should it not be built in time.
+            let loops = effective
+                .as_ref()
+                .is_some_and(|section| section.bounds.end_time > section.bounds.start_time);
+            if scheduler.all_finished() && !loops {
                 break;
             }
 
-            let armed = active_section.read().clone();
-            let break_requested = section_loop_break.load(Ordering::Relaxed);
-
-            // Which section we want warm loop-back sources for. Once armed, the
-            // active section is authoritative. Before arming, speculatively
-            // target whichever section the playhead is currently inside — it is
-            // the loop-back candidate, so the sources are warm the instant the
-            // performer arms, even on the section's final beat. (During looping
-            // the raw clock runs past the section end, so we rely on `armed`
-            // rather than the playhead lookup.)
-            let prewarm_target = if break_requested {
-                None
-            } else if armed.is_some() {
-                armed.clone()
-            } else {
-                // The clock is stream-relative; section bounds are
-                // song-absolute. Offset by the playback start position.
-                current_playhead_section(&song, start_time + clock.elapsed())
-            };
-
-            // Collect the result of a finished background build. Take the
-            // channel out and only restore it if the build is still running.
-            let wanted = |name: &str| prewarm_target.as_ref().is_some_and(|t| t.name == name);
-            if let Some((name, rx)) = build_rx.take() {
-                match rx.try_recv() {
-                    Ok(Ok(srcs)) => {
-                        // Keep only if we still want this section's sources.
-                        if wanted(&name) {
-                            pending_sources = Some((name, srcs));
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        error!(
-                            err = %e,
-                            section = name,
-                            "Failed to pre-build section loop sources; will retry"
-                        );
-                    }
-                    // Still building — put the channel back.
-                    Err(mpsc::TryRecvError::Empty) => build_rx = Some((name, rx)),
-                    // Worker vanished without sending (e.g. spawn failed);
-                    // leave build_rx cleared so we retry next iteration.
-                    Err(mpsc::TryRecvError::Disconnected) => {}
+            // Section bounds are song-absolute; the clock counts from this
+            // playback's start. Without the offset, a loop armed after
+            // starting mid-song (seek, section chip) fires every boundary
+            // `start_time` too late -- the audio runs past the section end
+            // while the UI wraps on the correct grid.
+            let elapsed = start_time + clock.elapsed();
+            match scheduler.poll(effective.as_ref(), elapsed) {
+                loop_scheduler::Poll::Scheduled(scheduled) => {
+                    debug!(
+                        at = ?scheduled.jump.at,
+                        start_sample = scheduled.start_sample,
+                        "Audio loop: jump committed"
+                    );
                 }
+                loop_scheduler::Poll::Idle => thread::sleep(Duration::from_millis(10)),
+                loop_scheduler::Poll::Stop => break,
             }
+        }
+        let (song_loop, pass_end) = scheduler.finish();
 
-            // Drop warmed sources / abandon an in-flight build if the target
-            // section changed (playhead moved on, loop armed elsewhere, section
-            // cleared, or a break was requested) — otherwise we'd swap stale
-            // audio in on the next trigger.
-            if pending_sources
-                .as_ref()
-                .is_some_and(|(name, _)| !wanted(name))
-            {
-                pending_sources = None;
+        // Playback ending in the middle of a crossfade: the outgoing pass's
+        // fade-out would keep it playing for the rest of a multi-second fade,
+        // and the incoming pass could still be waiting to start. Cut both
+        // short, as a loop break or stop does any other loop.
+        if let Some(song_loop) = song_loop.as_ref() {
+            let loop_broken = loop_break.load(Ordering::Relaxed);
+            if cancel_handle.is_cancelled() || loop_broken {
+                self.end_song_loop_crossfade(song_loop, crossfade_samples, loop_broken);
             }
-            if build_rx.as_ref().is_some_and(|(name, _)| !wanted(name)) {
-                // Dropping the receiver detaches the worker; its eventual send
-                // is a harmless no-op.
-                build_rx = None;
-            }
-
-            // Kick off a background build for the target if we have neither
-            // warmed sources nor a build already in flight. The worker thread
-            // absorbs the warmup/I/O block so trigger detection here is never
-            // delayed.
-            if let Some(target) = &prewarm_target {
-                if pending_sources.is_none() && build_rx.is_none() {
-                    let (tx, rx) = mpsc::channel();
-                    let song = song.clone();
-                    let ctx = playback_context.clone();
-                    let mappings = mappings.clone();
-                    let start_time = target.start_time;
-                    let _ = thread::Builder::new()
-                        .name("mtrack-section-prebuild".into())
-                        .spawn(move || {
-                            let result = song
-                                .create_channel_mapped_sources_from(&ctx, start_time, &mappings)
-                                .map_err(|e| e.to_string());
-                            // Receiver may be gone if the target changed.
-                            let _ = tx.send(result);
-                        });
-                    build_rx = Some((target.name.clone(), rx));
-                }
-            }
-
-            // Only loop when the section is actually armed.
-            if let Some(section) = armed {
-                if !break_requested {
-                    // Section bounds are song-absolute; the clock counts from
-                    // this playback's start. Without the offset, a loop armed
-                    // after starting mid-song (seek, section chip) fires every
-                    // boundary `start_time` too late — the audio runs past the
-                    // section end while the UI wraps on the correct grid.
-                    let elapsed = start_time + clock.elapsed();
-                    if let Some(trigger_time) =
-                        section_trigger.check(&section, elapsed, loop_trigger_lookahead)
-                    {
-                        let pending = match pending_sources.take() {
-                            Some((_, srcs)) => srcs,
-                            None => {
-                                warn!(
-                                    section = section.name,
-                                    "Audio section loop: trigger fired with no pre-built \
-                                     sources; skipping this boundary"
-                                );
-                                thread::sleep(Duration::from_millis(10));
-                                continue 'monitor;
-                            }
-                        };
-
-                        // Map the ideal trigger time to an exact mixer sample.
-                        // We use the live sample counter plus the remaining
-                        // delta so the result is robust to any small skew
-                        // between the playback clock and the mixer counter.
-                        let now_sample = self.output_manager.mixer.current_sample();
-                        // Correct for the startup skew so the boundary tracks the
-                        // audio content, not the clock epoch (see where
-                        // `audio_clock_skew_samples` is captured). The shift is a
-                        // constant, so inter-boundary spacing is unchanged.
-                        let loop_sample = crate::section_loop::loop_boundary_sample(
-                            now_sample,
-                            elapsed,
-                            trigger_time,
-                            mixer_sample_rate,
-                        )
-                        .saturating_add(audio_clock_skew_samples);
-                        // At a section-loop boundary the loop-point content
-                        // coincides on both sources: the section's `end_time` on
-                        // the outgoing source is the same musical moment as its
-                        // `start_time` on the incoming one — for a one-measure
-                        // loop, literally the same downbeat. With the boundary
-                        // aligned (seek-residual trim + startup-skew correction),
-                        // the two copies land on the same sample, so we overlap
-                        // them and let them reinforce into a single click rather
-                        // than cutting one.
-                        //
-                        // The crossfade straddles the boundary on the outgoing
-                        // side: the outgoing source plays THROUGH loop_sample at
-                        // full gain and fades out over the following window, while
-                        // the incoming source begins exactly at loop_sample and
-                        // fades in. This matters because the outgoing source's
-                        // resampler is in steady state, so its copy of the downbeat
-                        // is clean and carries the attack; the incoming source's
-                        // resampler is freshly created, so its first samples carry
-                        // a sinc pre-ring — the fade-in attenuates that pre-ring
-                        // while the clean outgoing transient dominates the attack.
-                        let fade_end_sample = loop_sample.saturating_add(crossfade_samples);
-
-                        loop_iteration += 1;
-                        debug!(
-                            section = section.name,
-                            loop_iteration,
-                            loop_sample,
-                            fade_end_sample,
-                            "Audio section loop: scheduling crossfade"
-                        );
-
-                        // Schedule fade-out + cut on currently-playing sources.
-                        // The envelope holds at 1.0 until loop_sample, then ramps
-                        // to 0 by fade_end_sample; cancel_at_sample removes them
-                        // once the fade completes.
-                        let current_ids: Vec<u64> = {
-                            let sources = self.output_manager.mixer.get_active_sources();
-                            let guard = sources.read();
-                            guard.iter().map(|s| s.lock().id).collect()
-                        };
-                        if !current_ids.is_empty() {
-                            let fade_out = Arc::new(
-                                crate::audio::crossfade::GainEnvelope::fade_out(
-                                    crossfade_samples,
-                                    crate::audio::crossfade::CrossfadeCurve::Linear,
-                                )
-                                .with_start_sample(loop_sample),
-                            );
-                            self.output_manager
-                                .mixer
-                                .set_gain_envelope(&current_ids, fade_out);
-                            self.output_manager
-                                .mixer
-                                .set_cancel_at_sample(&current_ids, fade_end_sample);
-                        }
-
-                        // Add the pre-built sources. Their own start_at_sample
-                        // delays playback until loop_sample; the fade-in envelope
-                        // ramps from there so the incoming source's resampler
-                        // pre-ring is attenuated while the clean outgoing transient
-                        // carries the downbeat attack.
-                        source_finish_flags.clear();
-                        for source in pending {
-                            // Each source gets its own envelope instance — a shared
-                            // GainEnvelope.position would advance once per source
-                            // per batch and the fade would complete N× too fast.
-                            let fade_in =
-                                Some(Arc::new(crate::audio::crossfade::GainEnvelope::fade_in(
-                                    crossfade_samples,
-                                    crate::audio::crossfade::CrossfadeCurve::Linear,
-                                )));
-                            let (mut active_source, flag) =
-                                build_active_source(source, mappings, &cancel_handle, fade_in);
-                            active_source.start_at_sample = Some(loop_sample);
-                            source_finish_flags.push(flag);
-                            if let Err(e) = self.output_manager.add_source(active_source) {
-                                error!(err = %e, "Failed to add section loop source");
-                            }
-                        }
-
-                        // Defer the consumed-time bump until the audio thread
-                        // actually crosses the boundary, so the user-visible
-                        // elapsed doesn't briefly jump backwards.
-                        let section_duration = section.end_time.saturating_sub(section.start_time);
-                        pending_consumption.push((loop_sample, section_duration));
-
-                        continue 'monitor;
-                    }
-                }
-            }
-
-            thread::sleep(Duration::from_millis(10));
         }
 
         // When section_loop_break is set, clear active_section so the song
@@ -1487,87 +2177,54 @@ impl AudioDevice for Device {
             *section = None;
         }
 
-        // Loop if the song has loop_playback and we haven't been told to stop.
-        while song.loop_playback()
-            && !cancel_handle.is_cancelled()
-            && !loop_break.load(Ordering::Relaxed)
-        {
-            info!(song = song.name(), "Audio loop: creating crossfade sources");
-
-            let crossfade_samples = crate::audio::crossfade::default_crossfade_samples(
-                self.output_manager.mixer.sample_rate(),
-            );
-
-            // Fade out any remaining sources from previous iteration.
-            let current_ids: Vec<u64> = {
-                let sources = self.output_manager.mixer.get_active_sources();
-                let guard = sources.read();
-                guard.iter().map(|s| s.lock().id).collect()
+        // A loop break fading the song out (a playlist `fade_out`) over longer than
+        // its audible pass has left: carry the fade on into the next pass, so
+        // the song does not fall silent part way through.
+        let fade = break_fade.lock().clone();
+        if let (true, Some(fade)) = (loop_break.load(Ordering::Relaxed), fade) {
+            let samples = |d: Duration| crate::audio::duration_to_samples(d, mixer_sample_rate);
+            let now_sample = self.output_manager.mixer.current_sample();
+            let break_sample = now_sample.saturating_sub(samples(fade.started.elapsed()));
+            // The pass playing out, and its sources: the latest, a jump
+            // scheduled before the break made under its fade.
+            let pass_ids: Vec<u64> = match song_loop.as_ref() {
+                Some(song_loop) => song_loop
+                    .fade_ids
+                    .iter()
+                    .chain(&song_loop.cut_ids)
+                    .copied()
+                    .collect(),
+                None => break_fade_ids.lock().clone(),
             };
-            if !current_ids.is_empty() {
-                let fade_out = Arc::new(crate::audio::crossfade::GainEnvelope::fade_out(
-                    crossfade_samples,
-                    crate::audio::crossfade::CrossfadeCurve::Linear,
-                ));
-                self.output_manager
-                    .mixer
-                    .set_gain_envelope(&current_ids, fade_out);
-            }
-
-            // Create new sources at t=0 with fade-in.
-            let new_sources = match song.create_channel_mapped_sources_from(
-                &playback_context,
-                Duration::ZERO,
-                mappings,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(err = e.as_ref(), "Failed to create loop audio sources");
-                    break;
-                }
+            let timing = crate::audio::song_loop::BreakCarryTiming {
+                now: now_sample,
+                break_sample,
+                fade: samples(fade.length),
+                curve: fade.curve,
+                pass_end: crate::section_loop::loop_boundary_sample(
+                    now_sample,
+                    start_time + clock.elapsed(),
+                    pass_end,
+                    mixer_sample_rate,
+                )
+                .saturating_add(audio_clock_skew_samples),
+                pass_len: samples(song.duration()),
+                overlap: song_loop.as_ref().map_or(0, |l| samples(l.overlap)),
+                sample_rate: mixer_sample_rate,
             };
-
-            let mut new_finish_flags = Vec::new();
-            let fade_in_envelope = Some(Arc::new(crate::audio::crossfade::GainEnvelope::fade_in(
-                crossfade_samples,
-                crate::audio::crossfade::CrossfadeCurve::Linear,
-            )));
-            for source in new_sources {
-                let (active_source, flag) =
-                    build_active_source(source, mappings, &cancel_handle, fade_in_envelope.clone());
-                new_finish_flags.push(flag);
-                if let Err(e) = self.output_manager.add_source(active_source) {
-                    error!(err = %e, "Failed to add loop source to mixer");
-                    break;
-                }
+            if let Some(carry) = crate::audio::song_loop::plan_break_carry(timing) {
+                self.carry_break_fade(
+                    &song,
+                    &playback_context,
+                    mappings,
+                    &cancel_handle,
+                    &pass_ids,
+                    carry,
+                    &timing,
+                    &fade,
+                    &break_fade_ids,
+                );
             }
-
-            if new_finish_flags.is_empty() {
-                break;
-            }
-
-            // Wait for new sources to finish or cancel/loop_break.
-            let loop_finished = Arc::new(AtomicBool::new(false));
-            let loop_finished_monitor = loop_finished.clone();
-            let cancel_for_monitor = cancel_handle.clone();
-            let loop_break_for_monitor = loop_break.clone();
-            let monitor_flags = new_finish_flags;
-
-            thread::spawn(move || loop {
-                if cancel_for_monitor.is_cancelled()
-                    || loop_break_for_monitor.load(Ordering::Relaxed)
-                {
-                    break;
-                }
-                if monitor_flags.iter().all(|f| f.load(Ordering::Relaxed)) {
-                    loop_finished_monitor.store(true, Ordering::Relaxed);
-                    cancel_for_monitor.notify();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(10));
-            });
-
-            cancel_handle.wait(loop_finished);
         }
 
         Ok(())
@@ -1632,6 +2289,232 @@ mod test {
     mod virtual_node_tests {
         use super::*;
 
+        /// No ALSA to ask, as for a node cpal lists from another host.
+        fn no_alsa(_card: &str, _dev: u16) -> Option<u16> {
+            None
+        }
+
+        /// A [`NodeProbe`] over a fixed listing, counting what it is asked.
+        struct FakeProbe {
+            listing: Vec<AudioDeviceInfo>,
+            hw: HashMap<(String, u16), u16>,
+            card_walks: usize,
+            hw_queries: usize,
+        }
+
+        impl NodeProbe for FakeProbe {
+            fn exists(&mut self, name: &str) -> Result<bool, Box<dyn Error>> {
+                Ok(self.listing.iter().any(|info| info.name == name))
+            }
+            fn card_nodes(
+                &mut self,
+                name: &str,
+                card: &str,
+            ) -> Result<Vec<AudioDeviceInfo>, Box<dyn Error>> {
+                self.card_walks += 1;
+                Ok(self
+                    .listing
+                    .iter()
+                    .filter(|info| is_card_node(&info.name, name, card))
+                    .cloned()
+                    .collect())
+            }
+            fn hw_channels(&mut self, card: &str, dev: u16) -> Option<u16> {
+                self.hw_queries += 1;
+                self.hw.get(&(card.to_string(), dev)).copied()
+            }
+        }
+
+        fn fake(listing: Vec<AudioDeviceInfo>, hw: &[(&str, u16, u16)]) -> FakeProbe {
+            FakeProbe {
+                listing,
+                hw: hw
+                    .iter()
+                    .map(|(card, dev, channels)| ((card.to_string(), *dev), *channels))
+                    .collect(),
+                card_walks: 0,
+                hw_queries: 0,
+            }
+        }
+
+        /// The band rig at boot: retried twice a second until the WING
+        /// appears. A missing name costs the name check and nothing else.
+        #[test]
+        fn a_missing_device_is_not_probed() {
+            let mut probe = fake(
+                vec![info("alsa:hw:CARD=Headphones,DEV=0", 8)],
+                &[("WING", 0, 48)],
+            );
+            let found =
+                listed_virtual_node("alsa:plughw:CARD=WING,DEV=0", "WING", &mut probe).unwrap();
+            assert!(found.is_none());
+            assert_eq!(probe.card_walks, 0);
+            assert_eq!(probe.hw_queries, 0);
+        }
+
+        /// The WING: its raw node never lists (cpal knows none of its
+        /// formats), so cpal has nothing to borrow; ALSA's hw_params say 48.
+        #[test]
+        fn plug_node_takes_the_width_alsa_reads_from_its_hardware() {
+            let mut probe = fake(
+                vec![
+                    info("alsa:plughw:CARD=WING,DEV=0", CPAL_CHANNEL_CLAMP),
+                    info("alsa:hw:CARD=Headphones,DEV=0", 8),
+                ],
+                &[("WING", 0, 48)],
+            );
+            let plug = listed_virtual_node("alsa:plughw:CARD=WING,DEV=0", "WING", &mut probe)
+                .unwrap()
+                .expect("listed");
+            assert_eq!(plug.max_channels, 48);
+            assert!(plug.channels_known);
+            assert_eq!(open_channel_count(Some(&plug), CPAL_CHANNEL_CLAMP), 48);
+            assert_eq!(probe.card_walks, 1);
+            assert_eq!(probe.hw_queries, 1);
+        }
+
+        /// ALSA busy or refusing: the cpal sibling stands in, and with none
+        /// the node stays unknown at its own report.
+        #[test]
+        fn a_failed_alsa_query_falls_back_to_the_listed_sibling() {
+            let mut probe = fake(
+                vec![
+                    info("alsa:hw:CARD=MAT,DEV=0", 8),
+                    info("alsa:plughw:CARD=MAT,DEV=0", CPAL_CHANNEL_CLAMP),
+                ],
+                &[],
+            );
+            let plug = listed_virtual_node("alsa:plughw:CARD=MAT,DEV=0", "MAT", &mut probe)
+                .unwrap()
+                .expect("listed");
+            assert_eq!(plug.max_channels, 8);
+
+            let mut probe = fake(
+                vec![info("alsa:plughw:CARD=WING,DEV=0", CPAL_CHANNEL_CLAMP)],
+                &[],
+            );
+            let plug = listed_virtual_node("alsa:plughw:CARD=WING,DEV=0", "WING", &mut probe)
+                .unwrap()
+                .expect("listed");
+            assert!(!plug.channels_known);
+            assert_eq!(
+                open_channel_count(Some(&plug), CPAL_CHANNEL_CLAMP),
+                CPAL_CHANNEL_CLAMP
+            );
+        }
+
+        /// The harness Pi's `surround71:CARD=MAT,DEV=0` is a route node, not on
+        /// the plugin list, that accepts any channel count, so cpal reports its
+        /// clamp. It listed as `64+` and would have opened at 64; it takes the
+        /// card's eight, listed and opened alike, while `front` and
+        /// `surround40` keep their own honest report and the `hw` node is not
+        /// rewritten.
+        #[test]
+        fn route_node_at_the_clamp_takes_its_cards_width() {
+            let listing = vec![
+                info("alsa:hw:CARD=MAT,DEV=0", 8),
+                info("alsa:front:CARD=MAT,DEV=0", 8),
+                info("alsa:surround40:CARD=MAT,DEV=0", 4),
+                info("alsa:surround71:CARD=MAT,DEV=0", CPAL_CHANNEL_CLAMP),
+            ];
+            assert!(!listing[3].virtual_node);
+            assert!(!listing[3].channels_known);
+            assert_eq!(
+                width_source_card("alsa:surround71:CARD=MAT,DEV=0").as_deref(),
+                Some("MAT")
+            );
+            assert_eq!(width_source_card("alsa:hw:CARD=MAT,DEV=0"), None);
+            assert_eq!(width_source_card("alsa:default"), None);
+
+            // The open path: ALSA's hw_params answer.
+            let mut probe = fake(listing.clone(), &[("MAT", 0, 8)]);
+            let route = listed_virtual_node("alsa:surround71:CARD=MAT,DEV=0", "MAT", &mut probe)
+                .unwrap()
+                .expect("listed");
+            assert_eq!(route.max_channels, 8);
+            assert!(route.channels_known);
+            assert_eq!(route.channels_display(), "8");
+            assert_eq!(open_channel_count(Some(&route), CPAL_CHANNEL_CLAMP), 8);
+            assert_eq!(probe.hw_queries, 1);
+
+            // The listing path, with ALSA busy: the listed `hw` sibling.
+            let mut infos = listing;
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
+            let widths: Vec<(u16, bool)> = infos
+                .iter()
+                .map(|info| (info.max_channels, info.channels_known))
+                .collect();
+            assert_eq!(widths, vec![(8, true), (8, true), (4, true), (8, true)]);
+        }
+
+        /// A CoreAudio UID holds colons, but it is no ALSA card: a 64-channel
+        /// device on another host borrows nothing, is not probed, and opens
+        /// without a warning, as on main. `hdmi:` numbers HDMI outputs, not
+        /// `hw` subdevices, so it never takes `hw:X,0`'s width either.
+        #[test]
+        fn only_alsa_card_nodes_borrow_a_width() {
+            let uid = "coreaudio:AppleUSBAudioEngine:Audinate:Dante VS:1:2";
+            assert!(card_token(uid).is_some(), "the UID parses as a card");
+            assert_eq!(width_source_card(uid), None);
+            assert_eq!(unresolved_width(uid, false, CPAL_CHANNEL_CLAMP), None);
+            assert_eq!(width_source_card("alsa:hdmi:CARD=vc4hdmi0,DEV=0"), None);
+
+            let mut infos = vec![
+                info("alsa:hw:CARD=Audinate,DEV=0", 8),
+                AudioDeviceInfo {
+                    host_name: "CoreAudio".to_string(),
+                    ..info(uid, CPAL_CHANNEL_CLAMP)
+                },
+                info("alsa:hw:CARD=vc4hdmi0,DEV=0", 8),
+                info("alsa:hdmi:CARD=vc4hdmi0,DEV=0", CPAL_CHANNEL_CLAMP),
+            ];
+            let mut asked = 0;
+            resolve_virtual_channel_counts(&mut infos, |_, _| {
+                asked += 1;
+                Some(2)
+            });
+            assert_eq!(asked, 0);
+            assert_eq!(infos[1].max_channels, CPAL_CHANNEL_CLAMP);
+            assert!(!infos[1].channels_known);
+            assert_eq!(infos[3].max_channels, CPAL_CHANNEL_CLAMP);
+
+            // Who still logs at the clamp: a card node ALSA could not read
+            // warns, a card-less plugin is noted, and nothing else.
+            assert_eq!(
+                unresolved_width("alsa:surround71:CARD=MAT,DEV=0", false, CPAL_CHANNEL_CLAMP),
+                Some(UnresolvedWidth::Unread)
+            );
+            assert_eq!(
+                unresolved_width("alsa:default", false, CPAL_CHANNEL_CLAMP),
+                Some(UnresolvedWidth::NoCard)
+            );
+            assert_eq!(unresolved_width("alsa:default", false, 32), None);
+            assert_eq!(
+                unresolved_width("alsa:hw:CARD=MAT,DEV=0", false, CPAL_CHANNEL_CLAMP),
+                None
+            );
+        }
+
+        /// The ALSA count caps a dmix node as the listed one does, and one
+        /// query serves every node on the card.
+        #[test]
+        fn alsa_count_caps_dmix_and_is_asked_once_per_subdevice() {
+            let mut infos = vec![
+                info("alsa:dmix:CARD=Headphones,DEV=0", 2),
+                info("alsa:plughw:CARD=Headphones,DEV=0", CPAL_CHANNEL_CLAMP),
+                info("alsa:sysdefault:CARD=Headphones", CPAL_CHANNEL_CLAMP),
+            ];
+            let mut asked = 0;
+            resolve_virtual_channel_counts(&mut infos, |_, _| {
+                asked += 1;
+                Some(8)
+            });
+            assert_eq!(asked, 1);
+            assert_eq!(infos[0].max_channels, 2);
+            assert_eq!(infos[1].max_channels, 8);
+            assert_eq!(infos[2].max_channels, 8);
+        }
+
         fn info(name: &str, max_channels: u16) -> AudioDeviceInfo {
             AudioDeviceInfo {
                 name: name.to_string(),
@@ -1694,6 +2577,87 @@ mod test {
             assert_eq!(dev_index("alsa:default"), None);
         }
 
+        /// The harness Pi: `plughw:CARD=Headphones,DEV=0` reports cpal's clamp,
+        /// and was opened at it -- 64 channels mixed for ALSA to drop all but
+        /// the eight the hardware node behind it reports. It opens at eight, and
+        /// a song mapped past them fails rather than going nowhere.
+        #[test]
+        fn plug_node_opens_at_the_width_of_its_hardware() {
+            let mut infos = vec![
+                info("alsa:hw:CARD=Headphones,DEV=0", 8),
+                info("alsa:plughw:CARD=Headphones,DEV=0", CPAL_CHANNEL_CLAMP),
+            ];
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
+            let width = open_channel_count(Some(&infos[1]), CPAL_CHANNEL_CLAMP);
+            assert_eq!(width, 8);
+
+            let mut mappings = HashMap::new();
+            mappings.insert("click".to_string(), vec![8]);
+            assert!(validate_channel_count(&mappings, width, "s", "plug").is_ok());
+            mappings.insert("bass".to_string(), vec![9]);
+            let err = validate_channel_count(&mappings, width, "s", "plug")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("9 channels requested"), "{err}");
+            assert!(err.contains("only has 8"), "{err}");
+        }
+
+        /// No hardware sibling to ask -- a WING's raw node never lists, and
+        /// `default` names no card -- so the width stays what the node reports.
+        #[test]
+        fn plug_node_with_no_sibling_opens_at_its_own_report() {
+            let mut infos = vec![
+                info("alsa:plughw:CARD=WING,DEV=0", CPAL_CHANNEL_CLAMP),
+                info("alsa:default", 32),
+            ];
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
+            assert_eq!(
+                open_channel_count(Some(&infos[0]), CPAL_CHANNEL_CLAMP),
+                CPAL_CHANNEL_CLAMP
+            );
+            assert_eq!(open_channel_count(Some(&infos[1]), 32), 32);
+        }
+
+        /// The harness Pi's `dmix:CARD=Headphones,DEV=0` reports two channels
+        /// in front of an eight-channel `hw` node. It was opened at eight,
+        /// borrowed from the sibling, and ALSA refused the hw_params: no audio.
+        /// It opens at its own two, and lists them.
+        #[test]
+        fn dmix_node_keeps_its_own_narrower_width() {
+            let mut infos = vec![
+                info("alsa:hw:CARD=Headphones,DEV=0", 8),
+                info("alsa:dmix:CARD=Headphones,DEV=0", 2),
+                info("alsa:plughw:CARD=Headphones,DEV=0", CPAL_CHANNEL_CLAMP),
+            ];
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
+
+            assert_eq!(infos[1].max_channels, 2);
+            assert!(infos[1].channels_known);
+            assert_eq!(open_channel_count(Some(&infos[1]), 2), 2);
+            // The plug node beside it still takes the hardware's eight.
+            assert_eq!(infos[2].max_channels, 8);
+        }
+
+        /// `front:` names the same card and subdevice as `hw:` with a width of
+        /// its own, and is not the hardware.
+        #[test]
+        fn only_the_hw_node_is_a_sibling() {
+            let mut infos = vec![
+                info("alsa:hw:CARD=PCH,DEV=0", 8),
+                info("alsa:front:CARD=PCH,DEV=0", 2),
+                info("alsa:plughw:CARD=PCH,DEV=0", CPAL_CHANNEL_CLAMP),
+            ];
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
+            assert_eq!(infos[2].max_channels, 8);
+        }
+
+        #[test]
+        fn hardware_opens_at_its_own_report() {
+            let hw = info("alsa:hw:CARD=MAT,DEV=0", 8);
+            assert_eq!(open_channel_count(Some(&hw), 8), 8);
+            assert_eq!(open_channel_count(None, 8), 8);
+        }
+
         /// The case that motivated this: `plughw:CARD=MAT` claims cpal's clamped
         /// 32, while the hardware it routes to reports its real 8.
         #[test]
@@ -1702,7 +2666,7 @@ mod test {
                 info("alsa:hw:CARD=MAT,DEV=0", 8),
                 info("alsa:plughw:CARD=MAT", CPAL_CHANNEL_CLAMP),
             ];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             let plug = &infos[1];
             assert_eq!(plug.max_channels, 8);
@@ -1727,7 +2691,7 @@ mod test {
                 info("alsa:plughw:CARD=PCH,DEV=3", CPAL_CHANNEL_CLAMP),
                 info("alsa:plughw:CARD=PCH,DEV=0", CPAL_CHANNEL_CLAMP),
             ];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             assert_eq!(infos[2].max_channels, 8, "DEV=3 plug node routes to HDMI");
             assert!(infos[2].channels_known);
@@ -1745,7 +2709,7 @@ mod test {
                 info("alsa:hw:CARD=PCH,DEV=0", 2),
                 info("alsa:plughw:CARD=PCH,DEV=7", CPAL_CHANNEL_CLAMP),
             ];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             assert!(
                 !infos[1].channels_known,
@@ -1760,7 +2724,7 @@ mod test {
                 info("alsa:hw:CARD=MAT,DEV=0", 8),
                 info("alsa:plughw:CARD=MAT", CPAL_CHANNEL_CLAMP),
             ];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             assert_eq!(infos[2].max_channels, 8);
         }
@@ -1771,7 +2735,7 @@ mod test {
         #[test]
         fn plug_node_without_hardware_sibling_stays_unknown() {
             let mut infos = vec![info("alsa:plughw:CARD=WING", CPAL_CHANNEL_CLAMP)];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             let plug = &infos[0];
             assert!(!plug.channels_known);
@@ -1786,7 +2750,7 @@ mod test {
                 info("alsa:default", CPAL_CHANNEL_CLAMP),
                 info("alsa:pulse", CPAL_CHANNEL_CLAMP),
             ];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             assert_eq!(infos[1].channels_display(), "virtual");
             assert_eq!(infos[2].channels_display(), "virtual");
@@ -1838,7 +2802,7 @@ mod test {
                 info("alsa:hw:CARD=WING,DEV=0", CPAL_CHANNEL_CLAMP),
                 info("alsa:plughw:CARD=WING", 8),
             ];
-            resolve_virtual_channel_counts(&mut infos);
+            resolve_virtual_channel_counts(&mut infos, no_alsa);
 
             // The hardware entry is left alone: only plug nodes are resolved.
             assert_eq!(infos[0].max_channels, CPAL_CHANNEL_CLAMP);
@@ -1872,32 +2836,24 @@ mod test {
         }
     }
 
-    /// Concurrent enumeration must not cost the process its stdout.
-    ///
-    /// Every walk silences ALSA with `shh`, which swaps fd 1 and fd 2 and puts
-    /// them back on drop. Unserialised, two threads restore each other's pipe
-    /// and the process is left writing into a closed descriptor -- which is how
-    /// this was found: the test binary reported a failure and printed nothing at
-    /// all to explain it.
-    ///
-    /// Linux-only because it reads the descriptor through `/proc`; the ALSA path
-    /// under test is Linux-only too.
-    ///
-    /// Observing the descriptors has to take the lock as well, or the baseline
-    /// can be read *during* another test's legitimate silence window and record
-    /// its pipe as the original.
+    /// Where fd 1 and fd 2 point. Linux-only because it reads `/proc`; the
+    /// ALSA path under test is Linux-only too.
+    #[cfg(target_os = "linux")]
+    fn std_stream_targets() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        (
+            std::fs::read_link("/proc/self/fd/1").ok(),
+            std::fs::read_link("/proc/self/fd/2").ok(),
+        )
+    }
+
+    /// Enumeration, concurrent or not, leaves the process's stdout and stderr
+    /// where they were. (It used to swap them for a pipe, which lost whatever
+    /// another thread wrote meanwhile and, unserialised, the process's real
+    /// stdout for good.)
     #[test]
     #[cfg(target_os = "linux")]
     fn concurrent_enumeration_preserves_process_stdout() {
-        fn std_stream_targets() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
-            let _lock = ENUMERATION_LOCK.lock();
-            (
-                std::fs::read_link("/proc/self/fd/1").ok(),
-                std::fs::read_link("/proc/self/fd/2").ok(),
-            )
-        }
-
-        let (stdout_before, stderr_before) = std_stream_targets();
+        let before = std_stream_targets();
 
         let handles: Vec<_> = (0..8)
             .map(|i| {
@@ -1916,15 +2872,181 @@ mod test {
             handle.join().expect("enumeration thread panicked");
         }
 
-        let (stdout_after, stderr_after) = std_stream_targets();
         assert_eq!(
-            stdout_after, stdout_before,
-            "stdout was left pointing somewhere else"
+            std_stream_targets(),
+            before,
+            "stdout or stderr was left pointing somewhere else"
         );
-        assert_eq!(
-            stderr_after, stderr_before,
-            "stderr was left pointing somewhere else"
+    }
+
+    /// While a walk is silenced, another thread's log line still arrives, and
+    /// the process's stdout and stderr are where they always were.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn another_threads_line_arrives_while_a_walk_is_silenced() {
+        let before = std_stream_targets();
+        let (silenced_tx, silenced_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let walker = thread::spawn(move || {
+            let _silenced = silence_enumeration();
+            silenced_tx.send(()).unwrap();
+            let _ = done_rx.recv();
+        });
+        silenced_rx.recv().unwrap();
+
+        let during = std_stream_targets();
+        let (layer, lines) = crate::tui::logging::capture_layer(10);
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            let subscriber = tracing_subscriber::Registry::default().with(layer);
+            let _guard = tracing::subscriber::set_default(subscriber);
+            info!(lighting = true, "DMX engine initialized");
+        }
+        done_tx.send(()).unwrap();
+        walker.join().unwrap();
+
+        assert_eq!(during, before, "a walk swapped stdout or stderr");
+        assert!(
+            lines
+                .lock()
+                .iter()
+                .any(|l| l.contains("DMX engine initialized")),
+            "the line was lost"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod alsa_quiet_tests {
+        use std::cell::Cell;
+        use std::ffi::{c_char, c_int};
+
+        use super::super::alsa_quiet::{set_local_log, AlsaErrorsSilenced, LogHandler};
+
+        thread_local! {
+            static RAISED: Cell<usize> = const { Cell::new(0) };
+        }
+
+        unsafe extern "C" fn count(
+            _file: *const c_char,
+            _line: c_int,
+            _func: *const c_char,
+            _err: c_int,
+            _fmt: *const c_char,
+            _arg: *mut alsa_sys::__va_list_tag,
+        ) {
+            RAISED.with(|r| r.set(r.get() + 1));
+        }
+
+        /// Counts too: on alsa-lib 1.2.15+ the log handler takes precedence
+        /// over the error handler, so the missing PCM is reported here.
+        unsafe extern "C" fn count_log(
+            _prio: c_int,
+            _interface: c_int,
+            _file: *const c_char,
+            _line: c_int,
+            _func: *const c_char,
+            _err: c_int,
+            _fmt: *const c_char,
+            _arg: *mut alsa_sys::__va_list_tag,
+        ) {
+            RAISED.with(|r| r.set(r.get() + 1));
+        }
+
+        /// This thread's current log handler, where the running alsa-lib has
+        /// the log API; read the same way as [`current_handler`].
+        fn current_log_handler() -> Option<Option<LogHandler>> {
+            set_local_log().map(|set| unsafe {
+                let current = set(None);
+                set(current);
+                current
+            })
+        }
+
+        /// This thread's current handler, read by swapping in nothing and
+        /// putting it straight back.
+        fn current_handler() -> alsa_sys::snd_local_error_handler_t {
+            unsafe {
+                let current = alsa_sys::snd_lib_error_set_local(None);
+                alsa_sys::snd_lib_error_set_local(current);
+                current
+            }
+        }
+
+        /// Asks ALSA for a PCM that does not exist, which it reports through
+        /// its error handler ("Unknown PCM ...") rather than only in the
+        /// return code.
+        fn open_missing_pcm() {
+            let mut pcm = std::ptr::null_mut();
+            let rc = unsafe {
+                alsa_sys::snd_pcm_open(
+                    &mut pcm,
+                    c"mtrack_test_no_such_pcm".as_ptr(),
+                    alsa_sys::SND_PCM_STREAM_PLAYBACK,
+                    alsa_sys::SND_PCM_NONBLOCK as c_int,
+                )
+            };
+            assert!(rc < 0, "a PCM that does not exist opened");
+        }
+
+        /// The walk's own chatter goes to the handler, not to stderr.
+        #[test]
+        fn the_walking_threads_alsa_errors_go_to_the_handler() {
+            RAISED.with(|r| r.set(0));
+            {
+                let _silenced = AlsaErrorsSilenced::with_handlers(count, count_log);
+                open_missing_pcm();
+            }
+            assert!(
+                RAISED.with(Cell::get) > 0,
+                "ALSA reported the missing PCM somewhere other than the handler"
+            );
+
+            // Lifted with the guard: nothing more is counted.
+            let after = RAISED.with(Cell::get);
+            let _quiet_for_this_check = AlsaErrorsSilenced::install();
+            open_missing_pcm();
+            assert_eq!(RAISED.with(Cell::get), after);
+        }
+
+        /// The guard puts back whatever handler it replaced, nested or not.
+        #[test]
+        fn the_previous_handler_is_restored() {
+            let log_ptr = || current_log_handler().map(|h| h.map(|f| f as usize));
+            assert!(current_handler().is_none());
+            let log_before = log_ptr();
+            assert!(log_before.is_none_or(|h| h.is_none()));
+            {
+                let _outer = AlsaErrorsSilenced::with_handlers(count, count_log);
+                let outer = current_handler().map(|f| f as usize);
+                assert_eq!(outer, Some(count as *const () as usize));
+                let outer_log = log_ptr();
+                if let Some(h) = outer_log {
+                    assert_eq!(h, Some(count_log as *const () as usize));
+                }
+                {
+                    let _inner = AlsaErrorsSilenced::install();
+                    assert_ne!(current_handler().map(|f| f as usize), outer);
+                    if outer_log.is_some() {
+                        assert_ne!(log_ptr(), outer_log);
+                    }
+                }
+                assert_eq!(current_handler().map(|f| f as usize), outer);
+                assert_eq!(log_ptr(), outer_log);
+            }
+            assert!(current_handler().is_none());
+            assert_eq!(log_ptr(), log_before);
+        }
+
+        /// The handler is this thread's alone: another thread's ALSA errors
+        /// are not swallowed by a walk in progress here.
+        #[test]
+        fn other_threads_keep_their_handler() {
+            let _silenced = AlsaErrorsSilenced::with_handlers(count, count_log);
+            let elsewhere = std::thread::spawn(|| current_handler().is_none())
+                .join()
+                .unwrap();
+            assert!(elsewhere, "another thread inherited the walk's handler");
+        }
     }
 
     mod available_hint_tests {
@@ -2005,7 +3127,7 @@ mod test {
         }
     }
 
-    mod current_playhead_section_tests {
+    mod section_at_tests {
         use super::*;
 
         // Two 4-beat measures at 120 BPM: beats every 0.5s.
@@ -2043,11 +3165,12 @@ mod test {
         fn finds_section_containing_playhead() {
             let song = song_with_sections();
             assert_eq!(
-                current_playhead_section(&song, Duration::from_millis(500)).map(|s| s.name),
+                crate::player::SectionBounds::at(&song, Duration::from_millis(500)).map(|s| s.name),
                 Some("verse".to_string())
             );
             assert_eq!(
-                current_playhead_section(&song, Duration::from_millis(2500)).map(|s| s.name),
+                crate::player::SectionBounds::at(&song, Duration::from_millis(2500))
+                    .map(|s| s.name),
                 Some("chorus".to_string())
             );
         }
@@ -2058,7 +3181,8 @@ mod test {
             // Exactly at the verse/chorus boundary belongs to chorus: a
             // section owns [start, end), so the measure boundary is the start
             // of the next section, not the tail of the previous one.
-            let at_boundary = current_playhead_section(&song, Duration::from_secs(2)).unwrap();
+            let at_boundary =
+                crate::player::SectionBounds::at(&song, Duration::from_secs(2)).unwrap();
             assert_eq!(at_boundary.name, "chorus");
             assert_eq!(at_boundary.start_time, Duration::from_secs(2));
         }
@@ -2066,14 +3190,14 @@ mod test {
         #[test]
         fn none_when_past_all_sections() {
             let song = song_with_sections();
-            assert!(current_playhead_section(&song, Duration::from_secs(10)).is_none());
+            assert!(crate::player::SectionBounds::at(&song, Duration::from_secs(10)).is_none());
         }
 
         #[test]
         fn none_without_beat_grid() {
             // A plain test song has no beat grid, so nothing resolves.
             let song = Song::new_for_test("test", &["click"]);
-            assert!(current_playhead_section(&song, Duration::from_secs(1)).is_none());
+            assert!(crate::player::SectionBounds::at(&song, Duration::from_secs(1)).is_none());
         }
     }
 
@@ -2126,15 +3250,21 @@ mod test {
 
         #[test]
         fn none_returns_fallback() {
-            assert_eq!(resolve_buffer_size(None, 256, None), Some(256));
-            assert_eq!(resolve_buffer_size(None, 512, Some(64)), Some(512));
+            assert_eq!(
+                resolve_buffer_size(None, 256, None),
+                (Some(256), PeriodSetting::BufferSize)
+            );
+            assert_eq!(
+                resolve_buffer_size(None, 512, Some(64)),
+                (Some(512), PeriodSetting::BufferSize)
+            );
         }
 
         #[test]
         fn default_returns_none() {
             assert_eq!(
                 resolve_buffer_size(Some(StreamBufferSize::Default), 256, None),
-                None
+                (None, PeriodSetting::BackendDefault)
             );
         }
 
@@ -2142,7 +3272,7 @@ mod test {
         fn min_returns_min_supported_when_available() {
             assert_eq!(
                 resolve_buffer_size(Some(StreamBufferSize::Min), 256, Some(64)),
-                Some(64)
+                (Some(64), PeriodSetting::Min)
             );
         }
 
@@ -2150,7 +3280,7 @@ mod test {
         fn min_falls_back_when_no_min_supported() {
             assert_eq!(
                 resolve_buffer_size(Some(StreamBufferSize::Min), 256, None),
-                Some(256)
+                (Some(256), PeriodSetting::MinFallback)
             );
         }
 
@@ -2158,7 +3288,7 @@ mod test {
         fn fixed_returns_specified_value() {
             assert_eq!(
                 resolve_buffer_size(Some(StreamBufferSize::Fixed(128)), 256, Some(64)),
-                Some(128)
+                (Some(128), PeriodSetting::Fixed)
             );
         }
     }

@@ -12,30 +12,31 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use axum::{
-    body::Bytes,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
+use crate::webui::wire::fixture_types::{
+    BeamBrief, FixtureTypeDeleted, FixtureTypeEntry, FixtureTypeGdtf, FixtureTypeList,
+    FixtureTypeSaved, GdtfBeam, GdtfInspection, GdtfMode, GdtfSummary, LightingFileError, ModeUse,
+    SceneFixture, StrobeRange, TypeVenue, TypeVenueFixture, VenueDetail, VenueList, VenueScene,
 };
+use crate::webui::wire::messages::FixturePlacement;
+use crate::webui::wire::preview::{
+    LightFileInfo, LightingGroup, LightingGroups, LightingValidation,
+};
+use axum::http::StatusCode;
 use serde_json::json;
 
 use super::super::config_io;
-use super::super::server::WebUiState;
+use super::super::safe_path::VerifiedRoot;
+use super::lighting_writes::{self, Answer};
 use crate::lighting;
+use crate::lighting::files::Kind;
 
 /// The canonical project root the lighting endpoints write into.
-#[allow(clippy::result_large_err)]
-fn project_root(
-    config_path: &std::path::Path,
-) -> Result<std::path::PathBuf, axum::response::Response> {
+pub(crate) fn project_root(config_path: &std::path::Path) -> Result<std::path::PathBuf, Answer> {
     let canonical = config_path.canonicalize().map_err(|_| {
-        (
+        Answer::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Failed to resolve config path"})),
+            "Failed to resolve config path",
         )
-            .into_response()
     })?;
     Ok(canonical
         .parent()
@@ -43,164 +44,159 @@ fn project_root(
         .to_path_buf())
 }
 
-/// Pulls the first uploaded file out of a multipart body: (file name, bytes).
-async fn first_multipart_file(
-    multipart: &mut axum::extract::Multipart,
-) -> Result<(String, Vec<u8>), axum::response::Response> {
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Failed to read multipart field: {}", e)})),
-        )
-            .into_response()
-    })? {
-        let Some(filename) = field.file_name().map(|f| f.to_string()) else {
-            continue;
-        };
-        // The name becomes a library path component; keep only the final
-        // component of whatever the browser sent.
-        let filename = std::path::Path::new(&filename)
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if filename.is_empty() {
-            continue;
-        }
-        let bytes = field.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Failed to read file data: {}", e)})),
-            )
-                .into_response()
-        })?;
-        return Ok((filename, bytes.to_vec()));
-    }
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": "No file uploaded"})),
-    )
-        .into_response())
+/// The name an uploaded archive is kept under in the library: the final
+/// component of whatever the browser sent, since it becomes a path
+/// component. None when there is no such component.
+pub(crate) fn archive_file_name(raw: &str) -> Option<String> {
+    std::path::Path::new(raw)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
 }
 
-/// POST /api/lighting/gdtf/inspect — parses an uploaded GDTF archive and
-/// returns its modes, for the mode picker. Writes nothing.
-pub(super) async fn inspect_gdtf(mut multipart: axum::extract::Multipart) -> impl IntoResponse {
-    let (_, bytes) = first_multipart_file(&mut multipart).await?;
-    let description = lighting::gdtf::parse_archive(&bytes).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Not a parseable GDTF: {}", e)})),
-        )
-            .into_response()
-    })?;
-    let modes: Vec<serde_json::Value> = lighting::gdtf::mode_summaries(&description)
-        .into_iter()
-        .map(|summary| {
-            json!({
-                "name": summary.name,
-                "channel_count": summary.channel_count,
-                "footprint": summary.footprint,
-            })
+// The archive's fixture name as a fixture type name: the importer's rule,
+// so the name the picker suggests is the name an import writes.
+use lighting::import::suggested_type_name;
+
+/// A GDTF archive's modes, as its fixture page shows them: each mode's
+/// footprint, what a show can do in it (capabilities, cells, strobe range),
+/// its channel map and the distiller's warnings, or the reason it cannot be
+/// imported.
+fn inspect_description(description: &lighting::gdtf::Description) -> GdtfInspection {
+    // Distilling every mode is a few milliseconds each (design 12.2), so the
+    // picker can say what each one lets a show do before anything is written.
+    let suggested = suggested_type_name(&description.name);
+    let summaries = lighting::gdtf::mode_summaries(description);
+    let modes = summaries
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            let mut mode = GdtfMode {
+                name: summary.name.clone(),
+                footprint: summary.footprint,
+                capabilities: None,
+                wants: None,
+                cells: None,
+                strobe_range: None,
+                channels: None,
+                refused: None,
+            };
+            // The importer finds a mode by name and takes the first match, so
+            // a repeat could only ever import its namesake.
+            let repeats = summaries[..index].iter().any(|m| m.name == summary.name);
+            let distilled = if repeats {
+                Err("another mode has this name; an import would take the first".to_string())
+            } else {
+                lighting::gdtf::distill(description, &summary.name, &suggested)
+                    .map_err(|e| e.to_string())
+            };
+            match distilled {
+                Ok(distilled) => {
+                    let fixture_type = &distilled.fixture_type;
+                    let mut info = lighting::effects::FixtureInfo::new(
+                        suggested.clone(),
+                        1,
+                        1,
+                        suggested.clone(),
+                        fixture_type.channels().clone(),
+                        None,
+                    );
+                    info.cells = fixture_type.cells().to_vec();
+                    let fit = lighting::fit::FitFixture::from_info(&info, &[]);
+                    mode.capabilities = Some(fit.capability_names());
+                    mode.wants = Some(fit.wants());
+                    mode.cells = Some(fixture_type.cells().len());
+                    mode.strobe_range =
+                        fixture_type
+                            .max_strobe_frequency()
+                            .map(|max_hz| StrobeRange {
+                                min_hz: fixture_type.min_strobe_frequency(),
+                                max_hz,
+                            });
+                    let mut channels: Vec<(u16, String)> = fixture_type
+                        .channels()
+                        .iter()
+                        .map(|(name, offset)| (*offset, name.clone()))
+                        .collect();
+                    channels.sort();
+                    mode.channels = Some(channels);
+                }
+                Err(reason) => mode.refused = Some(reason),
+            }
+            mode
         })
         .collect();
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({
-                "fixture": description.name,
-                "manufacturer": description.manufacturer,
-                "modes": modes,
-            })),
-        )
-            .into_response(),
-    )
+    GdtfInspection { modes }
 }
 
-/// Query parameters for the GDTF import endpoint.
-#[derive(serde::Deserialize)]
-pub(super) struct GdtfImportQuery {
-    mode: String,
-    name: Option<String>,
+/// What a GDTF upload announces: the name it will be kept under in the
+/// library (see [`archive_file_name`]), or the refusal.
+pub(crate) fn check_gdtf_upload(file_name: &str) -> Result<String, Answer> {
+    archive_file_name(file_name).ok_or_else(|| Answer::bad("No file uploaded"))
 }
 
-/// POST /api/lighting/gdtf/import?mode=...&name=... — imports one mode of an
-/// uploaded GDTF archive through the shared importer (the same one behind
-/// the CLI and MCP): archive into lighting/library/, a referential .fixture
-/// definition, and a warmed expansion cache. Returns the import report.
-pub(super) async fn import_gdtf(
-    State(state): State<WebUiState>,
-    Query(query): Query<GdtfImportQuery>,
-    mut multipart: axum::extract::Multipart,
-) -> impl IntoResponse {
-    let (filename, bytes) = first_multipart_file(&mut multipart).await?;
-    let project = project_root(&state.config_path)?;
-    // The inner Result survives spawn_blocking_io so an import refusal (bad
-    // mode, name collision, archive conflict) surfaces as the caller error
+/// Imports the staged GDTF archive `file` through the shared importer (the
+/// same one behind the CLI and MCP): a copy into lighting/library/, where it
+/// is a fixture (design §22), and a warmed rig for its page. One step: a
+/// venue fixture can use any of its modes straight away. Answers the import
+/// report (`already_imported` when the same archive was imported before and
+/// nothing was written; `renamed_from` when the archive's fixture name was
+/// taken). `name` is a name for the fixture; given, a record pins it. A
+/// different archive of the same file name already in the library, or a
+/// record name or file that is taken, is a 409; anything else refused is a
+/// 400. The staged file is deleted whether this succeeds or not.
+pub(crate) async fn import_gdtf(
+    config_path: &std::path::Path,
+    file: crate::webui::transfers::Claimed,
+    name: Option<&str>,
+) -> Result<lighting::import::GdtfImport, Answer> {
+    let project = project_root(config_path)?;
+    // Where the engine reads fixture types on this host, as the CLI and MCP
+    // import into (#673): its name check and a pinned record go there.
+    let types_dir = lighting_dir(config_path, None, LightingDir::FixtureTypes)?;
+    let name = name.map(str::to_string);
+    // The inner Result survives the blocking call so an import refusal (bad
+    // archive, name collision, archive conflict) surfaces as the caller error
     // it is, not a 500.
-    let report = super::helpers::spawn_blocking_io("import gdtf", move || {
+    let report = super::helpers::blocking_answer("import gdtf", move || {
+        let bytes = file.read().map_err(|e| e.to_string())?;
+        // A pinned name writes a fixture type record, in turn with the
+        // other fixture type and venue saves (#578).
+        let _guard = VENUE_WRITES.blocking_lock();
         Ok::<_, String>(
             lighting::import::import_gdtf_bytes(
                 &bytes,
-                &filename,
-                &query.mode,
-                query.name.as_deref(),
+                &file.file_name,
+                name.as_deref(),
                 &project,
-                DEFAULT_FIXTURE_TYPES_DIR,
+                &types_dir,
             )
-            .map_err(|e| e.to_string()),
+            .map_err(|e| lighting_writes::import_error(e.as_ref())),
         )
     })
     .await?
-    .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response())?;
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(serde_json::to_value(&report).unwrap_or_default()),
-        )
-            .into_response(),
-    )
+    .map_err(|(status, body)| Answer { status, body })?;
+    Ok(report)
 }
 
-/// GET /api/lighting — lists available .light files from the songs directory.
-pub(super) async fn get_lighting_files(State(state): State<WebUiState>) -> impl IntoResponse {
-    let songs_path = state.songs_path.clone();
-    let mut light_files =
-        match super::helpers::spawn_blocking_io("scan for lighting files", move || {
-            let mut files = Vec::new();
-            find_light_files(&songs_path, &songs_path, &mut files)?;
-            Ok::<_, std::io::Error>(files)
-        })
-        .await
-        {
-            Ok(f) => f,
-            Err(e) => return e,
-        };
-    light_files.sort_by(|a, b| {
-        a.get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .cmp(b.get("path").and_then(|v| v.as_str()).unwrap_or(""))
-    });
-    (StatusCode::OK, Json(json!({"files": light_files}))).into_response()
-}
-
-/// Recursively finds .light files under a directory.
+/// Recursively finds light show files (`.light`, in any case:
+/// `songs::FileKind::of`) under a directory.
 pub(crate) fn find_light_files(
     base: &std::path::Path,
     dir: &std::path::Path,
-    results: &mut Vec<serde_json::Value>,
+    results: &mut Vec<LightFileInfo>,
 ) -> Result<(), std::io::Error> {
-    // codeql[rust/path-injection] dir is always state.songs_path, set at startup.
+    // codeql[rust/path-injection] dir is always state.songs_path(), set at startup.
     if !dir.is_dir() {
         return Ok(());
     }
-    // codeql[rust/path-injection] dir is always state.songs_path, set at startup.
+    // codeql[rust/path-injection] dir is always state.songs_path(), set at startup.
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
             find_light_files(base, &path, results)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("light") {
+        } else if crate::songs::FileKind::is_lighting(&path) {
             let relative = path
                 .strip_prefix(base)
                 .unwrap_or(&path)
@@ -211,251 +207,478 @@ pub(crate) fn find_light_files(
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
-            results.push(json!({
-                "name": name,
-                "path": relative,
-            }));
+            results.push(LightFileInfo {
+                name,
+                path: relative,
+            });
         }
     }
     Ok(())
 }
 
-/// GET /api/lighting/:name — returns the raw DSL content of a .light file.
-///
-/// The `name` parameter is the relative path within the songs directory (as returned by
-/// the listing endpoint). Path traversal is guarded.
-pub(super) async fn get_lighting_file(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    use super::super::safe_path::{SafePath, VerifiedRoot};
+/// The 404 for a lighting file `name` that is not there.
+fn lighting_file_not_found(name: &str) -> Answer {
+    Answer::new(
+        StatusCode::NOT_FOUND,
+        format!("Lighting file not found: {name}"),
+    )
+}
 
-    let root = match VerifiedRoot::new(&state.songs_path) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let safe = match SafePath::resolve(&state.songs_path.join(&name), &root) {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("Lighting file not found: {}", name)})),
-            )
-                .into_response();
-        }
-    };
+/// The text of a song's light show: `name` is the file's path under the
+/// songs directory `songs_path` (as the listing returns it). A path that
+/// leaves the songs directory, by `..`, an absolute name or a link, is not
+/// found.
+pub(crate) async fn read_light_show(
+    songs_path: &std::path::Path,
+    name: &str,
+) -> Result<String, Answer> {
+    use super::super::safe_path::SafePath;
+
+    let root = VerifiedRoot::new(songs_path)?;
+    let safe = SafePath::resolve(&songs_path.join(name), &root)
+        .map_err(|_| lighting_file_not_found(name))?;
 
     let path = safe.as_path().to_path_buf();
-    match super::helpers::spawn_blocking_io("read lighting file", move || {
-        std::fs::read_to_string(&path)
+    super::helpers::blocking_answer("read lighting file", move || {
+        crate::util::read_to_string(&path)
     })
     .await
-    {
-        Ok(content) => (
-            StatusCode::OK,
-            [("content-type", "text/plain; charset=utf-8")],
-            content,
-        )
-            .into_response(),
-        Err(e) => e,
-    }
 }
 
-/// PUT /api/lighting/:name — validates and atomically writes a lighting DSL file.
-pub(super) async fn put_lighting_file(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    body: String,
-) -> impl IntoResponse {
-    use super::super::safe_path::{SafePath, SafePathError, VerifiedRoot};
-
-    let root = match VerifiedRoot::new(&state.songs_path) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-
-    // Resolve the file path under the songs root. For existing files, SafePath::resolve
-    // canonicalizes and verifies containment. For new files, resolve the parent directory
-    // and join the filename to it.
-    let candidate = root.as_path().join(&name);
-    let verified_path = match SafePath::resolve(&candidate, &root) {
-        Ok(p) => p.as_path().to_path_buf(),
-        Err(_) => {
-            // File doesn't exist — resolve the parent and join the filename.
-            let (parent, filename) = match (candidate.parent(), candidate.file_name()) {
-                (Some(p), Some(f)) => (p, f),
-                _ => return SafePathError::InvalidName.into_response(),
-            };
-            let safe_parent = match SafePath::resolve(parent, &root) {
-                Ok(p) => p,
-                Err(e) => return e.into_response(),
-            };
-            safe_parent.as_path().join(filename)
-        }
-    };
-
-    // Validate against the tempo the owning song loads this file with. A show
-    // inheriting its song's tempo is valid content that a tempo-less parse
-    // rejects, so writing it through the UI would fail for no real reason.
-    let tempo = song_tempo_for_path(&state, &verified_path);
-    if let Err(errors) = config_io::validate_light_show(&body, tempo.as_ref()) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"errors": errors}))).into_response();
-    }
-
-    let vp = verified_path;
-    let body_owned = body;
-    match super::helpers::spawn_blocking_io("write lighting file", move || {
-        config_io::staged_write(&vp, &body_owned)
-    })
-    .await
-    {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "saved"}))).into_response(),
-        Err(e) => e,
-    }
-}
-
-/// DELETE /api/lighting/:name — deletes a .light file from disk.
-pub(super) async fn delete_lighting_file(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    use super::super::safe_path::{SafePath, VerifiedRoot};
-
-    let root = match VerifiedRoot::new(&state.songs_path) {
-        Ok(r) => r,
-        Err(e) => return e.into_response(),
-    };
-    let safe = match SafePath::resolve(&state.songs_path.join(&name), &root) {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": format!("Lighting file not found: {}", name)})),
-            )
-                .into_response();
-        }
-    };
-
-    if safe.as_path().extension().and_then(|e| e.to_str()) != Some("light") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Can only delete .light files"})),
-        )
-            .into_response();
-    }
-
-    // codeql[rust/path-injection] safe is verified via SafePath::resolve against songs_path root.
-    let path = safe.as_path().to_path_buf();
-    match super::helpers::spawn_blocking_io("delete lighting file", move || {
-        std::fs::remove_file(&path)
-    })
-    .await
-    {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "deleted"}))).into_response(),
-        Err(e) => e,
-    }
-}
-
-/// A `?song=` on an endpoint that otherwise works on bare DSL, naming the song
-/// whose tempo map the source should be parsed against.
-#[derive(serde::Deserialize)]
-pub(super) struct ValidateQuery {
-    song: Option<String>,
-}
-
-/// POST /api/lighting/validate — validates lighting DSL content without saving.
+/// The one songs-root rule for a song's light show, written, deleted or
+/// validated, by the web UI and MCP alike: the folder `path` is in is
+/// inside the songs root `songs_root`, canonically, as
+/// [`SafePath::resolve`](super::super::safe_path::SafePath::resolve) holds
+/// every path the lighting endpoints take. A folder not there yet is held
+/// to it by its nearest part that is there, canonicalized (a symlinked
+/// `lighting/` pointing outside is outside), the rest of it plain names
+/// (no `..`, and no link that leads nowhere, which a write would follow).
 ///
-/// Pass `?song=` when the source belongs to one. Measure-based timing does not
-/// parse at all without a tempo map, so validating a bar/beat show without it
-/// reports a failure the save path does not agree with.
-pub(super) async fn validate_lighting(
-    State(state): State<WebUiState>,
-    Query(query): Query<ValidateQuery>,
-    body: String,
-) -> impl IntoResponse {
-    let tempo = query
-        .song
-        .as_deref()
-        .and_then(|name| state.player.songs().get(name).ok())
-        .and_then(|song| song.lighting_tempo_map());
-    match config_io::validate_light_show(&body, tempo.as_ref()) {
-        Ok(()) => (StatusCode::OK, Json(json!({"valid": true}))).into_response(),
-        Err(errors) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"valid": false, "errors": errors})),
-        )
-            .into_response(),
+/// Answers the folder resolved, joined with `path`'s own name, which is
+/// not resolved: a link there is the link, as the song loader names it,
+/// so its `include`s resolve where the loader resolves them, and a delete
+/// removes the link, never what it leads to. A write follows it, so
+/// [`light_show_to_write`] holds what it leads to as well. 403 outside
+/// the root.
+pub(crate) fn light_show_in_songs_root(
+    root: &VerifiedRoot,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, Answer> {
+    use super::super::safe_path::{SafePath, SafePathError};
+
+    let outside = || Answer::from(SafePathError::OutsideRoot);
+    let (Some(folder), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return Err(outside());
+    };
+    let mut missing = Vec::new();
+    let mut existing = folder;
+    loop {
+        match SafePath::resolve(existing, root) {
+            Ok(safe) => {
+                let mut resolved = safe.as_path().to_path_buf();
+                resolved.extend(missing.iter().rev());
+                resolved.push(file_name);
+                return Ok(resolved);
+            }
+            Err(SafePathError::NotFound) => {
+                // A link that leads nowhere: what a write made through it
+                // would land on is not known to be inside.
+                if std::fs::symlink_metadata(existing).is_ok() {
+                    return Err(outside());
+                }
+                match (existing.parent(), existing.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        missing.push(name.to_os_string());
+                        existing = parent;
+                    }
+                    // A `..` past a part that is not there, or nothing
+                    // there at all: nowhere that can be shown to be inside.
+                    _ => return Err(outside()),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
+}
+
+/// Where a write of the light show `path` lands, held to the songs root:
+/// [`light_show_in_songs_root`], and, the file being a link, which the
+/// write follows, what it leads to inside the songs root too (403
+/// otherwise). A link that leads nowhere is refused: the write would make
+/// its target, wherever that is. Both the name written and the file a
+/// link leads to must be `.light` files (400 otherwise): a show is never
+/// written over a song's config or anything else.
+fn light_show_to_write(
+    root: &VerifiedRoot,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, Answer> {
+    use super::super::safe_path::{SafePath, SafePathError};
+
+    let not_a_show = || Answer::bad("Can only write .light files");
+    let is_show = crate::songs::FileKind::is_lighting;
+    let path = light_show_in_songs_root(root, path)?;
+    if !is_show(&path) {
+        return Err(not_a_show());
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let target = SafePath::resolve(&path, root).map_err(|e| match e {
+            SafePathError::NotFound => Answer::from(SafePathError::OutsideRoot),
+            e => Answer::from(e),
+        })?;
+        if !is_show(target.as_path()) {
+            return Err(not_a_show());
+        }
+    }
+    Ok(path)
+}
+
+/// Refuses a light show path, resolved as the handler resolves it, that is
+/// inside the venues or fixture types directory the engine reads on this
+/// host: those files are written by name, by the one rule for them
+/// ([`lighting_writes`]), never as a song's light show. Compared by
+/// identity ([`crate::util::is_within_dir`]), so no spelling (`..`, a
+/// symlink, another case) gets around it.
+async fn refuse_venue_or_type_file(
+    config_path: &std::path::Path,
+    path: &std::path::Path,
+    name: &str,
+) -> Result<(), lighting_writes::Answer> {
+    let config_path = config_path.to_path_buf();
+    let project = crate::util::project_dir_of(&config_path);
+    let (path, name) = (path.to_path_buf(), name.to_string());
+    let refused = tokio::task::spawn_blocking(move || {
+        // A config that does not load is a 500, as at every endpoint that
+        // reads these directories: the defaults may not be this host's.
+        let dirs = configured_lighting_dirs(&config_path)?;
+        Ok::<_, String>(
+            [
+                (Kind::Venue, dirs.venues),
+                (Kind::FixtureType, dirs.fixture_types),
+            ]
+            .into_iter()
+            .find(|(_, dir)| crate::util::is_within_dir(&path, &project.join(dir))),
+        )
+    })
+    .await
+    .unwrap_or(Ok(None))
+    .map_err(|e| lighting_writes::Answer::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    match refused {
+        Some((kind, dir)) => Err(lighting_writes::Answer::bad(format!(
+            "{name} is in the {noun}s directory ({dir}): a {noun} is saved by name, on the \
+             Lighting page or with MCP's {noun} tools; this endpoint is for song light shows",
+            noun = kind.noun()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Saves a song's light show: `name` is the file's path under the songs
+/// directory `songs_path`, `body` its text ([`save_light_show`]). A new
+/// file goes in a folder already there, as the editor saves it.
+pub(crate) async fn put_light_show(
+    player: &crate::player::Player,
+    config_path: &std::path::Path,
+    songs_path: &std::path::Path,
+    name: &str,
+    body: String,
+) -> Result<(), Answer> {
+    let root = VerifiedRoot::new(songs_path)?;
+    let verified_path = match light_show_in_songs_root(&root, &songs_path.join(name)) {
+        Ok(path) if path.parent().is_some_and(std::path::Path::is_dir) => path,
+        Ok(_) => return Err(lighting_file_not_found(name)),
+        Err(e) => return Err(e),
+    };
+
+    // Held from reading the song's tempo: a song save changing it reloads
+    // the songs under this lock.
+    let _writing = super::songs_api::SONG_WRITES.lock().await;
+    let tempo = song_tempo_for_path(player, &verified_path);
+    save_light_show(
+        &player.layers(),
+        config_path,
+        &root,
+        &verified_path,
+        name,
+        body,
+        tempo.as_ref(),
+    )
+    .await
+}
+
+/// Writes a song's light show `body` to `path` (shown as `name`), by the
+/// one rule of the web UI's light show save and MCP's
+/// `write_song_lighting` and `patch_song_lighting`: inside `songs_root`
+/// ([`light_show_to_write`]); never a file in the venues or fixture
+/// types directory ([`refuse_venue_or_type_file`]); parsed first (400 with
+/// its `errors`, each `Invalid light show DSL: ...`, as the venue and
+/// fixture type saves say it) against `tempo`, the tempo its
+/// song loads it with (a show inheriting its song's tempo is valid content
+/// that a tempo-less parse rejects), its `include`s resolved where it is
+/// written and kept inside `root`; its directory made only then. The
+/// caller holds [`super::songs_api::SONG_WRITES`].
+pub(crate) async fn save_light_show(
+    layers: &crate::lighting::effects::LayerSet,
+    config_path: &std::path::Path,
+    root: &VerifiedRoot,
+    path: &std::path::Path,
+    name: &str,
+    body: String,
+    tempo: Option<&crate::tempo::TempoMap>,
+) -> Result<(), Answer> {
+    // The venues and fixture types refusal first: it says what to do
+    // instead, where the songs-root one, for those directories outside the
+    // songs root, says only no.
+    refuse_venue_or_type_file(config_path, path, name).await?;
+    let path = &light_show_to_write(root, path)?;
+    if let Err(errors) =
+        config_io::validate_light_show(layers, &body, Some(path), Some(root.as_path()), tempo)
+    {
+        let errors: Vec<String> = errors
+            .into_iter()
+            .map(|e| format!("Invalid light show DSL: {e}"))
+            .collect();
+        return Err(Answer {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({"errors": errors}),
+        });
+    }
+
+    let vp = path.to_path_buf();
+    super::helpers::blocking_answer("write lighting file", move || {
+        if let Some(parent) = vp.parent() {
+            crate::util::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        config_io::staged_write(&vp, &body)
+    })
+    .await
+}
+
+/// Deletes a song's `.light` file from disk: `name` is its path under the
+/// songs directory `songs_path`. By the one rule of MCP's
+/// `delete_song_lighting` too ([`check_light_show_delete`]): a link is
+/// removed, never what it leads to.
+pub(crate) async fn delete_light_show(
+    config_path: &std::path::Path,
+    songs_path: &std::path::Path,
+    name: &str,
+) -> Result<(), Answer> {
+    let root = VerifiedRoot::new(songs_path)?;
+    // In turn with the file's writes: an MCP patch reading it before the
+    // delete would write it back after.
+    let _writing = super::songs_api::SONG_WRITES.lock().await;
+    let path = check_light_show_delete(config_path, &root, &songs_path.join(name), name).await?;
+    remove_light_show(songs_path, &path).await
+}
+
+/// Whether the file at `path` (shown as `name`) may be deleted as a song's
+/// light show, by the one rule of the web UI's delete and MCP's
+/// `delete_song_lighting`: a `.light` file (400 otherwise), never one in
+/// the venues or fixture types directory ([`refuse_venue_or_type_file`]),
+/// in a folder inside `songs_root` ([`light_show_in_songs_root`]), and
+/// there (404 otherwise). Answers the file to remove: a link itself, not
+/// what it leads to, whose name is the one checked.
+pub(crate) async fn check_light_show_delete(
+    config_path: &std::path::Path,
+    root: &VerifiedRoot,
+    path: &std::path::Path,
+    name: &str,
+) -> Result<std::path::PathBuf, Answer> {
+    // The name checked is the one removed: the resolved path keeps it.
+    if !crate::songs::FileKind::is_lighting(path) {
+        return Err(Answer::bad("Can only delete .light files"));
+    }
+    // As a save: the venues and fixture types refusal, which says what to
+    // do instead, before the songs root's. Of where the file is, its
+    // folder: a link there is removed, not what it leads to, so where it
+    // leads does not matter.
+    let folder = path.parent().unwrap_or(path);
+    refuse_venue_or_type_file(config_path, folder, name).await?;
+    let path = light_show_in_songs_root(root, path)?;
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(lighting_file_not_found(name));
+    }
+    Ok(path)
+}
+
+/// Removes a song's light show file, [`check_light_show_delete`] first,
+/// off the async runtime: the file itself, a link and not what it leads
+/// to, held to `songs_root` again ([`light_show_in_songs_root`]), as it
+/// is checked some time before.
+pub(crate) async fn remove_light_show(
+    songs_root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), Answer> {
+    let root = VerifiedRoot::new(songs_root)?;
+    // codeql[rust/path-injection] the folder is verified via SafePath::resolve against the songs root.
+    let path = light_show_in_songs_root(&root, path)?;
+    super::helpers::blocking_answer("delete lighting file", move || std::fs::remove_file(&path))
+        .await
+}
+
+/// Checks light show text without saving it. `song` names the song the text
+/// belongs to: measure-based timing does not parse at all without a tempo
+/// map, so validating a bar/beat show without it reports a failure the save
+/// path does not agree with. `file` is the lighting file (as
+/// [`put_light_show`] names it) the text is a draft of, so its `include`s
+/// resolve where saving it would. The problems are the answer; a `file`
+/// that leads outside the songs directory is the error.
+pub(crate) fn validate_light_show_text(
+    player: &crate::player::Player,
+    songs_path: &std::path::Path,
+    body: &str,
+    song: Option<&str>,
+    file: Option<&str>,
+) -> Result<LightingValidation, Answer> {
+    let song = song.and_then(|name| player.songs().get(name).ok());
+    let tempo = song.as_ref().and_then(|song| song.lighting_tempo_map());
+    let path = match file {
+        Some(file) => {
+            let root = VerifiedRoot::new(songs_path)?;
+            Some(light_show_in_songs_root(&root, &songs_path.join(file))?)
+        }
+        None => song.as_ref().map(|song| song.lighting_draft_path()),
+    };
+    Ok(
+        match config_io::validate_light_show(
+            &player.layers(),
+            body,
+            path.as_deref(),
+            Some(songs_path),
+            tempo.as_ref(),
+        ) {
+            Ok(()) => LightingValidation {
+                valid: true,
+                errors: None,
+            },
+            Err(errors) => LightingValidation {
+                valid: false,
+                errors: Some(errors),
+            },
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Fixture Type & Venue CRUD endpoints
 // ---------------------------------------------------------------------------
 
-/// Default directory for fixture type definitions, relative to project root.
-const DEFAULT_FIXTURE_TYPES_DIR: &str = "lighting/fixture_types";
-
-/// Default directory for venue definitions, relative to project root.
-const DEFAULT_VENUES_DIR: &str = "lighting/venues";
-
-/// Fixture type files: `.fixture` (rich channels, GDTF-referential types) and
-/// the v1 `.light`, loaded as peers — the same pair the lighting system reads.
-const FIXTURE_TYPE_EXTENSIONS: &[&str] = &["light", "fixture"];
-
-/// The file a fixture type of this name lives in, if one exists: `.fixture`
-/// first, then `.light`.
-fn existing_fixture_type_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let stem = sanitize_filename(name);
-    ["fixture", "light"]
-        .iter()
-        .map(|extension| dir.join(format!("{stem}.{extension}")))
-        .find(|path| path.is_file())
+/// One of the project's lighting directories. A request names it (`?dir=`
+/// and the like), or it is the one the engine reads on this host, by the
+/// shared reader ([`crate::config::Player::lighting_dirs_at`]) the CLI and
+/// MCP ask (#673): the defaults only where the config sets none.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum LightingDir {
+    FixtureTypes,
+    Venues,
 }
 
-/// Venue files: `.venue` (positions, focus points, MVR provenance) and the
-/// v1 `.light`, loaded as peers.
-const VENUE_EXTENSIONS: &[&str] = &["light", "venue"];
-
-/// The file a venue of this name lives in, if one exists: `.venue` first,
-/// then `.light`.
-fn existing_venue_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let stem = sanitize_filename(name);
-    ["venue", "light"]
-        .iter()
-        .map(|extension| dir.join(format!("{stem}.{extension}")))
-        .find(|path| path.is_file())
+/// The lighting directories the engine reads on this host, by the shared
+/// reader; a config that does not load is the error to answer (a 500), the
+/// one rule of the web endpoints for it.
+pub(super) fn configured_lighting_dirs(
+    config_path: &std::path::Path,
+) -> Result<crate::config::lighting::ProjectDirs, String> {
+    // codeql[rust/path-injection] config_path is set at startup, not user input.
+    crate::config::Player::lighting_dirs_at(config_path)
+        .map_err(|e| format!("the config does not load: {e}"))
 }
 
-/// Whether a venue uses syntax only `.venue` files carry.
-fn needs_venue_extension(venue: &lighting::types::Venue) -> bool {
-    venue.source().is_some()
-        || !venue.focus_points().is_empty()
-        || venue
-            .fixtures()
-            .values()
-            .any(|f| f.position().is_some() || f.rotation().is_some())
+/// The project-relative directory `which` a request names, else the one
+/// the engine reads on this host. A config that does not load is a 500,
+/// as it is to MCP: the defaults might not be where this host's files are.
+pub(super) fn lighting_dir(
+    config_path: &std::path::Path,
+    requested: Option<&str>,
+    which: LightingDir,
+) -> Result<String, Answer> {
+    if let Some(dir) = requested.filter(|d| !d.is_empty()) {
+        return Ok(dir.to_string());
+    }
+    let dirs = configured_lighting_dirs(config_path)
+        .map_err(|e| Answer::new(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(match which {
+        LightingDir::FixtureTypes => dirs.fixture_types,
+        LightingDir::Venues => dirs.venues,
+    })
 }
 
-/// Resolves a lighting directory path relative to the project root.
-/// Uses the provided override (from query param) or falls back to the default.
-/// Returns an error response if the project root cannot be canonicalized or the
-/// resolved path would escape it.
-#[allow(clippy::result_large_err)]
-fn resolve_lighting_dir(
+/// The file a fixture type of this name is declared in, if one is, in the
+/// directory or any subdirectory: the file the lighting system loads it
+/// from, by the same reader ([`lighting::project_files::type_files`]). The
+/// file's stem need not match the name: an import writes
+/// `astera_pixelbrick.fixture` for "Astera-PixelBrick", and a file written
+/// by hand is called whatever its author liked. A file that does not parse
+/// is never searched for it.
+pub(super) fn existing_fixture_type_file(
+    dir: &std::path::Path,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    lighting::project_files::type_files(dir)
+        .get(name)
+        .map(|declared| declared.file.clone())
+}
+
+/// [`existing_fixture_type_file`], off the async runtime.
+pub(super) async fn locate_fixture_type_file(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<Option<std::path::PathBuf>, Answer> {
+    let (dir, name) = (dir.to_path_buf(), name.to_string());
+    super::helpers::blocking_answer("locate fixture type file", move || {
+        Ok::<_, String>(existing_fixture_type_file(&dir, &name))
+    })
+    .await
+}
+
+/// Serialises every read-check-write of a venue file, so two saves cannot
+/// interleave between the version check and the write; and every write of a
+/// fixture type file, which a fixture's settings save rewrites with its
+/// venues. MCP's venue and fixture type writes take it too, and its edits
+/// hold it from their read to their write, or a save made between the two
+/// would be lost (#578). The saves here run on a blocking thread, and take
+/// it with `blocking_lock`.
+pub(crate) static VENUE_WRITES: super::write_lock::WriteLock = super::write_lock::WriteLock::new();
+
+/// The version of a venue file: a hash of its bytes. A client sends back the
+/// one it read (`If-Match`); a save whose version is no longer the file's is
+/// refused, the same optimistic concurrency the config store has for inline
+/// profiles.
+pub(crate) fn content_version(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The 409 for a save made against a version that is no longer current.
+pub(crate) fn stale_venue_response(name: &str, current: Option<String>) -> lighting_writes::Answer {
+    lighting_writes::Answer {
+        status: StatusCode::CONFLICT,
+        body: json!({
+            "error": format!(
+                "venue \"{name}\" changed since you loaded it (another tab, page or an edit by \
+                 hand); it has been reloaded, so reapply your change"
+            ),
+            "conflict": true,
+            "version": current,
+        }),
+    }
+}
+
+/// Resolves a lighting directory path relative to the project root: the
+/// one the request names (from a query param), else this host's
+/// ([`lighting_dir`]). Returns an error response if the project root cannot
+/// be canonicalized or the resolved path would escape it.
+pub(super) fn resolve_lighting_dir(
     config_path: &std::path::Path,
     override_dir: Option<&str>,
-    default: &str,
-) -> Result<std::path::PathBuf, axum::response::Response> {
+    which: LightingDir,
+) -> Result<std::path::PathBuf, Answer> {
     use super::super::safe_path::{SafePath, VerifiedRoot};
 
-    let root = VerifiedRoot::new(&project_root(config_path)?).map_err(|e| e.into_response())?;
+    let root = VerifiedRoot::new(&project_root(config_path)?)?;
 
-    let relative = match override_dir {
-        Some(d) if !d.is_empty() => d,
-        _ => default,
-    };
+    let relative = lighting_dir(config_path, override_dir, which)?;
 
-    SafePath::validate_relative(relative, &root).map_err(|e| e.into_response())
+    Ok(SafePath::validate_relative(&relative, &root)?)
 }
 
 /// Checks a referential type's archive the way the lighting system will when
@@ -464,539 +687,799 @@ fn resolve_lighting_dir(
 /// load, through the cache — but a `.fixture` whose archive is missing or
 /// outside the project cannot load, and a save is the last moment where the
 /// person still has the text in front of them to fix it.
-#[allow(clippy::result_large_err)]
-fn validate_referential_archives(
+pub(super) fn validate_referential_archives(
     root: &std::path::Path,
     types: &std::collections::HashMap<String, lighting::types::FixtureType>,
-) -> Result<(), axum::response::Response> {
+) -> Result<(), lighting_writes::Answer> {
     let canonical_root = root.canonicalize().map_err(|_| {
-        (
+        lighting_writes::Answer::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "Failed to resolve project root"})),
+            "Failed to resolve project root",
         )
-            .into_response()
     })?;
     for (name, fixture_type) in types {
-        let Some(source) = fixture_type.source() else {
-            continue;
-        };
-        let archive = canonical_root.join(&source.path);
-        let canonical = archive.canonicalize().map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!(
-                    "fixture type \"{}\" references a GDTF archive that cannot be read: {}: {}",
-                    name, source.path, e
-                )})),
-            )
-                .into_response()
-        })?;
-        if !canonical.starts_with(&canonical_root) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!(
-                    "fixture type \"{}\" references a GDTF archive outside the project: {}",
-                    name, source.path
-                )})),
-            )
-                .into_response());
-        }
-        if !canonical.is_file() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!(
-                    "fixture type \"{}\" references a GDTF archive that is not a file: {}",
-                    name, source.path
-                )})),
-            )
-                .into_response());
+        if let Some(source) = fixture_type.source() {
+            resolve_referential_archive(&canonical_root, name, source)?;
         }
     }
     Ok(())
 }
 
-/// The name the URL asks for must be the name the DSL declares: the webui
-/// resolves a type or venue by its file stem, so a body that renames the
-/// declaration would write `oldname.fixture` holding `newname` — a file no
-/// later GET, PUT or DELETE can reach.
-#[allow(clippy::result_large_err)]
-fn require_declared_name<T>(
-    kind: &str,
-    name: &str,
-    parsed: &std::collections::HashMap<String, T>,
-) -> Result<(), axum::response::Response> {
-    if parsed.contains_key(name) {
-        return Ok(());
-    }
-    let mut declared: Vec<&str> = parsed.keys().map(String::as_str).collect();
-    declared.sort_unstable();
-    let found = if declared.is_empty() {
-        "it declares none".to_string()
-    } else {
-        format!("it declares \"{}\"", declared.join("\", \""))
-    };
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": format!(
-            "the DSL declares no {} named \"{}\" ({}); rename the {} in the Name field, not in \
-             the text",
-            kind, name, found, kind
-        )})),
-    )
-        .into_response())
+/// The project root, canonicalized, for [`resolve_referential_archive`].
+pub(super) fn canonical_project_root(root: &std::path::Path) -> Result<std::path::PathBuf, Answer> {
+    root.canonicalize().map_err(|_| {
+        Answer::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve project root",
+        )
+    })
 }
 
-/// Query parameters for lighting endpoints — allows overriding the directory.
-#[derive(serde::Deserialize, Default)]
-pub(super) struct LightingDirQuery {
-    dir: Option<String>,
-    /// The extension a *new* fixture type is written with (`light` or
-    /// `fixture`). An existing file keeps its own, so this only decides
-    /// which form a type is born in.
-    ext: Option<String>,
+/// One referential type's archive, resolved as the lighting system resolves
+/// it: joined to the project root, canonicalized, inside the project, and a
+/// file. The 400 names the type and the path as the `.fixture` writes it.
+fn resolve_referential_archive(
+    canonical_root: &std::path::Path,
+    name: &str,
+    source: &lighting::types::GdtfSource,
+) -> Result<std::path::PathBuf, lighting_writes::Answer> {
+    let archive = canonical_root.join(&source.path);
+    let canonical = archive.canonicalize().map_err(|e| {
+        lighting_writes::Answer::bad(format!(
+            "fixture type \"{}\" references a GDTF archive that cannot be read: {}: {}",
+            name, source.path, e
+        ))
+    })?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(lighting_writes::Answer::bad(format!(
+            "fixture type \"{}\" references a GDTF archive outside the project: {}",
+            name, source.path
+        )));
+    }
+    if !canonical.is_file() {
+        return Err(lighting_writes::Answer::bad(format!(
+            "fixture type \"{}\" references a GDTF archive that is not a file: {}",
+            name, source.path
+        )));
+    }
+    Ok(canonical)
 }
 
 /// Validates that a fixture type or venue name is safe for use as a filename.
-#[allow(clippy::result_large_err)]
-fn validate_lighting_name(name: &str) -> Result<(), axum::response::Response> {
+pub(crate) fn validate_lighting_name(name: &str) -> Result<(), lighting_writes::Answer> {
+    validate_lighting_name_to_write(name, true)
+}
+
+/// As [`validate_lighting_name`], for a fixture type or venue being written:
+/// one not already on disk (`exists` false) is being created, and its name
+/// must also pass the rules for new names.
+pub(crate) fn validate_lighting_name_to_write(
+    name: &str,
+    exists: bool,
+) -> Result<(), lighting_writes::Answer> {
     use super::super::safe_path::SafePath;
-    if SafePath::validate_name(name).is_err() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Invalid name"})),
-        )
-            .into_response());
+    if SafePath::validate_name_to_write(name, exists).is_err() {
+        return Err(lighting_writes::Answer::bad("Invalid name"));
+    }
+    if RESERVED_NAMES.contains(&name) {
+        return Err(lighting_writes::Answer::bad(format!(
+            "`{name}` is reserved: it is the name of an API route, so a file called that could not be addressed"
+        )));
     }
     Ok(())
 }
 
-/// The file types the asset store serves, by extension. Everything in the
-/// store was written by mtrack itself from a GDTF archive; the allowlist
-/// keeps the endpoint from ever becoming a general file server.
-const ASSET_TYPES: &[(&str, &str)] = &[
-    ("json", "application/json"),
-    ("glb", "model/gltf-binary"),
-    ("png", "image/png"),
-    ("svg", "image/svg+xml"),
-];
+/// Path segments the lighting API uses as routes beside `{name}`.
+const RESERVED_NAMES: &[&str] = &["lock", "validate", "activate"];
 
-/// The largest asset served; the store's own caps are lower.
-const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
-
-/// GET /api/lighting/assets/{*path} — serves a file of the project's
-/// asset store (`lighting/.cache/assets/`, design §16.2): rig models,
-/// meshes and thumbnails for the 3D view. Paths are content-addressed, so
-/// a hit is immutable and cached as such.
-pub(super) async fn get_lighting_asset(
-    State(state): State<WebUiState>,
-    Path(path): Path<String>,
-) -> impl IntoResponse {
-    use super::super::safe_path::{SafePath, VerifiedRoot};
-
-    let content_type = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .and_then(|ext| {
-            ASSET_TYPES
-                .iter()
-                .find(|(known, _)| known.eq_ignore_ascii_case(ext))
-        })
-        .map(|(_, mime)| *mime);
-    let Some(content_type) = content_type else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Not an asset type"})),
-        )
-            .into_response());
-    };
-
-    let store = project_root(&state.config_path)?
-        .join("lighting")
-        .join(".cache")
-        .join(lighting::distill::ASSETS_DIR);
-    // No store yet (no referential fixture type has expanded) is a plain
-    // 404, not a server error.
-    let root = VerifiedRoot::new(&store).map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "No asset store"})),
-        )
-            .into_response()
-    })?;
-    let file = SafePath::validate_relative(&path, &root).map_err(|e| e.into_response())?;
-
-    let (bytes, len) = super::helpers::spawn_blocking_io("read asset", move || {
-        let meta = std::fs::metadata(&file)?;
-        if !meta.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "not a file",
-            ));
-        }
-        if meta.len() > MAX_ASSET_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "asset over the size cap",
-            ));
-        }
-        Ok((std::fs::read(&file)?, meta.len()))
-    })
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Asset not found"})),
-        )
-            .into_response()
-    })?;
-
-    // The bytes are a stranger's (copied out of a GDTF archive), so the
-    // type is not to be sniffed, and an SVG — which may script — is served
-    // as a picture only: no scripts, no fetches, sandboxed if navigated to.
-    let mut response = axum::response::Response::builder()
-        .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, content_type)
-        .header(axum::http::header::CONTENT_LENGTH, len)
-        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(
-            axum::http::header::CACHE_CONTROL,
-            "public, max-age=31536000, immutable",
-        );
-    if content_type == "image/svg+xml" {
-        response = response.header(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            "default-src 'none'; style-src 'unsafe-inline'; sandbox",
-        );
-    }
-    Ok::<_, axum::response::Response>(
-        response
-            .body(axum::body::Body::from(bytes))
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-    )
-}
-
-/// GET /api/lighting/fixture-types — lists all fixture types from the directory.
-pub(super) async fn get_fixture_types(
-    State(state): State<WebUiState>,
-    Query(query): Query<LightingDirQuery>,
-) -> impl IntoResponse {
-    let dir = resolve_lighting_dir(
-        &state.config_path,
-        query.dir.as_deref(),
-        DEFAULT_FIXTURE_TYPES_DIR,
-    )
-    .map_err(|e| e.into_response())?;
-    if !dir.is_dir() {
-        return Ok::<_, axum::response::Response>(
-            (StatusCode::OK, Json(json!({"fixture_types": {}}))).into_response(),
-        );
-    }
-    let all = super::helpers::spawn_blocking_io("load fixture types", move || {
+/// Every fixture type of the directory `dir` (else this host's), its files
+/// that did not read, and, for a GDTF type, what its archive says and the
+/// venues in `venues_dir` (else this host's) that use it. A directory that
+/// is not there lists nothing; one that leads outside the project is
+/// refused.
+pub(crate) async fn list_fixture_types(
+    config_path: &std::path::Path,
+    dir: Option<&str>,
+    venues_dir: Option<&str>,
+) -> Result<FixtureTypeList, Answer> {
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::FixtureTypes)?;
+    let venues_dir = resolve_lighting_dir(config_path, venues_dir, LightingDir::Venues)?;
+    let root = canonical_project_root(&project_root(config_path)?)?;
+    let all = super::helpers::blocking_answer("load fixture types", move || {
         let mut all = std::collections::HashMap::new();
-        let mut duplicates = DuplicateNames::new("fixture type");
-        // Both extensions, as the lighting system loads them. A type's file
-        // travels with it: the form a type is in decides how it may be
-        // edited, and a referential type parsed from a file has no expanded
-        // channels to show — only the system's expansion has those.
-        let mut errors =
-            load_light_files_from_dir(&dir, FIXTURE_TYPE_EXTENSIONS, |content, path| {
-                let types = lighting::parser::parse_fixture_types(content)?;
-                let file = crate::util::filename_display(path).to_string();
-                let extension = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                for (name, fixture_type) in types {
-                    // The rest of this file still lists; only a name another
-                    // file already claimed is skipped.
-                    if !duplicates.claim(&name, &file) {
-                        continue;
-                    }
-                    all.insert(
-                        name,
-                        json!({
-                            "referential": fixture_type.source().is_some(),
-                            "rich": fixture_type.uses_rich_channels(),
-                            "fixture_type": fixture_type,
-                            "file": file,
-                            "extension": extension,
-                        }),
-                    );
-                }
-                Ok(())
+        let mut referential = Vec::new();
+        // The project's one reader of fixture types (the lighting system
+        // loads through it too): every type file in the directory and its
+        // subdirectories, then every GDTF in the library no record points
+        // at. A type's file travels with it: the form a type is in decides
+        // how it may be edited.
+        let project = lighting::project_files::fixture_types(&root, Some(&dir));
+        let shown = |path: &std::path::Path| lighting::project_files::display_in(&dir, path);
+        let mut errors: Vec<LightingFileError> = project
+            .files
+            .problems
+            .iter()
+            .map(|p| LightingFileError {
+                file: shown(&p.file),
+                error: p.error.clone(),
             })
-            .map_err(|e| e.to_string())?;
-        errors.append(&mut duplicates.errors);
+            .collect();
+        for declared in &project.files.items {
+            let fixture_type = &declared.item;
+            if let Some(source) = fixture_type.source() {
+                referential.push((declared.name.clone(), source.clone()));
+            }
+            all.insert(
+                declared.name.clone(),
+                FixtureTypeEntry {
+                    referential: fixture_type.source().is_some(),
+                    // A native type's addresses, for the venue editor's
+                    // patch; a GDTF fixture's are its mode's, so null here.
+                    footprint: Some(
+                        fixture_type
+                            .source()
+                            .is_none()
+                            .then(|| fixture_type.footprint()),
+                    ),
+                    rich: fixture_type.uses_rich_channels(),
+                    fixture_type: fixture_type.clone(),
+                    file: Some(shown(&declared.file)),
+                    extension: Some(
+                        declared
+                            .file
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                    owner: project.files.record.owner(&declared.name).map(|owner| {
+                        lighting_writes::wire_owner(
+                            lighting::files::Kind::FixtureType,
+                            &dir,
+                            &owner,
+                        )
+                    }),
+                    form_editable: crate::util::read_to_string(&declared.file).is_ok_and(|text| {
+                        lighting::fixture_patch::form_expresses(&text, &declared.name)
+                    }),
+                    gdtf: None,
+                    dsl: None,
+                },
+            );
+        }
+        let library = project.library;
+        // An archive that will not read is the listing's error; a name
+        // collision is already resolved (the second fixture is renamed).
+        for finding in &library.findings {
+            if finding.kind == "gdtf-unreadable" {
+                errors.push(LightingFileError {
+                    file: finding.file.clone(),
+                    error: finding.message.clone(),
+                });
+            }
+        }
+        for library_type in &library.types {
+            if all.contains_key(&library_type.name) {
+                continue;
+            }
+            let declared = lighting::library::declared(library_type);
+            referential.push((
+                library_type.name.clone(),
+                declared
+                    .source()
+                    .cloned()
+                    .expect("a library type is GDTF-sourced"),
+            ));
+            all.insert(
+                library_type.name.clone(),
+                FixtureTypeEntry {
+                    referential: true,
+                    footprint: Some(None),
+                    rich: false,
+                    fixture_type: declared,
+                    file: None,
+                    extension: None,
+                    owner: None,
+                    form_editable: false,
+                    gdtf: None,
+                    dsl: None,
+                },
+            );
+        }
+        // What each referential type's archive says, for its card. One bad
+        // archive is that card's `gdtf: null`, never the listing's failure.
+        let usage = fixtures_by_type(&venues_dir);
+        let cache = lighting::distill::DistillCache::new(root.join("lighting").join(".cache"));
+        let mut archives = ArchiveCache::default();
+        for (name, source) in referential {
+            let fixtures: Vec<Option<&str>> = usage
+                .get(&name)
+                .into_iter()
+                .flatten()
+                .flat_map(|(_, f)| f.iter().map(|(_, mode)| mode.as_deref()))
+                .collect();
+            let parsed = archives.get(&root, &name, &source);
+            let summary = parsed.map(|(bytes, description)| {
+                gdtf_list_summary(&cache, bytes, description, &name, &fixtures)
+            });
+            if let Some(entry) = all.get_mut(&name) {
+                entry.gdtf = Some(summary);
+            }
+        }
         Ok::<_, String>((all, errors))
     })
     .await?;
     let (all, errors) = all;
-    Ok((
-        StatusCode::OK,
-        Json(json!({"fixture_types": all, "errors": errors})),
-    )
-        .into_response())
+    Ok(FixtureTypeList {
+        fixture_types: all,
+        errors,
+    })
 }
 
-/// GET /api/lighting/fixture-types/:name — returns a single fixture type.
-pub(super) async fn get_fixture_type(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Query(query): Query<LightingDirQuery>,
-) -> impl IntoResponse {
-    validate_lighting_name(&name)?;
-    let dir = resolve_lighting_dir(
-        &state.config_path,
-        query.dir.as_deref(),
-        DEFAULT_FIXTURE_TYPES_DIR,
-    )?;
-    let Some(file_path) = existing_fixture_type_file(&dir, &name) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Fixture type not found: {}", name)})),
-        )
-            .into_response());
+/// One fixture type, with its file's text: a GDTF in the library with no
+/// record is a fixture with no file. NOT_FOUND-class (404) when no file or
+/// archive declares `name`.
+pub(crate) async fn read_fixture_type(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+) -> Result<FixtureTypeEntry, Answer> {
+    validate_lighting_name(name)?;
+    let name = name.to_string();
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::FixtureTypes)?;
+    let found = {
+        let (dir, name) = (dir.clone(), name.clone());
+        super::helpers::blocking_answer("read fixture type", move || {
+            let read = lighting::project_files::type_files(&dir);
+            let (Some(declared), Some(owner)) = (read.get(&name), read.record.owner(&name)) else {
+                return Ok(None);
+            };
+            let content = crate::util::read_to_string(&declared.file)?;
+            Ok::<_, std::io::Error>(Some((
+                declared.item.clone(),
+                declared.file.clone(),
+                lighting_writes::wire_owner(lighting::files::Kind::FixtureType, &dir, &owner),
+                content,
+            )))
+        })
+        .await?
     };
-    let fp = file_path.clone();
-    let content = super::helpers::spawn_blocking_io("read fixture type", move || {
-        std::fs::read_to_string(&fp)
+    let Some((ft, file_path, owner, content)) = found else {
+        // A GDTF in the library with no record: a fixture with no file.
+        let root = canonical_project_root(&project_root(config_path)?)?;
+        let (types_dir, wanted) = (dir.clone(), name.clone());
+        let found = super::helpers::blocking_answer("read the GDTF library", move || {
+            Ok::<_, String>(
+                lighting::library::unrecorded_types(&root, Some(&types_dir))
+                    .get(&wanted)
+                    .map(lighting::library::declared),
+            )
+        })
+        .await?;
+        return match found {
+            Some(declared) => Ok(FixtureTypeEntry {
+                referential: true,
+                footprint: None,
+                rich: false,
+                fixture_type: declared,
+                file: None,
+                extension: None,
+                owner: None,
+                form_editable: false,
+                gdtf: None,
+                dsl: Some(None),
+            }),
+            None => Err(Answer::new(
+                StatusCode::NOT_FOUND,
+                format!("Fixture type not found: {}", name),
+            )),
+        };
+    };
+    Ok(FixtureTypeEntry {
+        referential: ft.source().is_some(),
+        footprint: None,
+        rich: ft.uses_rich_channels(),
+        fixture_type: ft,
+        file: Some(crate::util::filename_display(&file_path).to_string()),
+        extension: Some(
+            file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        owner: Some(owner),
+        form_editable: lighting::fixture_patch::form_expresses(&content, &name),
+        gdtf: None,
+        dsl: Some(Some(content)),
+    })
+}
+
+/// The GDTF source of a fixture type: its record's, or — for a GDTF in the
+/// library with no record — its archive's, from the one function the engine
+/// loads them with. `Ok(None)`: no such type; `Err`: a native type (the
+/// 404 the caller answers).
+async fn gdtf_source_of(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<Option<lighting::types::GdtfSource>, Answer> {
+    if let Some(file_path) = locate_fixture_type_file(dir, name).await? {
+        let content = super::helpers::blocking_answer("read fixture type", move || {
+            crate::util::read_to_string(&file_path)
+        })
+        .await?;
+        let types = lighting::parser::parse_fixture_types(&content).map_err(|e| {
+            Answer::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse fixture type: {}", e),
+            )
+        })?;
+        let Some(fixture_type) = types.get(name) else {
+            return Ok(None);
+        };
+        return match fixture_type.source() {
+            Some(source) => Ok(Some(source.clone())),
+            None => Err(Answer::new(
+                StatusCode::NOT_FOUND,
+                format!("fixture type \"{}\" is not a GDTF type", name),
+            )),
+        };
+    }
+    let (root, dir, name) = (root.to_path_buf(), dir.to_path_buf(), name.to_string());
+    super::helpers::blocking_answer("read the GDTF library", move || {
+        Ok::<_, String>(
+            lighting::library::unrecorded_types(&root, Some(&dir))
+                .get(&name)
+                .and_then(|t| lighting::library::declared(t).source().cloned()),
+        )
+    })
+    .await
+}
+
+/// What a GDTF fixture's
+/// archive holds, for its page: every mode as the mode picker shows it,
+/// the venue fixtures using it in their
+/// own modes, and the rig model and thumbnail the 3D view draws (paths in
+/// the asset store) — drawn in the first mode it can drive. The rig is
+/// written through the expansion cache as the lighting system would write
+/// it; a rig that cannot be made is not an error here — the modes are still
+/// worth showing.
+pub(crate) async fn fixture_type_gdtf(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+    venues_dir: Option<&str>,
+) -> Result<FixtureTypeGdtf, Answer> {
+    validate_lighting_name(name)?;
+    let name = name.to_string();
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::FixtureTypes)?;
+    let root = canonical_project_root(&project_root(config_path)?)?;
+    let Some(source) = gdtf_source_of(&root, &dir, &name).await? else {
+        return Err(Answer::new(
+            StatusCode::NOT_FOUND,
+            format!("Fixture type not found: {}", name),
+        ));
+    };
+    let archive = resolve_referential_archive(&root, &name, &source)?;
+    let venues_dir = resolve_lighting_dir(config_path, venues_dir, LightingDir::Venues)?;
+
+    // Reading, parsing, distilling every mode and (cold) writing the rig are
+    // all blocking work. The inner Result is the parse failure, a 400.
+    let outcome = super::helpers::blocking_answer("inspect GDTF", move || {
+        let bytes = crate::util::read_file(&archive)?;
+        let description = match lighting::gdtf::parse_archive(&bytes) {
+            Ok(description) => description,
+            Err(e) => return Ok::<_, std::io::Error>(Err(e.to_string())),
+        };
+        let cache = lighting::distill::DistillCache::new(root.join("lighting").join(".cache"));
+        // A GDTF fixture has no mode of its own: it is drawn in the first
+        // mode the archive offers that distils — the body is the same in
+        // every mode.
+        let rig_mode = drawn_mode(&description, &name);
+        // Only the type's name goes in the log: everything else here is the
+        // archive's own text.
+        let rig = rig_mode.as_deref().and_then(|mode| {
+            match cache.ensure_rig(&bytes, mode, || Ok(&description)) {
+                Ok((rig, _warnings)) => Some(rig),
+                Err(_) => {
+                    tracing::warn!(fixture_type = %name, "no rig model for the fixture type's details view");
+                    None
+                }
+            }
+        });
+        // The thumbnail sits beside the rig file, under the archive's hash.
+        let thumbnail = rig.as_deref().and_then(|rel| {
+            let model = cache.load_rig(rel).ok()?;
+            let file = model.thumbnail?;
+            let (dir, _) = rel.rsplit_once('/')?;
+            Some(format!("{dir}/{file}"))
+        });
+        let beam = pinned_beam(&description, rig_mode.as_deref()).map(|b| GdtfBeam {
+            beam_type: b.beam_type.clone(),
+            beam_angle: b.beam_angle,
+            field_angle: b.field_angle,
+            luminous_flux: b.luminous_flux,
+            color_temperature: b.color_temperature,
+            power: b.power_consumption,
+        });
+        // Each fixture in its own mode, spelled as the archive spells it
+        // (null when it names none, or none of the archive's).
+        let venues = fixtures_by_type(&venues_dir)
+            .remove(&name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(venue, fixtures)| TypeVenue {
+                name: venue,
+                fixtures: fixtures
+                    .into_iter()
+                    .map(|(fixture, mode)| TypeVenueFixture {
+                        name: fixture,
+                        mode: mode.as_deref().and_then(|m| resolve_mode(&description, m)),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Ok(Ok(FixtureTypeGdtf {
+            archive: source.path,
+            rig,
+            thumbnail,
+            beam,
+            about: description.about.clone(),
+            venues,
+            inspection: inspect_description(&description),
+        }))
     })
     .await?;
-    let types = lighting::parser::parse_fixture_types(&content).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to parse fixture type: {}", e)})),
-        )
-            .into_response()
-    })?;
-    match types.get(&name) {
-        Some(ft) => Ok((
-            StatusCode::OK,
-            Json(json!({
-                "referential": ft.source().is_some(),
-                "rich": ft.uses_rich_channels(),
-                "fixture_type": ft,
-                "dsl": content,
-                "file": crate::util::filename_display(&file_path),
-                "extension": file_path.extension().and_then(|e| e.to_str()).unwrap_or_default(),
-            })),
-        )
-            .into_response()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Fixture type '{}' not found in file", name)})),
-        )
-            .into_response()),
+    outcome.map_err(|e| Answer::bad(format!("Not a parseable GDTF: {}", e)))
+}
+
+/// The beam a type's facts quote: the first `Beam` in the mode's own
+/// geometry tree (through its geometry references), else the archive's
+/// first. A fixture's beams are usually alike, and the mode's tree is the
+/// one the fixture draws.
+fn pinned_beam<'a>(
+    description: &'a lighting::gdtf::Description,
+    mode: Option<&str>,
+) -> Option<&'a lighting::gdtf::BeamData> {
+    mode.and_then(|m| description.modes.iter().find(|x| x.name == m))
+        .and_then(|m| first_beam_under(description, &m.geometry, 0))
+        .or_else(|| description.geometries.iter().find_map(|g| g.beam.as_ref()))
+}
+
+/// The first beam at or under a top-level geometry, in document order. A
+/// reference is followed to the geometry it instances, a few levels deep at
+/// most (GDTF does not nest them further, and a cycle must not spin).
+fn first_beam_under<'a>(
+    description: &'a lighting::gdtf::Description,
+    top: &str,
+    depth: usize,
+) -> Option<&'a lighting::gdtf::BeamData> {
+    if depth > 4 {
+        return None;
+    }
+    let geometries = &description.geometries;
+    let root = geometries
+        .iter()
+        .position(|g| g.parent.is_none() && g.name == top)?;
+    // A parent precedes its children, so one pass in order finds the
+    // subtree.
+    let mut inside = vec![false; geometries.len()];
+    for (index, node) in geometries.iter().enumerate().skip(root) {
+        if index != root && !node.parent.is_some_and(|p| inside[p]) {
+            continue;
+        }
+        inside[index] = true;
+        if let Some(beam) = &node.beam {
+            return Some(beam);
+        }
+        if let Some(beam) = node
+            .reference
+            .as_deref()
+            .and_then(|r| first_beam_under(description, r, depth + 1))
+        {
+            return Some(beam);
+        }
+    }
+    None
+}
+
+/// The fixtures of each type across a venues directory's files (both
+/// extensions), by type, then venue name, then fixture in patch order. A
+/// file that does not parse, or a missing directory, contributes nothing:
+/// this answers "who uses it", not whether the venues are well.
+fn fixtures_by_type(dir: &std::path::Path) -> FixturesByType {
+    let venues: std::collections::BTreeMap<String, lighting::types::Venue> =
+        lighting::project_files::venues(dir)
+            .items
+            .into_iter()
+            .map(|d| (d.name, d.item))
+            .collect();
+    let mut by_type = FixturesByType::new();
+    for (venue_name, venue) in venues {
+        let mut of_type: std::collections::BTreeMap<&str, Vec<(String, Option<String>)>> =
+            std::collections::BTreeMap::new();
+        for fixture in venue.fixtures_by_patch() {
+            of_type.entry(fixture.fixture_type()).or_default().push((
+                fixture.name().to_string(),
+                fixture.mode().map(str::to_string),
+            ));
+        }
+        for (fixture_type, fixtures) in of_type {
+            by_type
+                .entry(fixture_type.to_string())
+                .or_default()
+                .push((venue_name.clone(), fixtures));
+        }
+    }
+    by_type
+}
+
+/// Type name → (venue name → (fixture name, the mode its line names)).
+type FixturesByType =
+    std::collections::HashMap<String, Vec<(String, Vec<(String, Option<String>)>)>>;
+
+/// A mode as the archive spells it, matched as the lighting system matches
+/// one (exact, then normalized); `None` when it names no mode of the archive.
+fn resolve_mode(description: &lighting::gdtf::Description, mode: &str) -> Option<String> {
+    lighting::gdtf::match_mode(description, mode)
+        .ok()
+        .map(|m| m.name)
+}
+
+/// The mode a GDTF fixture is drawn in (its 3D view, thumbnail and quoted
+/// beam): the first mode of the archive that distils — the importer warms
+/// exactly that rig.
+fn drawn_mode(description: &lighting::gdtf::Description, type_name: &str) -> Option<String> {
+    lighting::import::first_drivable_mode(description, type_name)
+}
+
+/// GDTF archives read and parsed once per listing, by the path a `.fixture`
+/// names; `None` for one that is missing, outside the project, or does not
+/// parse.
+#[derive(Default)]
+struct ArchiveCache {
+    parsed: std::collections::HashMap<String, Option<(Vec<u8>, lighting::gdtf::Description)>>,
+}
+
+impl ArchiveCache {
+    fn get(
+        &mut self,
+        root: &std::path::Path,
+        name: &str,
+        source: &lighting::types::GdtfSource,
+    ) -> Option<&(Vec<u8>, lighting::gdtf::Description)> {
+        self.parsed
+            .entry(source.path.clone())
+            .or_insert_with(|| {
+                let archive = resolve_referential_archive(root, name, source).ok()?;
+                let bytes = crate::util::read_file(&archive).ok()?;
+                let description = lighting::gdtf::parse_archive(&bytes).ok()?;
+                Some((bytes, description))
+            })
+            .as_ref()
     }
 }
 
-/// PUT /api/lighting/fixture-types/:name — creates or updates a fixture type.
+/// A referential type's card in the listing: what the fixture is, its mode
+/// count, the pinned mode and its beam, and how many venue fixtures use it.
+/// The thumbnail is quoted only when the rig is already in the store — a
+/// listing writes nothing.
+fn gdtf_list_summary(
+    cache: &lighting::distill::DistillCache,
+    bytes: &[u8],
+    description: &lighting::gdtf::Description,
+    type_name: &str,
+    fixtures: &[Option<&str>],
+) -> GdtfSummary {
+    // The fixture is drawn, and its beam quoted, in the first mode it can
+    // drive: a GDTF fixture has no mode of its own.
+    let drawn = drawn_mode(description, type_name);
+    let beam = pinned_beam(description, drawn.as_deref()).map(|b| BeamBrief {
+        beam_type: b.beam_type.clone(),
+        angle: b.beam_angle,
+    });
+    // The thumbnail of the rig the details view draws, if it was drawn.
+    let thumbnail = drawn.and_then(|mode| {
+        let rel = lighting::distill::DistillCache::rig_path(bytes, &mode);
+        let rig = cache.load_rig(&rel).ok()?;
+        let file = rig.thumbnail?;
+        let (dir, _) = rel.rsplit_once('/')?;
+        Some(format!("{dir}/{file}"))
+    });
+    // How many venue fixtures use each mode, by the archive's spelling (a
+    // mode that resolves to none is counted as written).
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for mode in fixtures.iter().flatten() {
+        let mode = resolve_mode(description, mode).unwrap_or_else(|| mode.to_string());
+        *counts.entry(mode).or_default() += 1;
+    }
+    let mut in_use: Vec<(String, usize)> = counts.into_iter().collect();
+    in_use.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    GdtfSummary {
+        fixture: description.name.clone(),
+        manufacturer: description.manufacturer.clone(),
+        modes: description.modes.len(),
+        beam,
+        thumbnail,
+        used_by: fixtures.len(),
+        in_use: in_use
+            .into_iter()
+            .map(|(mode, count)| ModeUse { mode, count })
+            .collect(),
+    }
+}
+
+/// The channel-map form of a fixture type, as the editor's form sends it:
+/// each channel's name and offset, and the strobe figures when it states
+/// them. It can say no more than that, so a save of it is refused for a
+/// type that holds more (`form_expresses`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ChannelMap {
+    pub channels: std::collections::BTreeMap<String, u32>,
+    pub max_strobe_frequency: Option<f64>,
+    pub min_strobe_frequency: Option<f64>,
+    pub strobe_dmx_offset: Option<u32>,
+}
+
+/// What a fixture type save writes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TypeBody {
+    /// The whole file's DSL, which must declare this one type and nothing
+    /// else.
+    Text(String),
+    /// The channel-map form.
+    ChannelMap(ChannelMap),
+}
+
+/// A save of one fixture type, as a caller asks it.
+pub(crate) struct TypeSaveAsk<'a> {
+    pub name: &'a str,
+    /// A rename's old name.
+    pub from: Option<&'a str>,
+    pub dir: Option<&'a str>,
+    pub venues_dir: Option<&'a str>,
+    /// The form asked for (`light` or `fixture`); anything else is refused.
+    pub ext: Option<&'a str>,
+    pub body: TypeBody,
+}
+
+/// Creates, updates or renames a fixture type.
 ///
-/// Accepts either JSON (structured) or plain text (raw DSL).
-pub(super) async fn put_fixture_type(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Query(query): Query<LightingDirQuery>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    validate_lighting_name(&name)?;
-    let dir = resolve_lighting_dir(
-        &state.config_path,
-        query.dir.as_deref(),
-        DEFAULT_FIXTURE_TYPES_DIR,
-    )?;
+/// By the one rule for type files ([`super::lighting_writes`]): a new name
+/// is claimed at `<fixture types dir>/<stem>.fixture`; an existing one is
+/// written only where its file is that type's alone, and refused (409, with
+/// the file and why) otherwise. `from` renames, as for venues, and, as the
+/// fixture settings' rename does, retypes every venue line naming the old
+/// name in `venues_dir` (refused, nothing written, when any venue file
+/// cannot be; the answer's `rename` says what changed). A `.light` whose
+/// new text needs a `.fixture` (rich channels, a GDTF reference, or `ext`
+/// `fixture`) moves to `<stem>.fixture`. There is no version to send: the
+/// file is replaced as it stands, as it always was.
+pub(crate) async fn put_fixture_type(
+    player: &std::sync::Arc<crate::player::Player>,
+    config_path: &std::path::Path,
+    ask: TypeSaveAsk<'_>,
+) -> Result<FixtureTypeSaved, Answer> {
+    let TypeSaveAsk {
+        name,
+        from,
+        dir,
+        venues_dir,
+        ext,
+        body,
+    } = ask;
+    validate_lighting_name(name)?;
+    if let Some(from) = from {
+        validate_lighting_name(from)?;
+    }
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::FixtureTypes)?;
 
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let from_form = content_type.contains("application/json");
+    let from_form = matches!(body, TypeBody::ChannelMap(_));
 
     // Whatever form the body is in, an `ext` naming no known form is a
-    // mistake worth reporting rather than quietly writing a `.light`.
-    let requested_extension = match query.ext.as_deref() {
-        None | Some("") => None,
-        Some(known @ ("light" | "fixture")) => Some(known),
-        Some(other) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Unknown fixture type extension: {}", other)})),
-            )
-                .into_response())
-        }
+    // mistake worth reporting rather than quietly ignored.
+    let ext = fixture_type_extension(ext)?;
+
+    let dsl = match body {
+        TypeBody::ChannelMap(form) => channel_map_to_dsl(name, &form).map_err(Answer::bad)?,
+        TypeBody::Text(text) => text,
     };
 
-    let dsl = if from_form {
-        // Parse JSON body and convert to DSL
-        let json_body: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid JSON: {}", e)})),
-            )
-                .into_response()
-        })?;
-        fixture_type_json_to_dsl(&name, &json_body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response())?
-    } else {
-        // Treat as raw DSL text
-        String::from_utf8(body.to_vec()).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Invalid UTF-8"})),
-            )
-                .into_response()
-        })?
+    let root = canonical_project_root(&project_root(config_path)?)?;
+    let venues_dir = resolve_lighting_dir(config_path, venues_dir, LightingDir::Venues)?;
+    let save = lighting_writes::TypeSave {
+        root,
+        dir,
+        venues_dir: venues_dir.clone(),
+        name: name.to_string(),
+        from: from.map(str::to_string),
+        ext,
+        from_form,
+        body: lighting_writes::Body::Text(dsl),
     };
-
-    // Validate the DSL parses correctly
-    let types = lighting::parser::parse_fixture_types(&dsl).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid fixture type DSL: {}", e)})),
-        )
-            .into_response()
-    })?;
-    require_declared_name("fixture type", &name, &types)?;
-    validate_referential_archives(&project_root(&state.config_path)?, &types)?;
-
-    let stem = sanitize_filename(&name);
-    // Read against the resolved directory rather than the created one: every
-    // refusal below should land before anything is made on disk.
-    let existing_extension = existing_fixture_type_file(&dir, &name).and_then(|path| {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_string)
-    });
-
-    // The channel-map form cannot say what a `.fixture` file holds, so
-    // saving one through it would silently drop the type's rich channels or
-    // its GDTF reference.
-    if from_form && existing_extension.as_deref() == Some("fixture") {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({"error": format!(
-                "fixture type \"{}\" lives in {}.fixture, whose form the channel-map editor \
-                 cannot express — edit this type as text",
-                name, stem
-            )})),
-        )
-            .into_response());
-    }
-
-    // An explicit `ext` wins — that is how a `.light` type converts to a
-    // `.fixture`. Without one, an existing file keeps its own extension and
-    // a new type is born a `.light`.
-    let extension = match (requested_extension, existing_extension.as_deref()) {
-        (Some(requested), _) => requested,
-        (None, Some(existing)) => match existing {
-            "fixture" => "fixture",
-            _ => "light",
-        },
-        (None, None) => "light",
-    };
-
-    // The extension is the version marker: rich channel syntax written into
-    // a `.light` file would be saved, then skipped by the loader, and one
-    // missing type fails the whole venue's registration.
-    if extension == "light" {
-        if let Some(rich) = types.values().find(|t| t.uses_rich_channels()) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!(
-                    "fixture type \"{}\" uses rich channel syntax (fine, range, functions), which \
-                     belongs in a .fixture file; this editor writes .light files — save it as \
-                     lighting/fixture_types/{}.fixture by hand or through `mtrack import-gdtf`",
-                    rich.name(),
-                    stem
-                )})),
-            )
-                .into_response());
-        }
-    }
-
-    // Everything that can refuse the save has: the same helper the playlists
-    // and profiles writes use, so a refusal is reported as the configuration
-    // problem it is rather than a server fault. The file goes under the
-    // directory that was made, not the spelling.
-    let dir = super::helpers::ensure_configured_dir(&dir, &state).await?;
-
-    // A type is one file: whichever form it is saved in, the other one is
-    // retired, or the loader would register the name twice.
-    let file_path = dir.join(format!("{stem}.{extension}"));
-    let stale_twin = FIXTURE_TYPE_EXTENSIONS
-        .iter()
-        .map(|extension| dir.join(format!("{stem}.{extension}")))
-        .find(|path| path != &file_path && path.is_file());
-    let fp = file_path;
-    let dsl_owned = dsl;
-    super::helpers::spawn_blocking_io("write fixture type", move || {
-        config_io::staged_write(&fp, &dsl_owned)?;
-        if let Some(twin) = stale_twin {
-            // Best effort: the save is durable already, and a leftover twin
-            // surfaces as a duplicate fixture type name at load.
-            if let Err(e) = std::fs::remove_file(&twin) {
-                tracing::warn!(file = %twin.display(), error = %e, "could not retire the fixture type's stale twin");
-            }
-        }
-        Ok::<(), String>(())
+    let rename = super::helpers::blocking_answer("write fixture type", move || {
+        Ok::<_, String>(lighting_writes::save_fixture_type(save))
     })
-    .await?;
+    .await??
+    .rename;
+    let venue_error = match &rename {
+        Some(_) => {
+            super::fixture_settings::reload_types_and_venues(player, config_path, name, &venues_dir)
+                .await
+        }
+        None => None,
+    };
 
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({"status": "saved", "name": name})),
-        )
-            .into_response(),
-    )
+    Ok(FixtureTypeSaved {
+        status: "saved".to_string(),
+        name: name.to_string(),
+        rename,
+        venue_error,
+    })
 }
 
-/// DELETE /api/lighting/fixture-types/:name — deletes a fixture type file.
-pub(super) async fn delete_fixture_type(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Query(query): Query<LightingDirQuery>,
-) -> impl IntoResponse {
-    validate_lighting_name(&name)?;
-    let dir = resolve_lighting_dir(
-        &state.config_path,
-        query.dir.as_deref(),
-        DEFAULT_FIXTURE_TYPES_DIR,
-    )?;
-    let Some(file_path) = existing_fixture_type_file(&dir, &name) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Fixture type not found: {}", name)})),
-        )
-            .into_response());
-    };
-    let fp = file_path;
-    super::helpers::spawn_blocking_io("delete fixture type", move || std::fs::remove_file(&fp))
-        .await?;
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({"status": "deleted", "name": name})),
-        )
-            .into_response(),
-    )
+/// The form a fixture type save asks for (`?ext=`): `light` or `fixture`,
+/// or none; anything else is a 400.
+pub(crate) fn fixture_type_extension(
+    ext: Option<&str>,
+) -> Result<Option<&'static str>, lighting_writes::Answer> {
+    match ext {
+        None | Some("") => Ok(None),
+        Some("light") => Ok(Some("light")),
+        Some("fixture") => Ok(Some("fixture")),
+        Some(other) => Err(lighting_writes::Answer::bad(format!(
+            "Unknown fixture type extension: {}",
+            other
+        ))),
+    }
+}
+
+/// Deletes a fixture type file: only one that is the type's alone (409
+/// otherwise, with the file and why). A GDTF in the library with no record
+/// is its archive, deleted.
+pub(crate) async fn delete_fixture_type(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+) -> Result<FixtureTypeDeleted, Answer> {
+    validate_lighting_name(name)?;
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::FixtureTypes)?;
+    let root = canonical_project_root(&project_root(config_path)?)?;
+    let deleted = name.to_string();
+    let outcome = super::helpers::blocking_answer("delete fixture type", move || {
+        Ok::<_, String>(lighting_writes::delete_fixture_type(&root, &dir, &deleted))
+    })
+    .await??;
+    Ok(FixtureTypeDeleted {
+        status: "deleted".to_string(),
+        name: name.to_string(),
+        archive_removed: outcome.archive_removed,
+        archive_kept: outcome.archive_kept,
+    })
 }
 
 /// The tempo a `.light` file at this path will be loaded with, found by
 /// matching the path against the loaded songs' directories.
 fn song_tempo_for_path(
-    state: &WebUiState,
+    player: &crate::player::Player,
     path: &std::path::Path,
 ) -> Option<crate::tempo::TempoMap> {
-    let song = state
-        .player
-        .songs()
-        .list()
-        .into_iter()
-        .find(|song| path.starts_with(song.base_path()))?;
+    // Both sides resolved: `path` is, and a song's folder need not be (one
+    // built from a path through a linked songs folder). The plain
+    // comparison first, so the folders are canonicalized only when no
+    // song's matches as written.
+    let songs = player.songs().list();
+    let song = songs
+        .iter()
+        .find(|song| path.starts_with(song.base_path()))
+        .or_else(|| {
+            songs.iter().find(|song| {
+                song.base_path()
+                    .canonicalize()
+                    .is_ok_and(|base| path.starts_with(base))
+            })
+        })?;
     song.lighting_tempo_map()
 }
 
@@ -1006,9 +1489,11 @@ fn song_tempo_for_path(
 /// These are the logical groups declared under `dmx.lighting.groups`. Venues no
 /// longer define groups of their own — fixtures carry tags, and logical groups
 /// select on them — so this is the only list a show can target.
-pub(super) async fn get_lighting_groups(State(state): State<WebUiState>) -> impl IntoResponse {
-    let Some(system) = state
-        .player
+pub(crate) async fn lighting_groups(
+    player: &crate::player::Player,
+    config_path: &std::path::Path,
+) -> Result<LightingGroups, Answer> {
+    let Some(system) = player
         .dmx_engine()
         .and_then(|dmx| dmx.broadcast_handles().lighting_system)
     else {
@@ -1016,7 +1501,7 @@ pub(super) async fn get_lighting_groups(State(state): State<WebUiState>) -> impl
         // case for editing a show. The groups are declared in the player config,
         // not by the engine, so the names are still knowable; only the fixtures
         // each resolves to are not.
-        return groups_from_config(&state.config_path).await;
+        return groups_from_config(config_path, &player.layers()).await;
     };
 
     // The lighting system's mutex is shared with the effects loop thread, and
@@ -1027,31 +1512,381 @@ pub(super) async fn get_lighting_groups(State(state): State<WebUiState>) -> impl
             .logical_groups_iter()
             .map(|(n, _)| n.clone())
             .collect();
-        let mut out: Vec<serde_json::Value> = names
+        let mut out: Vec<LightingGroup> = names
             .into_iter()
-            .map(|name| {
-                let fixtures = guard.resolve_logical_group_graceful(&name);
-                json!({"name": name, "fixtures": fixtures})
+            .map(|name| LightingGroup {
+                fixtures: guard.resolve_logical_group_graceful(&name),
+                name,
             })
             .collect();
-        out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     })
     .await;
 
     match groups {
-        Ok(groups) => Json(json!({"groups": groups})).into_response(),
-        Err(e) => (
+        Ok(groups) => Ok(LightingGroups {
+            groups,
+            layers: player.layers().names().to_vec(),
+            resolved: None,
+        }),
+        Err(e) => Err(Answer::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to resolve groups: {e}")})),
-        )
-            .into_response(),
+            format!("Failed to resolve groups: {e}"),
+        )),
     }
+}
+
+/// The facts behind the Lighting overview's five checks: does the show
+/// reach the lights?
+///
+/// Facts, not verdicts. The UI turns them into ready / needs attention /
+/// blocked / unknown, so the wording and the rules live in one place. Every
+/// piece is something mtrack already knows: the loaded lighting system, the
+/// songs' parsed shows, the same lint MCP's `validate_lighting` runs, and the
+/// olad patch probe. All of it is blocking (the lighting-system mutex is shared
+/// with the effects loop, the probe is HTTP), so it runs off the async worker.
+pub(crate) async fn readiness(
+    player: std::sync::Arc<crate::player::Player>,
+) -> Result<crate::webui::wire::readiness::Readiness, Answer> {
+    tokio::task::spawn_blocking(move || readiness_report(&player))
+        .await
+        .map_err(|e| {
+            Answer::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to gather readiness: {e}"),
+            )
+        })
+}
+
+/// The facts and suggestions behind the "Fit shows" page: for each group the
+/// shows use, what it needs and what would satisfy it; the focus points the
+/// shows aim at that the venue lacks; and the universes with no output. The
+/// suggestion rules live in `lighting::fit`, shared with MCP's
+/// `suggest_group_tags`. Blocking (lighting-system mutex, olad probe), so off
+/// the async worker.
+pub(crate) async fn fit(
+    player: std::sync::Arc<crate::player::Player>,
+) -> Result<crate::lighting::fit::FitReport, Answer> {
+    tokio::task::spawn_blocking(move || crate::lighting::fit::FitReport::gather(&player))
+        .await
+        .map_err(|e| {
+            Answer::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to gather fit: {e}"),
+            )
+        })
+}
+
+/// What a song's shows would be doing at each of `times` (song seconds),
+/// offline: the Preview mode's data.
+///
+/// Each evaluation carries the live `state` message's `fixtures`, `poses` and
+/// `cells` (built by the same helper, so the 3D scene is fed one shape from
+/// both sources) plus `active_effects` with the groups each cue named. The
+/// fixtures no cue targets are the same for every instant and come once,
+/// beside the evaluations, as `untouched`. Runs the song's registered shows
+/// through `evaluate_with_system` — the function MCP's `evaluate_show` uses —
+/// and never touches the DMX engine's effect engine, so a playing song plays
+/// on.
+pub(crate) async fn evaluate_song(
+    player: &crate::player::Player,
+    song: &str,
+    times: &[f64],
+) -> Result<crate::webui::wire::preview::Preview, Answer> {
+    let error = |status: StatusCode, message: String| Answer::new(status, message);
+    if times.iter().any(|t| !t.is_finite() || *t < 0.0) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "times must be non-negative seconds".to_string(),
+        ));
+    }
+
+    let songs = player.songs();
+    // A song whose lighting fails to parse never loads: the registry
+    // keeps its failure, and the message says why.
+    let song_loaded = songs.get(song)?;
+    let shows = crate::lighting::evaluate::registered_shows(&song_loaded);
+    if shows.is_empty() {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            format!("song `{song}` has no lighting loaded"),
+        ));
+    }
+    let tempo = song_loaded.lighting_tempo_map();
+    // Duration::from_secs_f64 panics on what it cannot hold; the evaluator
+    // bounds the count and the latest instant itself. Collected rather than
+    // sized up front: a capacity taken from the request is what CodeQL flags.
+    let times: Vec<std::time::Duration> = match times
+        .iter()
+        .map(|t| crate::util::duration_from_secs(*t))
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(times) => times,
+        None => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                crate::lighting::evaluate::EvaluateError::TimeOutOfRange.to_string(),
+            ))
+        }
+    };
+    let lighting_system = player
+        .dmx_engine()
+        .and_then(|dmx| dmx.broadcast_handles().lighting_system);
+
+    // The lighting system is a `parking_lot` mutex shared with the effects
+    // loop, and evaluation is pure CPU besides: off the async worker.
+    let evaluated = tokio::task::spawn_blocking(move || {
+        crate::lighting::evaluate::evaluate_with_system(
+            shows,
+            tempo.as_ref(),
+            &times,
+            lighting_system.as_deref(),
+        )
+    })
+    .await;
+    let evaluated = match evaluated {
+        Ok(Ok(evaluated)) => evaluated,
+        Ok(Err(e)) => return Err(error(StatusCode::BAD_REQUEST, e.to_string())),
+        Err(e) => {
+            return Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to evaluate: {e}"),
+            ))
+        }
+    };
+
+    use crate::webui::wire::preview::{Preview, PreviewEffect, PreviewEvaluation};
+    let untouched = evaluated
+        .venue_fixtures
+        .iter()
+        .filter(|name| !evaluated.targeted.contains(*name))
+        .cloned()
+        .collect();
+    let layers = player.layers();
+    let evaluations = evaluated
+        .evaluations
+        .iter()
+        .map(|evaluation| PreviewEvaluation {
+            time: evaluation.time.as_secs_f64(),
+            frame: super::super::state::stage_frame(&evaluation.fixtures, &evaluation.poses),
+            active_effects: evaluation
+                .active_effects
+                .iter()
+                .map(|effect| PreviewEffect {
+                    id: effect.id.clone(),
+                    groups: evaluated.effect_groups.get(&effect.id).cloned(),
+                    kind: effect.effect_type.to_string(),
+                    layer: layers.display_name(effect.layer),
+                    elapsed: effect.elapsed.as_secs_f64(),
+                    duration: effect.duration.as_secs_f64(),
+                    fixtures: effect.fixtures.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(Preview {
+        song: song.to_string(),
+        evaluations,
+        untouched,
+        venue_error: evaluated.venue_error,
+    })
+}
+
+/// The readiness facts for the player's running profile.
+fn readiness_report(player: &crate::player::Player) -> crate::webui::wire::readiness::Readiness {
+    use crate::lighting::readiness::{group_names, VenueFacts};
+    use crate::webui::wire::readiness::*;
+    use std::collections::BTreeSet;
+
+    // Shows are reported with or without DMX: a laptop with no DMX output is
+    // where shows are written, and a show that does not load is broken there
+    // too. Everything that needs a venue or an output is empty without one.
+    let dmx = player.dmx_engine();
+    let configured = dmx
+        .as_ref()
+        .map(|d| d.configured_universes())
+        .unwrap_or_default();
+
+    // Every song with lighting, and the shows its files hold.
+    let songs = player.songs();
+    let with_lighting = crate::lighting::readiness::songs_with_lighting(&songs);
+    let all_shows: Vec<lighting::parser::LightShow> = with_lighting
+        .iter()
+        .flat_map(|(_, shows)| shows.iter().cloned())
+        .collect();
+    let names = group_names(&all_shows);
+
+    // The lighting system, under its lock for as short a time as it takes to
+    // read what the sections below need.
+    let mut facts = VenueFacts::default();
+    let mut venue = None;
+    let mut in_use: BTreeSet<String> = BTreeSet::new();
+    let mut unresolved = Vec::new();
+    let mut library = Vec::new();
+    let mut used_universes: BTreeSet<u16> = BTreeSet::new();
+    if let Some(system) = dmx
+        .as_ref()
+        .and_then(|d| d.broadcast_handles().lighting_system)
+    {
+        let mut guard = system.lock();
+        facts = VenueFacts::collect(&mut guard, &names, Some(&configured));
+        // The library's own findings: two archives that would share a name,
+        // an archive that cannot be read. Neither stops a load.
+        library = guard.library_findings().to_vec();
+        if let Some(current) = guard.get_current_venue() {
+            let mut fixtures: Vec<&lighting::types::Fixture> =
+                current.fixtures().values().collect();
+            fixtures.sort_by(|a, b| a.name().cmp(b.name()));
+            for fixture in &fixtures {
+                used_universes.insert(fixture.universe());
+                match guard.fixture_problem(current.name(), fixture) {
+                    None => {
+                        in_use.insert(fixture.fixture_type().to_string());
+                    }
+                    Some(reason) => unresolved.push(UnresolvedFixture {
+                        fixture: fixture.name().to_string(),
+                        fixture_type: fixture.fixture_type().to_string(),
+                        reason,
+                    }),
+                }
+            }
+            venue = Some(ReadinessVenue {
+                name: current.name().to_string(),
+                fixtures: fixtures.len(),
+                placed: fixtures.iter().filter(|f| f.position().is_some()).count(),
+                focus_points: current.focus_points().keys().cloned().collect(),
+            });
+        }
+    }
+
+    let groups: Vec<ReadinessGroup> = names
+        .iter()
+        .filter(|_| dmx.is_some())
+        .map(|name| ReadinessGroup {
+            name: name.clone(),
+            fixtures: facts.group_fixture_counts.get(name).copied().unwrap_or(0),
+            songs: with_lighting
+                .iter()
+                .filter(|(_, shows)| group_names(shows).contains(name))
+                .map(|(song, _)| song.name().to_string())
+                .collect(),
+        })
+        .collect();
+
+    let mut shows: Vec<ReadinessShow> = with_lighting
+        .iter()
+        .map(|(song, shows)| {
+            let warnings: Vec<_> = facts
+                .lint(shows, Some(song))
+                .into_iter()
+                // Venue-level: the Output and Venue sections already carry
+                // them, and repeating them under every song would say each
+                // once per song.
+                .filter(|w| {
+                    !matches!(
+                        w.kind,
+                        "unconfigured-universe" | "patch-overlap" | "patch-overrun"
+                    )
+                })
+                .collect();
+            let files: Vec<String> = song
+                .dsl_lighting_shows()
+                .iter()
+                .map(|dsl| {
+                    let path = dsl.file_path();
+                    path.strip_prefix(song.base_path())
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            ReadinessShow {
+                song: song.name().to_string(),
+                files,
+                error: None,
+                warnings,
+            }
+        })
+        .collect();
+    // A song whose show does not parse never loads (`Song::new` fails as a
+    // whole), so it is not in the list above: the player recorded the failure,
+    // with the parser's own message, and that is the error.
+    for failure in songs.failures() {
+        if failure.concerns_lighting() {
+            shows.push(ReadinessShow {
+                song: failure.name().to_string(),
+                files: Vec::new(),
+                error: Some(failure.error().to_string()),
+                warnings: Vec::new(),
+            });
+        }
+    }
+    shows.sort_by(|a, b| a.song.cmp(&b.song));
+
+    let unconfigured: Vec<u16> = used_universes
+        .iter()
+        .copied()
+        .filter(|u| !configured.contains(u))
+        .collect();
+
+    // Ask olad about the universes the venue streams to, when there are any,
+    // else about everything configured. A universe with no output configured is
+    // never streamed to, so asking olad about it would only repeat the
+    // `unconfigured` finding. Nothing to ask means no answer, not a reachable
+    // olad.
+    let to_probe: Vec<u16> = if used_universes.is_empty() {
+        configured.clone()
+    } else {
+        used_universes
+            .iter()
+            .copied()
+            .filter(|u| configured.contains(u))
+            .collect()
+    };
+    let olad = match &dmx {
+        Some(dmx) if !to_probe.is_empty() => {
+            let report = dmx.olad().probe(&to_probe);
+            Some(OladPatch {
+                reachable: report.reachable,
+                unpatched: report.unpatched,
+            })
+        }
+        _ => None,
+    };
+
+    // The venue's own findings: whether it loads at all (one fixture that
+    // cannot be driven fails the whole venue, and nothing lights), and
+    // fixtures patched over each other or past the universe's end.
+    let mut report = Readiness {
+        dmx: dmx.is_some(),
+        venue,
+        venue_error: facts.venue_error,
+        patch_warnings: facts.patch_warnings,
+        fixture_types: ReadinessTypes {
+            in_use: in_use.into_iter().collect(),
+            unresolved,
+            library,
+        },
+        groups,
+        shows,
+        output: ReadinessOutput {
+            universes: used_universes.into_iter().collect(),
+            unconfigured,
+            olad,
+        },
+        checks: Vec::new(),
+    };
+    report.checks = report.verdicts();
+    report
 }
 
 /// The logical group names declared under `dmx.lighting.groups`, read from the
 /// player config when no engine is running to resolve them against.
-async fn groups_from_config(config_path: &std::path::Path) -> axum::response::Response {
+async fn groups_from_config(
+    config_path: &std::path::Path,
+    layers: &crate::lighting::effects::LayerSet,
+) -> Result<LightingGroups, Answer> {
     // codeql[rust/path-injection] config_path is set at startup, not user input.
     let path = config_path.to_path_buf();
     // A parse failure is reported, not swallowed. `.ok()` here answered
@@ -1062,8 +1897,7 @@ async fn groups_from_config(config_path: &std::path::Path) -> axum::response::Re
         crate::config::Player::deserialize(&path)
             .map(|player| {
                 player
-                    .dmx()
-                    .and_then(|dmx| dmx.lighting())
+                    .host_lighting()
                     .map(|lighting| {
                         let mut names: Vec<String> = lighting.groups().keys().cloned().collect();
                         names.sort();
@@ -1078,212 +1912,311 @@ async fn groups_from_config(config_path: &std::path::Path) -> axum::response::Re
     let names = match loaded {
         Ok(Ok(names)) => names,
         Ok(Err(e)) => {
-            return (
+            return Err(Answer::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!(
-                        "no DMX engine is running, and the player config could not be read \
-                         to list the declared groups: {e}"
-                    )
-                })),
-            )
-                .into_response();
+                format!(
+                    "no DMX engine is running, and the player config could not be read \
+                     to list the declared groups: {e}"
+                ),
+            ));
         }
         Err(e) => {
-            return (
+            return Err(Answer::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("reading the player config failed: {e}")})),
-            )
-                .into_response();
+                format!("reading the player config failed: {e}"),
+            ));
         }
     };
 
-    let groups: Vec<serde_json::Value> = names
+    let groups = names
         .into_iter()
-        .map(|name| json!({"name": name, "fixtures": []}))
-        .collect();
-    Json(json!({"groups": groups, "resolved": false})).into_response()
-}
-
-/// GET /api/lighting/venues — lists all venues from the directory.
-pub(super) async fn get_venues(
-    State(state): State<WebUiState>,
-    Query(query): Query<LightingDirQuery>,
-) -> impl IntoResponse {
-    let dir = resolve_lighting_dir(&state.config_path, query.dir.as_deref(), DEFAULT_VENUES_DIR)
-        .map_err(|e| e.into_response())?;
-    if !dir.is_dir() {
-        return Ok::<_, axum::response::Response>(
-            (StatusCode::OK, Json(json!({"venues": {}}))).into_response(),
-        );
-    }
-    let all = super::helpers::spawn_blocking_io("load venues", move || {
-        let mut all = std::collections::HashMap::new();
-        let mut duplicates = DuplicateNames::new("venue");
-        // Both extensions, as the lighting system loads them — so the same
-        // name can arrive from a `.light` and a `.venue`.
-        let mut errors = load_light_files_from_dir(&dir, VENUE_EXTENSIONS, |content, path| {
-            let venues = lighting::parser::parse_venues(content)?;
-            let file = crate::util::filename_display(path).to_string();
-            for (name, venue) in venues {
-                if !duplicates.claim(&name, &file) {
-                    continue;
-                }
-                all.insert(name, venue);
-            }
-            Ok(())
+        .map(|name| LightingGroup {
+            name,
+            fixtures: vec![],
         })
-        .map_err(|e| e.to_string())?;
-        errors.append(&mut duplicates.errors);
-        Ok::<_, String>((all, errors))
+        .collect();
+    Ok(LightingGroups {
+        groups,
+        layers: layers.names().to_vec(),
+        resolved: Some(false),
     })
-    .await?;
-    let (all, errors) = all;
-    Ok((
-        StatusCode::OK,
-        Json(json!({"venues": all, "errors": errors})),
-    )
-        .into_response())
 }
 
-/// GET /api/lighting/venues/:name — returns a single venue.
-pub(super) async fn get_venue(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Query(query): Query<LightingDirQuery>,
-) -> impl IntoResponse {
-    validate_lighting_name(&name)?;
-    let dir = resolve_lighting_dir(&state.config_path, query.dir.as_deref(), DEFAULT_VENUES_DIR)?;
-    let Some(file_path) = existing_venue_file(&dir, &name) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Venue not found: {}", name)})),
-        )
-            .into_response());
-    };
-    let fp = file_path.clone();
-    let content =
-        super::helpers::spawn_blocking_io("read venue file", move || std::fs::read_to_string(&fp))
-            .await?;
-    let venues = lighting::parser::parse_venues(&content).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to parse venue: {}", e)})),
-        )
-            .into_response()
-    })?;
-    match venues.get(&name) {
-        Some(v) => Ok((StatusCode::OK, Json(json!({"venue": v, "dsl": content}))).into_response()),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Venue '{}' not found in file", name)})),
-        )
-            .into_response()),
+/// Every venue of the directory `dir` (else this host's) with its file and
+/// its version, and the files that did not read. A directory that is not
+/// there lists nothing; one that leads outside the project is refused.
+pub(crate) async fn list_venues(
+    config_path: &std::path::Path,
+    dir: Option<&str>,
+) -> Result<VenueList, Answer> {
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::Venues)?;
+    if !dir.is_dir() {
+        return Ok(VenueList {
+            venues: Default::default(),
+            owners: Default::default(),
+            errors: None,
+            versions: None,
+        });
     }
-}
-
-/// PUT /api/lighting/venues/:name — creates or updates a venue.
-pub(super) async fn put_venue(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Query(query): Query<LightingDirQuery>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> impl IntoResponse {
-    validate_lighting_name(&name)?;
-    let dir = resolve_lighting_dir(&state.config_path, query.dir.as_deref(), DEFAULT_VENUES_DIR)?;
-
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let dsl = if content_type.contains("application/json") {
-        let json_body: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("Invalid JSON: {}", e)})),
-            )
-                .into_response()
-        })?;
-        venue_json_to_dsl(&name, &json_body)
-            .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response())?
-    } else {
-        String::from_utf8(body.to_vec()).map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Invalid UTF-8"})),
-            )
-                .into_response()
-        })?
-    };
-
-    // Validate the DSL parses correctly
-    let venues = lighting::parser::parse_venues(&dsl).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Invalid venue DSL: {}", e)})),
-        )
-            .into_response()
-    })?;
-    require_declared_name("venue", &name, &venues)?;
-    let typed = venues.values().any(needs_venue_extension);
-
-    let dir = super::helpers::ensure_configured_dir(&dir, &state).await?;
-    // The extension is the version marker: a venue using positions, focus
-    // points or MVR provenance is a `.venue`; anything else stays `.light`.
-    // An existing file keeps its extension unless the content outgrows it,
-    // in which case the `.light` twin is retired after the durable write.
-    let stem = sanitize_filename(&name);
-    let existing = existing_venue_file(&dir, &name);
-    let file_path = match &existing {
-        Some(path) if !typed || path.extension().is_some_and(|e| e == "venue") => path.clone(),
-        _ => dir.join(format!("{stem}.{}", if typed { "venue" } else { "light" })),
-    };
-    let stale_twin = existing.filter(|path| path != &file_path);
-    let fp = file_path;
-    let dsl_owned = dsl;
-    super::helpers::spawn_blocking_io("write venue", move || {
-        config_io::staged_write(&fp, &dsl_owned)?;
-        if let Some(twin) = stale_twin {
-            // Best effort: the save is durable already, and a leftover
-            // `.light` twin surfaces as a duplicate venue name at load.
-            if let Err(e) = std::fs::remove_file(&twin) {
-                tracing::warn!(file = %twin.display(), error = %e, "could not retire the venue's .light twin");
+    let all = super::helpers::blocking_answer("load venues", move || {
+        // The lighting system's own reader: both extensions, the directory
+        // and its subdirectories, the first file to claim a name keeps it.
+        let read = lighting::project_files::venues(&dir);
+        let mut all = std::collections::HashMap::new();
+        let mut versions = std::collections::HashMap::new();
+        let mut owners = std::collections::HashMap::new();
+        for declared in read.items {
+            if let Ok(bytes) = crate::util::read_file(&declared.file) {
+                versions.insert(declared.name.clone(), content_version(&bytes));
             }
+            if let Some(owner) = read.record.owner(&declared.name) {
+                owners.insert(
+                    declared.name.clone(),
+                    lighting_writes::wire_owner(Kind::Venue, &dir, &owner),
+                );
+            }
+            all.insert(declared.name, declared.item);
         }
-        Ok::<(), String>(())
+        let errors: Vec<LightingFileError> = read
+            .problems
+            .iter()
+            .map(|p| LightingFileError {
+                file: lighting::project_files::display_in(&dir, &p.file),
+                error: p.error.clone(),
+            })
+            .collect();
+        Ok::<_, String>((all, owners, errors, versions))
     })
     .await?;
+    let (all, owners, errors, versions) = all;
+    Ok(VenueList {
+        venues: all,
+        owners,
+        errors: Some(errors),
+        versions: Some(versions),
+    })
+}
 
-    let reloaded = reload_if_current_venue(&state, &name).await;
+/// One venue, from the file the loader read it from, with that file's text
+/// and version. A file that does not parse is never searched for it. 404
+/// when no file declares `name`.
+pub(crate) async fn read_venue(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+) -> Result<VenueDetail, Answer> {
+    validate_lighting_name(name)?;
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::Venues)?;
+    let found = {
+        let (dir, name) = (dir.clone(), name.to_string());
+        super::helpers::blocking_answer("read venue file", move || {
+            let read = lighting::project_files::venues(&dir);
+            let Some(declared) = read.get(&name) else {
+                return Ok(None);
+            };
+            crate::util::read_file(&declared.file)
+                .map(|bytes| Some((declared.item.clone(), bytes)))
+                .map_err(|e| format!("cannot read {}: {e}", declared.file.display()))
+        })
+        .await?
+    };
+    let Some((venue, bytes)) = found else {
+        return Err(Answer::new(
+            StatusCode::NOT_FOUND,
+            format!("Venue not found: {}", name),
+        ));
+    };
+    Ok(VenueDetail {
+        venue,
+        version: content_version(&bytes),
+        dsl: String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
 
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({"status": "saved", "name": name, "reloaded": reloaded})),
-        )
-            .into_response(),
-    )
+/// A venue save, as a caller asks it.
+pub(crate) struct VenueSaveAsk<'a> {
+    pub name: &'a str,
+    /// A rename's old name.
+    pub from: Option<&'a str>,
+    pub dir: Option<&'a str>,
+    /// The version the venue was read at; a file at another is refused (409,
+    /// `conflict`).
+    pub expected: Option<String>,
+    pub body: VenueBody,
+}
+
+/// What a venue save writes.
+pub(crate) enum VenueBody {
+    /// The whole file.
+    Text(String),
+    /// The structured venue, which patches the file.
+    Form(VenueForm),
+}
+
+/// Creates, updates or renames a venue.
+///
+/// By the one rule for venue files ([`super::lighting_writes`]): a new name
+/// is claimed at `<venues dir>/<stem>.venue`; an existing one is written
+/// only where its file is that venue's alone, and refused (409, with the
+/// file and why) otherwise. `from` renames: a file at the old name's
+/// canonical place moves to the new name's, any other is renamed in place.
+/// A structured venue patches the file (never regenerates an existing one);
+/// a text body is the whole file, and must declare this one venue and
+/// nothing else. An `expected` version, when given, must be the file's
+/// current one (409, `conflict`, otherwise); the answer carries the new
+/// `version`.
+pub(crate) async fn put_venue(
+    player: &std::sync::Arc<crate::player::Player>,
+    config_path: &std::path::Path,
+    ask: VenueSaveAsk<'_>,
+) -> Result<crate::webui::wire::venue::VenueSaved, Answer> {
+    let VenueSaveAsk {
+        name,
+        from,
+        dir,
+        expected,
+        body,
+    } = ask;
+    validate_lighting_name(name)?;
+    if let Some(from) = from {
+        validate_lighting_name(from)?;
+    }
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::Venues)?;
+
+    let (body, needs_new_format) = match body {
+        VenueBody::Form(form) => {
+            let venue = venue_from_form(name, &form).map_err(Answer::bad)?;
+            let needs = lighting_writes::needs_venue_extension(&venue);
+            let renamed_to = name.to_string();
+            let subject = from.unwrap_or(name).to_string();
+            let renaming = !lighting::files::same_name(&subject, name);
+            // An existing file is patched, not regenerated: comments, TODO
+            // lines and the file's own layout survive a save from the UI.
+            let edit: lighting_writes::Edit = Box::new(move |current| {
+                let patched = match current {
+                    // Patched under the name it has, then renamed.
+                    Some(text) => venue_from_form(&subject, &form)
+                        .and_then(|as_is| {
+                            lighting::venue_patch::patch_venue(text, &subject, &as_is)
+                        })
+                        .and_then(|patched| {
+                            if renaming {
+                                lighting::venue_patch::rename_venue(&patched, &subject, &renamed_to)
+                            } else {
+                                Ok(patched)
+                            }
+                        }),
+                    None => venue_form_to_dsl(&renamed_to, &form),
+                };
+                patched.map_err(lighting_writes::Answer::bad)
+            });
+            (lighting_writes::Body::Edit(edit), Some(needs))
+        }
+        VenueBody::Text(text) => (lighting_writes::Body::Text(text), None),
+    };
+
+    let save = lighting_writes::VenueSave {
+        project: crate::util::project_dir_of(config_path),
+        dir: dir.clone(),
+        name: name.to_string(),
+        from: from.map(str::to_string),
+        expected,
+        needs_new_format,
+        body,
+    };
+    let saved = super::helpers::blocking_answer("write venue", move || {
+        Ok::<_, String>(lighting_writes::save_venue(save))
+    })
+    .await??;
+    let version = content_version(saved.text.as_bytes());
+
+    let reloaded = reload_if_current_venue(player, name).await;
+    let venue_error = venue_error_of(player, config_path, name, &dir).await;
+
+    Ok(crate::webui::wire::venue::VenueSaved {
+        status: "saved".to_string(),
+        name: name.to_string(),
+        reloaded,
+        version,
+        venue_error,
+    })
+}
+
+/// After a venue save: when the saved venue is the current one and no
+/// longer loads — a fixture whose type or mode cannot be driven fails the
+/// whole venue, and then nothing lights — the fixture and why, as
+/// `{venue, fixture, reason}`; `None` otherwise. The save stands either
+/// way; this is what the editor shows beside it. Read from the running
+/// engine after its reload, or, with no engine (a laptop), from the
+/// project's files for the venue the config names as current. `player`'s
+/// config is at `config_path`; MCP's writes answer it too.
+pub(crate) async fn venue_error_of(
+    player: &std::sync::Arc<crate::player::Player>,
+    config_path: &std::path::Path,
+    name: &str,
+    venues_dir: &std::path::Path,
+) -> Option<crate::lighting::findings::VenueError> {
+    let player = player.clone();
+    let config_path = config_path.to_path_buf();
+    let venue = name.to_string();
+    let venues_dir = venues_dir.to_path_buf();
+    let found = tokio::task::spawn_blocking(move || {
+        if let Some(system) = player.broadcast_handles().and_then(|h| h.lighting_system) {
+            let guard = system.lock();
+            if guard.current_venue() != Some(venue.as_str()) {
+                return None;
+            }
+            return guard.venue_problem(&venue);
+        }
+        // codeql[rust/path-injection] config_path is set at startup, not user input.
+        let config = crate::config::Player::deserialize(&config_path).ok()?;
+        let lighting = config.host_lighting()?;
+        if lighting.current_venue() != Some(venue.as_str()) {
+            return None;
+        }
+        let root = canonical_project_root(&project_root(&config_path).ok()?).ok()?;
+        let types = lighting.fixture_types_dir();
+        let system = system_from_files(&root, &root.join(types), &venues_dir).ok()?;
+        system.venue_problem(&venue)
+    })
+    .await
+    .ok()
+    .flatten();
+    found.map(|(fixture, reason)| crate::lighting::findings::VenueError {
+        venue: name.to_string(),
+        fixture,
+        reason,
+    })
 }
 
 /// After a venue file changed on disk: if it is the venue the running engine
-/// is playing against, re-read it and push fresh stage metadata to every
-/// web client. Returns whether that happened. A reload failure is logged,
+/// is playing against, re-read it and tell every stage watcher. Returns whether that happened. A reload failure is logged,
 /// not returned — the save itself is durable and the loader will say the
 /// same thing at next startup.
-async fn reload_if_current_venue(state: &WebUiState, name: &str) -> bool {
-    let is_current = state
-        .player
-        .broadcast_handles()
-        .and_then(|h| h.lighting_system)
-        .is_some_and(|system| system.lock().current_venue() == Some(name));
-    if !is_current {
-        return false;
-    }
-    let player = state.player.clone();
-    match tokio::task::spawn_blocking(move || player.reload_current_venue()).await {
-        Ok(Ok(())) => true,
+pub(crate) async fn reload_if_current_venue(
+    player: &std::sync::Arc<crate::player::Player>,
+    name: &str,
+) -> bool {
+    // The lighting system's lock is a blocking mutex and the reload reads
+    // and parses files, so both stay off the async workers.
+    let player = player.clone();
+    let venue = name.to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let is_current = player
+            .broadcast_handles()
+            .and_then(|h| h.lighting_system)
+            .is_some_and(|system| system.lock().current_venue() == Some(venue.as_str()));
+        if !is_current {
+            return Ok(false);
+        }
+        player
+            .reload_current_venue()
+            .map(|()| true)
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(reloaded)) => reloaded,
         Ok(Err(e)) => {
             tracing::warn!(venue = name, error = %e, "venue saved, but the running engine could not reload it");
             false
@@ -1295,152 +2228,68 @@ async fn reload_if_current_venue(state: &WebUiState, name: &str) -> bool {
     }
 }
 
-/// DELETE /api/lighting/venues/:name — deletes a venue file.
-pub(super) async fn delete_venue(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Query(query): Query<LightingDirQuery>,
-) -> impl IntoResponse {
-    validate_lighting_name(&name)?;
-    let dir = resolve_lighting_dir(&state.config_path, query.dir.as_deref(), DEFAULT_VENUES_DIR)?;
-    let Some(file_path) = existing_venue_file(&dir, &name) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Venue not found: {}", name)})),
-        )
-            .into_response());
-    };
-    let fp = file_path;
-    super::helpers::spawn_blocking_io("delete venue", move || std::fs::remove_file(&fp)).await?;
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({"status": "deleted", "name": name})),
-        )
-            .into_response(),
-    )
+/// Deletes a venue file: only one that is the venue's alone (409
+/// otherwise, with the file and why).
+pub(crate) async fn delete_venue(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+) -> Result<(), Answer> {
+    validate_lighting_name(name)?;
+    let dir = resolve_lighting_dir(config_path, dir, LightingDir::Venues)?;
+    let wanted = name.to_string();
+    super::helpers::blocking_answer("delete venue", move || {
+        Ok::<_, String>(lighting_writes::delete_venue(&dir, &wanted))
+    })
+    .await??;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Lighting helpers
 // ---------------------------------------------------------------------------
 
-/// Reads every file of the given extensions from a directory, calling the
-/// processor with each one's content and path.
-fn load_light_files_from_dir(
-    dir: &std::path::Path,
-    extensions: &[&str],
-    mut processor: impl FnMut(&str, &std::path::Path) -> Result<(), Box<dyn std::error::Error>>,
-) -> Result<Vec<FileError>, Box<dyn std::error::Error>> {
-    let mut errors = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let extension = path.extension().and_then(|e| e.to_str());
-        if path.is_file() && extension.is_some_and(|e| extensions.contains(&e)) {
-            let content = std::fs::read_to_string(&path)?;
-            // Per-file, not fatal: a directory is a set of independent files,
-            // and one that no longer parses must not hide the rest. The caller
-            // reports them so the UI can say which file and why.
-            if let Err(e) = processor(&content, &path) {
-                errors.push(FileError {
-                    file: crate::util::filename_display(&path).to_string(),
-                    error: e.to_string(),
-                });
-            }
-        }
-    }
-    Ok(errors)
-}
-
-/// A file in a lighting directory that could not be parsed, reported alongside
-/// the ones that could.
-#[derive(serde::Serialize)]
-struct FileError {
-    file: String,
-    error: String,
-}
-
-/// Tracks which file each name came from while a directory's files are
-/// merged. A directory is a set of independent files, and two of them can
-/// claim the same name — across the two extensions especially. Last-wins
-/// would show one file and hide the other while the lighting system
-/// registers the name twice, so the first file to claim a name keeps it and
-/// the clash is reported against both.
-struct DuplicateNames {
-    kind: &'static str,
-    seen: std::collections::HashMap<String, String>,
-    errors: Vec<FileError>,
-}
-
-impl DuplicateNames {
-    fn new(kind: &'static str) -> Self {
-        Self {
-            kind,
-            seen: std::collections::HashMap::new(),
-            errors: Vec::new(),
-        }
-    }
-
-    /// Whether this name is still free. A name already taken is recorded as
-    /// an error naming both files, and the caller skips it.
-    fn claim(&mut self, name: &str, file: &str) -> bool {
-        if let Some(previous) = self.seen.get(name) {
-            self.errors.push(FileError {
-                file: file.to_string(),
-                error: format!(
-                    "{} \"{}\" is defined in both {} and {}",
-                    self.kind, name, previous, file
-                ),
-            });
-            return false;
-        }
-        self.seen.insert(name.to_string(), file.to_string());
-        true
-    }
-}
-
-/// Converts a name to a safe filename (lowercase, spaces to underscores).
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            ' ' => '_',
-            c if c.is_alphanumeric() || c == '_' || c == '-' => c,
-            _ => '_',
-        })
-        .collect::<String>()
-        .to_lowercase()
-}
-
-/// Converts a JSON fixture type definition to DSL format.
-fn fixture_type_json_to_dsl(name: &str, json: &serde_json::Value) -> Result<String, String> {
-    let channels = json
-        .get("channels")
-        .and_then(|v| v.as_object())
-        .ok_or("Missing 'channels' object")?;
-
+/// Converts the channel-map form of a fixture type to DSL.
+fn channel_map_to_dsl(name: &str, form: &ChannelMap) -> Result<String, String> {
     let mut dsl = format!("fixture_type \"{name}\" {{\n");
-    dsl.push_str(&format!("  channels: {}\n", channels.len()));
+    dsl.push_str(&format!("  channels: {}\n", form.channels.len()));
     dsl.push_str("  channel_map: {\n");
 
-    let mut entries: Vec<(&String, &serde_json::Value)> = channels.iter().collect();
-    entries.sort_by_key(|(_, v)| v.as_u64().unwrap_or(0));
+    let mut entries: Vec<(&String, &u32)> = form.channels.iter().collect();
+    entries.sort_by_key(|(_, offset)| **offset);
+    // The editor's own check of its rows (`venue_rows`), its first finding
+    // the refusal.
+    let rows: Vec<_> = entries
+        .iter()
+        .map(|(ch_name, offset)| lighting::venue_rows::ChannelRow {
+            name: ch_name.to_string(),
+            offset: Some(f64::from(**offset)),
+        })
+        .collect();
+    if let Some(found) = lighting::venue_rows::channel_row_problems(&rows).first() {
+        use lighting::venue_rows::ChannelProblem;
+        let name = &rows[found.row as usize].name;
+        return Err(match found.problems[0] {
+            ChannelProblem::NoName => "A channel has no name".to_string(),
+            ChannelProblem::DuplicateName => format!("Channel '{name}' listed more than once"),
+            ChannelProblem::BadOffset => {
+                format!("Channel '{name}' offset must be from 1 to 65535")
+            }
+        });
+    }
     for (i, (ch_name, ch_offset)) in entries.iter().enumerate() {
-        let offset = ch_offset
-            .as_u64()
-            .ok_or(format!("Channel '{}' offset must be a number", ch_name))?;
         let comma = if i + 1 < entries.len() { "," } else { "" };
-        dsl.push_str(&format!("    \"{ch_name}\": {offset}{comma}\n"));
+        dsl.push_str(&format!("    \"{ch_name}\": {ch_offset}{comma}\n"));
     }
     dsl.push_str("  }\n");
 
-    if let Some(v) = json.get("max_strobe_frequency").and_then(|v| v.as_f64()) {
+    if let Some(v) = form.max_strobe_frequency {
         dsl.push_str(&format!("  max_strobe_frequency: {v}\n"));
     }
-    if let Some(v) = json.get("min_strobe_frequency").and_then(|v| v.as_f64()) {
+    if let Some(v) = form.min_strobe_frequency {
         dsl.push_str(&format!("  min_strobe_frequency: {v}\n"));
     }
-    if let Some(v) = json.get("strobe_dmx_offset").and_then(|v| v.as_u64()) {
+    if let Some(v) = form.strobe_dmx_offset {
         dsl.push_str(&format!("  strobe_dmx_offset: {v}\n"));
     }
 
@@ -1448,543 +2297,320 @@ fn fixture_type_json_to_dsl(name: &str, json: &serde_json::Value) -> Result<Stri
     Ok(dsl)
 }
 
-/// Converts a JSON venue definition to DSL format.
-fn venue_json_to_dsl(name: &str, json: &serde_json::Value) -> Result<String, String> {
-    use lighting::types::{Fixture, Vec3, Venue, VenueSource};
+/// The addresses each fixture of a venue occupies, from the files, with no
+/// DMX engine needed (venues are authored on laptops): each fixture's span
+/// from its own mode's expansion (a native type's channels, a GDTF type's
+/// mode distilled through the cache), and the venue's overlaps and overruns
+/// as `lighting::patch` finds them. A fixture whose type or mode does not
+/// load has a `null` footprint and is left out of the checks — never guessed
+/// at. The venue inspector checks a candidate address or mode against these
+/// spans before it saves. 404 for a venue the files do not declare.
+pub(crate) async fn get_venue_patch(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+    fixture_types_dir: Option<&str>,
+) -> Result<crate::webui::wire::venue::VenuePatch, Answer> {
+    validate_lighting_name(name)?;
+    let venues_dir = resolve_lighting_dir(config_path, dir, LightingDir::Venues)?;
+    let types_dir =
+        resolve_lighting_dir(config_path, fixture_types_dir, LightingDir::FixtureTypes)?;
+    let root = canonical_project_root(&project_root(config_path)?)?;
+    let name = name.to_string();
+    let outcome = super::helpers::blocking_answer("read venue patch", move || {
+        let system = system_from_files(&root, &types_dir, &venues_dir)?;
+        let Some(venue) = system
+            .venues_iter()
+            .find(|(n, _)| **n == name)
+            .map(|(_, v)| v)
+        else {
+            return Ok::<_, String>(None);
+        };
+        Ok(Some(venue_patch(&system, venue)))
+    })
+    .await?;
+    outcome.ok_or_else(|| Answer::new(StatusCode::NOT_FOUND, "Venue not found"))
+}
 
-    fn vec3(value: &serde_json::Value, what: &str) -> Result<Vec3, String> {
-        let items = value
-            .as_array()
-            .filter(|a| a.len() == 3)
-            .ok_or_else(|| format!("{what} must be [x, y, z]"))?;
-        let mut out = [0.0; 3];
-        for (slot, item) in out.iter_mut().zip(items) {
-            *slot = item
-                .as_f64()
-                .filter(|v| v.is_finite())
-                .ok_or_else(|| format!("{what} must be [x, y, z] numbers"))?;
-        }
-        Ok(out)
+/// What the 3D view draws for a venue, read from the files with no engine
+/// needed: the shape of the stage's metadata for the current venue (each
+/// fixture's type, mode, position, rotation and rig; the venue's focus
+/// points and scenery), so a venue that is not the current one can be looked
+/// at in 3D. Loading the system distils each (archive, mode) rig into the
+/// store, as the engine's load does; a fixture whose type or mode does not
+/// load has no rig and is drawn generically. 404 for a venue the files do
+/// not declare.
+pub(crate) async fn get_venue_scene(
+    config_path: &std::path::Path,
+    name: &str,
+    dir: Option<&str>,
+    fixture_types_dir: Option<&str>,
+) -> Result<VenueScene, Answer> {
+    validate_lighting_name(name)?;
+    let venues_dir = resolve_lighting_dir(config_path, dir, LightingDir::Venues)?;
+    let types_dir =
+        resolve_lighting_dir(config_path, fixture_types_dir, LightingDir::FixtureTypes)?;
+    let root = canonical_project_root(&project_root(config_path)?)?;
+    let name = name.to_string();
+    let outcome = super::helpers::blocking_answer("read venue scene", move || {
+        let system = system_from_files(&root, &types_dir, &venues_dir)?;
+        let Some(venue) = system
+            .venues_iter()
+            .find(|(n, _)| **n == name)
+            .map(|(_, v)| v)
+        else {
+            return Ok::<_, String>(None);
+        };
+        Ok(Some(venue_scene(&system, venue)))
+    })
+    .await?;
+    outcome.ok_or_else(|| Answer::new(StatusCode::NOT_FOUND, "Venue not found"))
+}
+
+/// The scene answer for one venue of a loaded system.
+fn venue_scene(
+    system: &lighting::system::LightingSystem,
+    venue: &lighting::types::Venue,
+) -> VenueScene {
+    let fixtures = venue
+        .fixtures()
+        .iter()
+        .map(|(name, fixture)| {
+            let rig = system
+                .resolve_fixture_type(fixture)
+                .ok()
+                .and_then(|t| t.rig().map(str::to_string));
+            let scene = SceneFixture {
+                placement: FixturePlacement {
+                    tags: fixture.tags().to_vec(),
+                    fixture_type: fixture.fixture_type().to_string(),
+                    position: fixture.position(),
+                    rotation: fixture.rotation(),
+                    beam_angle: fixture.beam_angle(),
+                    rig,
+                },
+                mode: fixture.mode().map(String::from),
+            };
+            (name.clone(), scene)
+        })
+        .collect();
+    VenueScene {
+        fixtures,
+        venue: super::super::state::stage_venue(system, venue),
     }
-    fn optional_vec3(fix: &serde_json::Value, key: &str) -> Result<Option<Vec3>, String> {
-        match fix.get(key) {
-            None | Some(serde_json::Value::Null) => Ok(None),
-            Some(value) => vec3(value, key).map(Some),
+}
+
+/// A lighting system loaded from a project's type and venue files alone, as
+/// the engine would load them, with no venue made current (so the loader
+/// reports nothing on its behalf).
+pub(super) fn system_from_files(
+    root: &std::path::Path,
+    types_dir: &std::path::Path,
+    venues_dir: &std::path::Path,
+) -> Result<lighting::system::LightingSystem, String> {
+    let display = |p: &std::path::Path| p.to_string_lossy().into_owned();
+    let config = crate::config::Lighting::new(
+        None,
+        None,
+        Some(crate::config::lighting::Directories::new(
+            types_dir.is_dir().then(|| display(types_dir)),
+            venues_dir.is_dir().then(|| display(venues_dir)),
+        )),
+    );
+    let mut system = lighting::system::LightingSystem::new();
+    system.load(&config, root).map_err(|e| e.to_string())?;
+    Ok(system)
+}
+
+/// The patch answer for one venue of a loaded system.
+fn venue_patch(
+    system: &lighting::system::LightingSystem,
+    venue: &lighting::types::Venue,
+) -> crate::webui::wire::venue::VenuePatch {
+    use crate::webui::wire::venue::{PatchedFixture, VenuePatch};
+    let spans = venue
+        .fixtures_by_patch()
+        .into_iter()
+        .map(|fixture| PatchedFixture {
+            fixture: fixture.name().to_string(),
+            universe: fixture.universe(),
+            address: fixture.start_channel(),
+            footprint: system
+                .resolve_fixture_type(fixture)
+                .ok()
+                .map(|t| t.footprint()),
+            fixture_type: fixture.fixture_type().to_string(),
+            mode: fixture.mode().map(String::from),
+        })
+        .collect();
+    let known = system.patch_spans(venue);
+    VenuePatch {
+        spans,
+        overlaps: lighting::patch::venue_overlaps(&known),
+        overruns: lighting::patch::venue_overruns(&known),
+    }
+}
+
+/// A venue as a caller structures it, to be saved.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VenueForm {
+    pub fixtures: Vec<FormFixture>,
+    pub focus_points: std::collections::BTreeMap<String, lighting::types::Vec3>,
+    pub source: Option<lighting::types::VenueSource>,
+}
+
+/// A fixture of a [`VenueForm`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FormFixture {
+    pub name: String,
+    pub fixture_type: String,
+    pub universe: u32,
+    pub start_channel: u32,
+    pub tags: Vec<String>,
+    pub position: Option<lighting::types::Vec3>,
+    pub rotation: Option<lighting::types::Vec3>,
+    pub mode: Option<String>,
+    pub beam_angle: Option<f64>,
+}
+
+/// Converts a structured venue definition to DSL format.
+fn venue_form_to_dsl(name: &str, form: &VenueForm) -> Result<String, String> {
+    venue_from_form(name, form).map(|venue| format!("{venue}\n"))
+}
+
+/// Builds the venue a structured save describes.
+fn venue_from_form(name: &str, form: &VenueForm) -> Result<lighting::types::Venue, String> {
+    use lighting::types::{Fixture, Vec3, Venue};
+
+    /// A point whose figures are all finite numbers.
+    fn finite(v: Vec3, what: &str) -> Result<Vec3, String> {
+        if v.iter().all(|x| x.is_finite()) {
+            Ok(v)
+        } else {
+            Err(format!("{what} must be [x, y, z] numbers"))
         }
+    }
+    fn optional_vec3(v: Option<Vec3>, what: &str) -> Result<Option<Vec3>, String> {
+        v.map(|v| finite(v, what)).transpose()
     }
 
-    let fixtures = json
-        .get("fixtures")
-        .and_then(|v| v.as_array())
-        .ok_or("Missing 'fixtures' array")?;
+    let rows: Vec<_> = form
+        .fixtures
+        .iter()
+        .map(|fix| lighting::venue_rows::VenueRow {
+            name: fix.name.clone(),
+            fixture_type: fix.fixture_type.clone(),
+            universe: Some(f64::from(fix.universe)),
+            start_channel: Some(f64::from(fix.start_channel)),
+            mode: None,
+        })
+        .collect();
+    // A row the editor could not name or address is refused, not saved as
+    // a fixture nobody can address (or dropped without a word), by the
+    // editor's own check of its rows (`venue_rows`).
+    if let Some(found) = lighting::venue_rows::venue_row_problems(&rows, |_| false).first() {
+        use lighting::venue_rows::RowProblem;
+        let row = &rows[found.row as usize];
+        let name = &row.name;
+        return Err(match found.problems[0] {
+            RowProblem::NoName => "A fixture has no name".to_string(),
+            RowProblem::DuplicateName => format!("Fixture '{name}' listed more than once"),
+            RowProblem::NoType | RowProblem::NoMode => {
+                format!("Fixture '{name}' has no fixture type")
+            }
+            RowProblem::BadUniverse if row.universe == Some(0.0) => {
+                format!("Fixture '{name}': universe must be 1 or more")
+            }
+            RowProblem::BadUniverse => "Fixture 'universe' out of range".to_string(),
+            RowProblem::BadAddress if row.start_channel == Some(0.0) => {
+                format!("Fixture '{name}': start channel must be 1 or more")
+            }
+            RowProblem::BadAddress => "Fixture 'start_channel' out of range".to_string(),
+        });
+    }
 
     let mut by_name = std::collections::HashMap::new();
-    for fix in fixtures {
-        let fix_name = fix
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or("Fixture missing 'name'")?;
-        let fix_type = fix
-            .get("fixture_type")
-            .and_then(|v| v.as_str())
-            .ok_or("Fixture missing 'fixture_type'")?;
-        let universe = fix
-            .get("universe")
-            .and_then(|v| v.as_u64())
-            .ok_or("Fixture missing 'universe'")?;
-        let start_channel = fix
-            .get("start_channel")
-            .and_then(|v| v.as_u64())
-            .ok_or("Fixture missing 'start_channel'")?;
-        let tags: Vec<String> = fix
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|tags| {
-                tags.iter()
-                    .filter_map(|t| t.as_str())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+    for (fix, row) in form.fixtures.iter().zip(&rows) {
+        let (fix_name, fix_type) = (row.name.as_str(), row.fixture_type.as_str());
         let fixture = Fixture::new(
             fix_name.to_string(),
             fix_type.to_string(),
-            u16::try_from(universe).map_err(|_| "Fixture 'universe' out of range")?,
-            u16::try_from(start_channel).map_err(|_| "Fixture 'start_channel' out of range")?,
-            tags,
+            // Both in 1..=65535, by the check above.
+            row.universe.unwrap_or_default() as u16,
+            row.start_channel.unwrap_or_default() as u16,
+            fix.tags.clone(),
         )
-        .with_position(optional_vec3(fix, "position")?)
-        .with_rotation(optional_vec3(fix, "rotation")?);
-        if by_name.insert(fix_name.to_string(), fixture).is_some() {
-            return Err(format!("Fixture '{fix_name}' listed more than once"));
-        }
+        .with_position(optional_vec3(fix.position, "position")?)
+        .with_rotation(optional_vec3(fix.rotation, "rotation")?)
+        // What the unit really throws, in degrees (a drawing hint); absent
+        // is the type's own. Dropping it here would silently lose it.
+        .with_beam_angle(match fix.beam_angle {
+            None => None,
+            Some(angle) => Some(
+                Some(angle)
+                    .filter(|v| lighting::fixture_data::beam_angle_valid(*v))
+                    .ok_or_else(|| {
+                        format!(
+                            "Fixture '{fix_name}': 'beam_angle' must be a number of degrees, \
+                             greater than 0 and at most {}, or null",
+                            lighting::fixture_data::MAX_BEAM_ANGLE
+                        )
+                    })?,
+            ),
+        })
+        // The fixture's own GDTF mode (§21); absent is the type's default.
+        // Dropping it here would silently re-mode the fixture.
+        .with_mode(match &fix.mode {
+            None => None,
+            Some(mode) => Some(
+                Some(mode.as_str())
+                    .filter(|m| !m.trim().is_empty())
+                    .ok_or("Fixture 'mode' must be a non-empty string or null")?
+                    .to_string(),
+            ),
+        });
+        by_name.insert(fix_name.to_string(), fixture);
     }
 
     let mut focus_points = std::collections::BTreeMap::new();
-    if let Some(points) = json.get("focus_points").and_then(|v| v.as_object()) {
-        for (focus_name, point) in points {
-            focus_points.insert(focus_name.clone(), vec3(point, "focus point")?);
-        }
+    for (focus_name, point) in &form.focus_points {
+        focus_points.insert(focus_name.clone(), finite(*point, "focus point")?);
     }
-    let source = match json.get("source") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(source) => Some(VenueSource {
-            mvr: source
-                .get("mvr")
-                .and_then(|v| v.as_str())
-                .ok_or("source missing 'mvr'")?
-                .to_string(),
-            origin: match source.get("origin") {
-                None | Some(serde_json::Value::Null) => [0.0; 3],
-                Some(origin) => vec3(origin, "source origin")?,
-            },
+    let source = match &form.source {
+        None => None,
+        Some(source) => Some(lighting::types::VenueSource {
+            mvr: source.mvr.clone(),
+            origin: finite(source.origin, "source origin")?,
         }),
     };
 
-    let venue = Venue::new(name.to_string(), by_name)
+    Ok(Venue::new(name.to_string(), by_name)
         .with_focus_points(focus_points)
-        .with_source(source);
-    Ok(format!("{venue}\n"))
+        .with_source(source))
 }
 
 #[cfg(test)]
 mod test {
-    use super::super::router;
-    use super::super::test_helpers::*;
     use super::*;
-    use axum::body::Body;
-    use axum::http::StatusCode;
-    use tower::ServiceExt;
 
-    /// With no DMX device, the group names still come back — from the config.
-    ///
-    /// Authoring on a laptop is the normal case for editing a show, and the
-    /// groups are declared under `dmx.lighting.groups` in the player config, not
-    /// by the engine. Answering `{"groups": []}` there emptied the cue-target
-    /// autocomplete with no error to explain it, because the endpoint only read
-    /// them off a live engine.
-    #[tokio::test]
-    async fn lighting_groups_come_from_the_config_without_a_dmx_engine() {
-        let (state, dir) = test_state();
-        std::fs::write(
-            &state.config_path,
-            "songs: songs\ndmx:\n  universes:\n    - universe: 1\n      name: main\n  \
-             lighting:\n    groups:\n      front_wash:\n        \
-             name: front_wash\n        constraints:\n          - AllOf: [\"wash\"]\n      \
-             back_wash:\n        name: back_wash\n        constraints:\n          \
-             - AllOf: [\"back\"]\n",
-        )
-        .unwrap();
-        let _keep = dir;
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/groups")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response_body(response).await).unwrap();
-        let names: Vec<&str> = parsed["groups"]
-            .as_array()
-            .expect("groups")
-            .iter()
-            .filter_map(|g| g["name"].as_str())
-            .collect();
-        assert_eq!(
-            names,
-            vec!["back_wash", "front_wash"],
-            "the declared groups must be listed even with no engine to resolve them"
-        );
-        // Flagged as unresolved: the names are knowable without an engine, the
-        // fixtures each resolves to are not, and a caller has to be able to tell
-        // "no fixtures" from "not asked yet".
-        assert_eq!(parsed["resolved"], serde_json::json!(false));
-        for group in parsed["groups"].as_array().expect("groups") {
-            assert!(group["fixtures"].as_array().expect("fixtures").is_empty());
-        }
-    }
-
-    /// A config that will not load is reported, not answered as "no groups".
-    ///
-    /// The fallback exists because an empty list was indistinguishable from a
-    /// rig with nothing declared. Swallowing a parse error with `.ok()` put that
-    /// exact ambiguity back one layer down — a missing `dmx.universes` read as
-    /// an empty autocomplete with no explanation.
-    #[tokio::test]
-    async fn a_config_that_does_not_load_is_reported_not_answered_empty() {
-        let (state, dir) = test_state();
-        // `dmx.universes` is required, so this parses as YAML and fails to load
-        // as config — the shape most likely to be hit by hand-editing.
-        std::fs::write(
-            &state.config_path,
-            "songs: songs\ndmx:\n  lighting:\n    groups:\n      wash:\n        name: wash\n",
-        )
-        .unwrap();
-        let _keep = dir;
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/groups")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response_body(response).await).unwrap();
-        assert!(
-            parsed["error"]
-                .as_str()
-                .is_some_and(|e| e.contains("could not be read")),
-            "the reason must reach the caller: {parsed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_lighting_files_empty() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["files"].is_array());
-    }
-
-    #[tokio::test]
-    async fn get_lighting_files_with_files() {
-        let (state, _dir) = test_state();
-        std::fs::write(state.songs_path.join("show.light"), "content").unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["files"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn get_lighting_files_sorted() {
-        let (state, _dir) = test_state();
-        std::fs::write(state.songs_path.join("z_show.light"), "content").unwrap();
-        std::fs::write(state.songs_path.join("a_show.light"), "content").unwrap();
-        std::fs::write(state.songs_path.join("m_show.light"), "content").unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let files = parsed["files"].as_array().unwrap();
-        assert_eq!(files.len(), 3);
-        let paths: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
-        assert_eq!(paths, vec!["a_show.light", "m_show.light", "z_show.light"]);
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_success() {
-        let (state, _dir) = test_state();
-        std::fs::write(state.songs_path.join("show.light"), "light content").unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/show.light")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        assert_eq!(body, "light content");
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_path_traversal() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/..%2F..%2Fetc%2Fpasswd")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_symlink_escape() {
-        let (state, _dir) = test_state();
-        let outside_dir = tempfile::tempdir().unwrap();
-        let secret_file = outside_dir.path().join("secret.light");
-        std::fs::write(&secret_file, "secret content").unwrap();
-        std::os::unix::fs::symlink(&secret_file, state.songs_path.join("evil.light")).unwrap();
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/evil.light")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        assert!(
-            status == StatusCode::FORBIDDEN
-                || status == StatusCode::BAD_REQUEST
-                || status == StatusCode::NOT_FOUND,
-            "expected rejection for symlink escape, got {status}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_not_found() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/nonexistent.light")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_unreadable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (state, _dir) = test_state();
-        let file = state.songs_path.join("unreadable.light");
-        std::fs::write(&file, "content").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/unreadable.light")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn validate_lighting_valid() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let body = r#"
-show "test" {
-    @00:00.000
-    lights: static color: "red", duration: 5s
-}
-"#;
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/lighting/validate")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["valid"], true);
-    }
-
-    #[tokio::test]
-    async fn validate_lighting_invalid() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/lighting/validate")
-                    .body(Body::from("invalid {{{ content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_lighting_file_valid() {
-        let (state, _dir) = test_state();
-        let file_path = state.songs_path.join("new.light");
-        let content =
-            "show \"test\" {\n    @00:00.000\n    lights: static color: \"red\", duration: 5s\n}\n";
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/new.light")
-                    .body(Body::from(content))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn put_lighting_file_path_traversal() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/..%2F..%2Fevil.light")
-                    .body(Body::from("content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn get_lighting_files_missing_dir() {
-        let (mut state, _dir) = test_state();
-        state.songs_path = std::path::PathBuf::from("/nonexistent/songs");
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn put_lighting_file_outside_base() {
-        let (state, _dir) = test_state();
-        let outside_dir = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside_dir.path(), state.songs_path.join("escape")).unwrap();
-
-        let content =
-            "show \"test\" {\n    @00:00.000\n    lights: static color: \"red\", duration: 5s\n}\n";
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/escape%2Fevil.light")
-                    .body(Body::from(content))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        assert!(
-            status == StatusCode::FORBIDDEN
-                || status == StatusCode::BAD_REQUEST
-                || status == StatusCode::NOT_FOUND,
-            "expected rejection for symlink escape, got {status}"
-        );
-    }
-
-    #[tokio::test]
-    async fn put_lighting_file_invalid_dsl() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/test.light")
-                    .body(Body::from("invalid {{{ content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    #[test]
+    fn a_path_is_within_a_dir_by_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let venues = dir.path().join("lighting/venues");
+        std::fs::create_dir_all(&venues).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        std::os::unix::fs::symlink(&venues, dir.path().join("alias")).unwrap();
+        let within = |p: &str| crate::util::is_within_dir(&dir.path().join(p), &venues);
+        assert!(within("lighting/venues/new.light"));
+        assert!(within("lighting/venues/deep/er/new.light"));
+        assert!(within("other/../lighting/venues/new.light"));
+        assert!(within("alias/new.light"));
+        assert!(!within("other/new.light"));
+        assert!(!within("lighting/new.light"));
+        assert!(!crate::util::is_within_dir(
+            &dir.path().join("x"),
+            &dir.path().join("missing")
+        ));
     }
 
     #[test]
@@ -2001,12 +2627,25 @@ show "test" {
         find_light_files(base, base, &mut results).unwrap();
 
         assert_eq!(results.len(), 2);
-        let paths: Vec<&str> = results
-            .iter()
-            .map(|r| r["path"].as_str().unwrap())
-            .collect();
+        let paths: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
         assert!(paths.contains(&"song1/show.light"));
         assert!(paths.contains(&"top.light"));
+    }
+
+    /// A light show's extension is read in any case: `Show.LIGHT` is listed,
+    /// as `songs --init` registers it.
+    #[test]
+    fn find_light_files_reads_extensions_in_any_case() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Show.LIGHT"), "content").unwrap();
+        std::fs::write(dir.path().join("show.lights"), "content").unwrap();
+
+        let mut results = Vec::new();
+        find_light_files(dir.path(), dir.path(), &mut results).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "Show.LIGHT");
+        assert_eq!(results[0].name, "Show");
     }
 
     #[test]
@@ -2026,7 +2665,7 @@ show "test" {
         find_light_files(dir.path(), dir.path(), &mut results).unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["name"].as_str().unwrap(), "my_show");
+        assert_eq!(results[0].name, "my_show");
     }
 
     #[test]
@@ -2042,7 +2681,7 @@ show "test" {
         find_light_files(base, base, &mut results).unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["path"].as_str().unwrap(), "a/b/c/deep.light");
+        assert_eq!(results[0].path, "a/b/c/deep.light");
     }
 
     #[test]
@@ -2071,230 +2710,7 @@ show "test" {
         find_light_files(base, base, &mut results).unwrap();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["name"].as_str().unwrap(), "show");
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_path_traversal_via_dotdot() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/..%2Fpasswd")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Path traversal: expect rejection (NOT_FOUND, FORBIDDEN, or BAD_REQUEST).
-        let status = response.status();
-        assert!(
-            status == StatusCode::NOT_FOUND
-                || status == StatusCode::FORBIDDEN
-                || status == StatusCode::BAD_REQUEST,
-            "expected rejection, got {status}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_not_found_body_contains_name() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/missing.light")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("Lighting file not found"));
-    }
-
-    #[tokio::test]
-    async fn get_lighting_file_unreadable_body_contains_message() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (state, _dir) = test_state();
-        let file = state.songs_path.join("broken.light");
-        std::fs::write(&file, "content").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/broken.light")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to read lighting file"));
-    }
-
-    #[tokio::test]
-    async fn put_lighting_file_path_traversal_returns_invalid_path() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/..%2Fevil.light")
-                    .body(Body::from(
-                        "show \"test\" {\n    @00:00.000\n    lights: static color: \"red\", duration: 5s\n}\n",
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let status = response.status();
-        assert!(
-            status == StatusCode::NOT_FOUND
-                || status == StatusCode::FORBIDDEN
-                || status == StatusCode::BAD_REQUEST,
-            "expected rejection for path traversal, got {status}"
-        );
-    }
-
-    #[tokio::test]
-    async fn put_lighting_file_write_failure_returns_500() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (state, _dir) = test_state();
-        let sub = state.songs_path.join("readonly");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
-
-        let content =
-            "show \"test\" {\n    @00:00.000\n    lights: static color: \"red\", duration: 5s\n}\n";
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/readonly%2Ftest.light")
-                    .body(Body::from(content))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["error"].is_string());
-    }
-
-    #[tokio::test]
-    async fn get_lighting_files_scan_error_returns_500() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (state, _dir) = test_state();
-        let sub = state.songs_path.join("unreadable_dir");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to scan for lighting files"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Helper function to create a fixture type DSL string for tests.
-    // -----------------------------------------------------------------------
-    fn sample_fixture_type_dsl(name: &str) -> String {
-        format!(
-            r#"fixture_type "{name}" {{
-  channels: 3
-  channel_map: {{
-    "red": 1,
-    "green": 2,
-    "blue": 3
-  }}
-}}"#
-        )
-    }
-
-    /// The rich channel form, which only a `.fixture` file may hold.
-    fn sample_rich_fixture_type_dsl(name: &str) -> String {
-        format!(
-            "fixture_type \"{name}\" {{\n  channel \"pan\" @ 1 fine 2 range -270deg..270deg\n}}\n"
-        )
-    }
-
-    /// A GDTF-referential type. It parses without the archive — expansion
-    /// happens in the lighting system, so its `channels` map is empty here.
-    fn sample_referential_fixture_type_dsl(name: &str) -> String {
-        format!(
-            "fixture_type \"{name}\" from gdtf(\"library/synth.gdtf\", mode \"8: RGBS\") {{\n}}\n"
-        )
-    }
-
-    // Helper function to create a venue DSL string for tests.
-    fn sample_venue_dsl(name: &str) -> String {
-        format!(
-            r#"venue "{name}" {{
-  fixture "Spot1" GenericPar @ 1:1
-  fixture "Spot2" GenericPar @ 1:5
-}}"#
-        )
-    }
-
-    // -----------------------------------------------------------------------
-    // Unit tests: sanitize_filename
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn sanitize_filename_removes_special_chars() {
-        assert_eq!(sanitize_filename("hello world"), "hello_world");
-        assert_eq!(sanitize_filename("My-Fixture_01"), "my-fixture_01");
-        assert_eq!(sanitize_filename("a/b\\c.d!e"), "a_b_c_d_e");
-        assert_eq!(sanitize_filename("UPPER"), "upper");
-        assert_eq!(sanitize_filename(""), "");
+        assert_eq!(results[0].name, "show");
     }
 
     // -----------------------------------------------------------------------
@@ -2306,6 +2722,14 @@ show "test" {
         assert!(validate_lighting_name("my-fixture").is_ok());
         assert!(validate_lighting_name("Venue_01").is_ok());
         assert!(validate_lighting_name("simple").is_ok());
+    }
+
+    #[test]
+    fn validate_lighting_name_rejects_route_segments() {
+        for name in ["lock", "validate", "activate"] {
+            assert!(validate_lighting_name(name).is_err(), "{name}");
+        }
+        assert!(validate_lighting_name("locker").is_ok());
     }
 
     #[test]
@@ -2335,15 +2759,15 @@ show "test" {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn fixture_type_json_to_dsl_basic() {
-        let json = serde_json::json!({
-            "channels": {
-                "red": 1,
-                "green": 2,
-                "blue": 3
-            }
-        });
-        let dsl = fixture_type_json_to_dsl("TestFixture", &json).unwrap();
+    fn channel_map_to_dsl_basic() {
+        let form = ChannelMap {
+            channels: [("red", 1), ("green", 2), ("blue", 3)]
+                .into_iter()
+                .map(|(n, o)| (n.to_string(), o))
+                .collect(),
+            ..Default::default()
+        };
+        let dsl = channel_map_to_dsl("TestFixture", &form).unwrap();
         assert!(dsl.contains("fixture_type \"TestFixture\""));
         assert!(dsl.contains("channels: 3"));
         assert!(dsl.contains("\"red\": 1"));
@@ -2355,17 +2779,17 @@ show "test" {
     }
 
     #[test]
-    fn fixture_type_json_to_dsl_with_strobe() {
-        let json = serde_json::json!({
-            "channels": {
-                "dimmer": 1,
-                "strobe": 2
-            },
-            "max_strobe_frequency": 25.0,
-            "min_strobe_frequency": 0.5,
-            "strobe_dmx_offset": 10
-        });
-        let dsl = fixture_type_json_to_dsl("StrobeLight", &json).unwrap();
+    fn channel_map_to_dsl_with_strobe() {
+        let form = ChannelMap {
+            channels: [("dimmer", 1), ("strobe", 2)]
+                .into_iter()
+                .map(|(n, o)| (n.to_string(), o))
+                .collect(),
+            max_strobe_frequency: Some(25.0),
+            min_strobe_frequency: Some(0.5),
+            strobe_dmx_offset: Some(10),
+        };
+        let dsl = channel_map_to_dsl("StrobeLight", &form).unwrap();
         assert!(dsl.contains("max_strobe_frequency: 25"));
         assert!(dsl.contains("min_strobe_frequency: 0.5"));
         assert!(dsl.contains("strobe_dmx_offset: 10"));
@@ -2375,29 +2799,32 @@ show "test" {
         assert_eq!(ft.max_strobe_frequency(), Some(25.0));
     }
 
-    #[test]
-    fn fixture_type_json_to_dsl_missing_channels() {
-        let json = serde_json::json!({"foo": "bar"});
-        assert!(fixture_type_json_to_dsl("Bad", &json).is_err());
+    // -----------------------------------------------------------------------
+    // Unit tests: venue_form_to_dsl
+    // -----------------------------------------------------------------------
+
+    /// A fixture row of a venue form: `name`, `fixture_type`, 1:`start_channel`.
+    fn form_fixture(name: &str, fixture_type: &str, start_channel: u32) -> FormFixture {
+        FormFixture {
+            name: name.to_string(),
+            fixture_type: fixture_type.to_string(),
+            universe: 1,
+            start_channel,
+            ..Default::default()
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // Unit tests: venue_json_to_dsl
-    // -----------------------------------------------------------------------
+    fn form_of(fixtures: Vec<FormFixture>) -> VenueForm {
+        VenueForm {
+            fixtures,
+            ..Default::default()
+        }
+    }
 
     #[test]
-    fn venue_json_to_dsl_basic() {
-        let json = serde_json::json!({
-            "fixtures": [
-                {
-                    "name": "Spot1",
-                    "fixture_type": "GenericPar",
-                    "universe": 1,
-                    "start_channel": 1
-                }
-            ]
-        });
-        let dsl = venue_json_to_dsl("TestVenue", &json).unwrap();
+    fn venue_form_to_dsl_basic() {
+        let form = form_of(vec![form_fixture("Spot1", "GenericPar", 1)]);
+        let dsl = venue_form_to_dsl("TestVenue", &form).unwrap();
         assert!(dsl.contains("venue \"TestVenue\""));
         assert!(dsl.contains("fixture \"Spot1\" GenericPar @ 1:1"));
         // Verify the DSL actually parses.
@@ -2406,19 +2833,52 @@ show "test" {
     }
 
     #[test]
-    fn venue_json_to_dsl_with_tags() {
-        let json = serde_json::json!({
-            "fixtures": [
-                {
-                    "name": "Wash1",
-                    "fixture_type": "Par",
-                    "universe": 1,
-                    "start_channel": 1,
-                    "tags": ["front", "wash"]
-                }
-            ]
-        });
-        let dsl = venue_json_to_dsl("Tagged", &json).unwrap();
+    fn venue_form_to_dsl_carries_beam_angle() {
+        let venue = |beam: Option<f64>| {
+            form_of(vec![FormFixture {
+                rotation: Some([60.0, 0.0, 0.0]),
+                beam_angle: beam,
+                ..form_fixture("Brick1", "Brick", 1)
+            }])
+        };
+        let dsl = venue_form_to_dsl("V", &venue(Some(60.0))).unwrap();
+        assert!(
+            dsl.contains("rotation (60, 0, 0) beam_angle 60\n"),
+            "after rotation, no trailing .0: {dsl}"
+        );
+        let dsl = venue_form_to_dsl("V", &venue(Some(22.5))).unwrap();
+        assert!(dsl.contains("beam_angle 22.5"), "{dsl}");
+
+        let dsl = venue_form_to_dsl("V", &venue(None)).unwrap();
+        assert!(!dsl.contains("beam_angle"), "{dsl}");
+
+        for bad in [0.0, -3.0, 181.0, f64::NAN, f64::INFINITY] {
+            let err = venue_form_to_dsl("V", &venue(Some(bad))).unwrap_err();
+            assert!(
+                err.contains("'beam_angle'") && err.contains("Brick1"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_venue_with_a_beam_angle_needs_the_venue_extension() {
+        let venue = lighting::parser::parse_venues(
+            "venue \"v\" {\n  fixture \"A\" T @ 1:1 beam_angle 60\n}\n",
+        )
+        .unwrap()
+        .remove("v")
+        .unwrap();
+        assert!(lighting_writes::needs_venue_extension(&venue));
+    }
+
+    #[test]
+    fn venue_form_to_dsl_with_tags() {
+        let form = form_of(vec![FormFixture {
+            tags: vec!["front".to_string(), "wash".to_string()],
+            ..form_fixture("Wash1", "Par", 1)
+        }]);
+        let dsl = venue_form_to_dsl("Tagged", &form).unwrap();
         assert!(dsl.contains("tags [\"front\", \"wash\"]"));
         // Verify the DSL actually parses.
         let venues = lighting::parser::parse_venues(&dsl).unwrap();
@@ -2428,23 +2888,11 @@ show "test" {
     }
 
     #[test]
-    fn venue_json_to_dsl_ignores_groups() {
-        // Venue groups are gone. A stale client still sending them must not
-        // produce a file the parser then rejects.
-        let json = serde_json::json!({
-            "fixtures": [
-                {
-                    "name": "L1",
-                    "fixture_type": "Par",
-                    "universe": 1,
-                    "start_channel": 1
-                }
-            ],
-            "groups": {
-                "front": ["L1"]
-            }
-        });
-        let dsl = venue_json_to_dsl("Grouped", &json).unwrap();
+    fn venue_form_to_dsl_emits_no_groups() {
+        // Venue groups are gone: a form has none to send, and the file the
+        // parser reads back has none.
+        let form = form_of(vec![form_fixture("L1", "Par", 1)]);
+        let dsl = venue_form_to_dsl("Grouped", &form).unwrap();
         assert!(
             !dsl.contains("group"),
             "groups should not be emitted: {dsl}"
@@ -2453,298 +2901,55 @@ show "test" {
     }
 
     #[test]
-    fn venue_json_to_dsl_missing_fixtures() {
-        let json = serde_json::json!({"foo": "bar"});
-        assert!(venue_json_to_dsl("Bad", &json).is_err());
+    fn venue_form_to_dsl_refuses_a_fixture_with_no_name() {
+        let form = form_of(vec![form_fixture("", "Par", 1)]);
+        assert!(venue_form_to_dsl("Bad", &form)
+            .unwrap_err()
+            .contains("no name"));
     }
 
     #[test]
-    fn venue_json_to_dsl_fixture_missing_name() {
-        let json = serde_json::json!({
-            "fixtures": [
-                {
-                    "fixture_type": "Par",
-                    "universe": 1,
-                    "start_channel": 1
-                }
-            ]
+    fn venue_form_to_dsl_refuses_a_figure_that_is_not_a_number() {
+        let at = |position, rotation| {
+            form_of(vec![FormFixture {
+                position,
+                rotation,
+                ..form_fixture("A", "Par", 1)
+            }])
+        };
+        let nan = [f64::NAN, 0.0, 0.0];
+        assert!(venue_form_to_dsl("V", &at(Some(nan), None))
+            .unwrap_err()
+            .contains("position"));
+        assert!(venue_form_to_dsl("V", &at(None, Some(nan)))
+            .unwrap_err()
+            .contains("rotation"));
+        let mut form = at(None, None);
+        form.focus_points.insert("drummer".to_string(), nan);
+        assert!(venue_form_to_dsl("V", &form)
+            .unwrap_err()
+            .contains("focus point"));
+        let mut form = at(None, None);
+        form.source = Some(lighting::types::VenueSource {
+            mvr: "a.mvr".to_string(),
+            origin: [f64::INFINITY, 0.0, 0.0],
         });
-        assert!(venue_json_to_dsl("Bad", &json).is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // Unit tests: load_light_files_from_dir
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn load_light_files_from_dir_processes_light_files() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.light"), sample_fixture_type_dsl("TypeA")).unwrap();
-        std::fs::write(dir.path().join("b.txt"), "not a light file").unwrap();
-
-        let mut count = 0;
-        load_light_files_from_dir(dir.path(), &["light"], |_content, _path| {
-            count += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(count, 1);
+        assert!(venue_form_to_dsl("V", &form)
+            .unwrap_err()
+            .contains("source origin"));
     }
 
     #[test]
-    fn load_light_files_from_dir_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut count = 0;
-        load_light_files_from_dir(dir.path(), &["light"], |_content, _path| {
-            count += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Fixture Types endpoint tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn get_fixture_types_empty() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_empty");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["fixture_types"].is_object());
-        assert_eq!(parsed["fixture_types"].as_object().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn get_fixture_types_nonexistent_dir() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/fixture-types?dir=nonexistent_dir")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["fixture_types"].as_object().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn get_fixture_types_with_files() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_test");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(
-            ft_dir.join("led_par.light"),
-            sample_fixture_type_dsl("LED_Par"),
-        )
-        .unwrap();
-        std::fs::write(
-            ft_dir.join("mover.fixture"),
-            sample_rich_fixture_type_dsl("Mover"),
-        )
-        .unwrap();
-        std::fs::write(
-            ft_dir.join("brick.fixture"),
-            sample_referential_fixture_type_dsl("Brick"),
-        )
-        .unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let par = &parsed["fixture_types"]["LED_Par"];
-        assert!(par["fixture_type"].is_object(), "{parsed}");
-        assert_eq!(par["file"], "led_par.light");
-        assert_eq!(par["extension"], "light");
-        assert_eq!(par["referential"], false);
-        assert_eq!(par["rich"], false);
-
-        let mover = &parsed["fixture_types"]["Mover"];
-        assert_eq!(mover["file"], "mover.fixture");
-        assert_eq!(mover["extension"], "fixture");
-        assert_eq!(mover["rich"], true);
-        assert_eq!(mover["referential"], false);
-
-        // A referential type has no channels of its own here; only the
-        // lighting system's expansion resolves them from the archive.
-        let brick = &parsed["fixture_types"]["Brick"];
-        assert_eq!(brick["referential"], true);
-        assert_eq!(brick["extension"], "fixture");
-        assert_eq!(
-            brick["fixture_type"]["channels"].as_object().unwrap().len(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn get_fixture_type_success() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_get");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(
-            ft_dir.join("led_par.light"),
-            sample_fixture_type_dsl("LED_Par"),
-        )
-        .unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types/LED_Par?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["fixture_type"].is_object());
-        assert!(parsed["dsl"].is_string());
-        assert_eq!(parsed["file"], "led_par.light");
-        assert_eq!(parsed["extension"], "light");
-        assert_eq!(parsed["referential"], false);
-        assert_eq!(parsed["rich"], false);
-    }
-
-    #[tokio::test]
-    async fn get_fixture_type_reads_a_fixture_file() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_get_fixture");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(
-            ft_dir.join("brick.fixture"),
-            sample_referential_fixture_type_dsl("Brick"),
-        )
-        .unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types/Brick?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["file"], "brick.fixture");
-        assert_eq!(parsed["extension"], "fixture");
-        assert_eq!(parsed["referential"], true);
-        assert!(
-            parsed["dsl"].as_str().unwrap().contains("from gdtf("),
-            "{parsed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_fixture_type_not_found() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_notfound");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types/nonexistent?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_raw_dsl() {
-        let (state, _dir) = test_state();
-        let rel = "ft_put_raw";
-        let app = router().with_state(state);
-
-        let dsl = sample_fixture_type_dsl("MyFixture");
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/MyFixture?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "saved");
-        assert_eq!(parsed["name"], "MyFixture");
-
-        // Verify file was created.
-        let file_path = _dir.path().join(rel).join("myfixture.light");
-        assert!(file_path.exists());
-    }
-
-    fn multipart_body(filename: &str, bytes: &[u8]) -> (String, Vec<u8>) {
-        let boundary = "mtrack-test-boundary";
-        let mut body = Vec::new();
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
-                .as_bytes(),
-        );
-        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
-        body.extend_from_slice(bytes);
-        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        (format!("multipart/form-data; boundary={boundary}"), body)
+    fn venue_form_to_dsl_refuses_a_blank_mode() {
+        for mode in ["", "  "] {
+            let form = form_of(vec![FormFixture {
+                mode: Some(mode.to_string()),
+                ..form_fixture("A", "Brick", 1)
+            }]);
+            assert!(venue_form_to_dsl("V", &form)
+                .unwrap_err()
+                .contains("'mode'"));
+        }
     }
 
     fn synthetic_gdtf_bytes() -> Vec<u8> {
@@ -2754,1514 +2959,95 @@ show "test" {
         )])
     }
 
-    #[tokio::test]
-    async fn inspect_gdtf_lists_modes_and_writes_nothing() {
-        let (state, dir) = test_state();
-        let app = router().with_state(state);
-        let (content_type, body) = multipart_body("synth.gdtf", &synthetic_gdtf_bytes());
+    // -----------------------------------------------------------------------
+    // A GDTF's modes, as the fixture page shows them
+    // -----------------------------------------------------------------------
 
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/lighting/gdtf/inspect")
-                    .header("content-type", content_type)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response_body(response).await).unwrap();
-        assert_eq!(parsed["fixture"], "Synth Brick");
-        assert!(
-            parsed["modes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|m| m["name"] == "8: RGBS"),
-            "{parsed}"
-        );
-        assert!(
-            !dir.path().join("lighting").exists(),
-            "inspect must not write"
-        );
+    async fn inspect(bytes: &[u8]) -> serde_json::Value {
+        json!(inspect_description(
+            &lighting::gdtf::parse_archive(bytes).unwrap()
+        ))
     }
 
     #[tokio::test]
-    async fn import_gdtf_writes_and_reports_through_the_shared_importer() {
-        let (state, dir) = test_state();
-        let app = router().with_state(state);
-        // A traversal-shaped filename must land as its final component only.
-        let (content_type, body) = multipart_body("../synth.gdtf", &synthetic_gdtf_bytes());
+    async fn inspect_gdtf_says_what_each_mode_can_do() {
+        let parsed = inspect(&synthetic_gdtf_bytes()).await;
+        let modes = parsed["modes"].as_array().unwrap();
+        let rgbs = modes.iter().find(|m| m["name"] == "8: RGBS").unwrap();
+        // RGB and a strobe, and a dimmer only as a virtual channel.
+        assert_eq!(rgbs["capabilities"], json!(["color", "strobe"]), "{rgbs}");
+        assert_eq!(rgbs["strobe_range"]["min_hz"], json!(0.4), "{rgbs}");
+        assert_eq!(rgbs["strobe_range"]["max_hz"], json!(25.0), "{rgbs}");
+        assert_eq!(rgbs["cells"], json!(0));
+        assert!(rgbs.get("refused").is_none());
+        assert!(rgbs["channels"]
+            .as_array()
+            .unwrap()
+            .contains(&json!([1, "red"])));
+        assert!(rgbs.get("warnings").is_none(), "nothing reads them");
 
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/lighting/gdtf/import?mode=8%3A%20RGBS&name=Brick")
-                    .header("content-type", content_type)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response_body(response).await).unwrap();
-        assert_eq!(parsed["type_name"], "Brick");
-        assert!(dir.path().join("lighting/library/synth.gdtf").exists());
-        assert!(
-            !dir.path().parent().unwrap().join("synth.gdtf").exists(),
-            "traversal filename must not escape the library"
-        );
-        assert!(dir
-            .path()
-            .join("lighting/fixture_types/brick.fixture")
-            .exists());
-        assert!(dir.path().join("lighting/.cache").is_dir());
+        let mover = modes.iter().find(|m| m["name"] == "Mover 16bit").unwrap();
+        assert_eq!(mover["capabilities"], json!(["pan_tilt"]), "{mover}");
+        assert!(mover.get("strobe_range").is_none());
+        assert_eq!(mover["footprint"], json!(5));
+    }
 
-        // A bad mode is the caller's error, not a server fault.
-        let (content_type, body) = multipart_body("synth.gdtf", &synthetic_gdtf_bytes());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/lighting/gdtf/import?mode=Nope")
-                    .header("content-type", content_type)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&response_body(response).await).unwrap();
+    #[tokio::test]
+    async fn inspect_gdtf_answers_every_mode_of_a_many_mode_archive() {
+        // A big real GDTF has dozens of modes; all of them are distilled (off
+        // the async worker) and reported.
+        let xml = crate::lighting::gdtf::SYNTHETIC_DESCRIPTION;
+        let start = xml.find("<DMXMode Name=\"8: RGBS\"").unwrap();
+        let end = start + xml[start..].find("</DMXMode>").unwrap() + "</DMXMode>".len();
+        let template = &xml[start..end];
+        let many: String = (1..=30)
+            .map(|n| template.replace("8: RGBS", &format!("Mode {n}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let xml = format!("{}{many}{}", &xml[..start], &xml[end..]);
+        let bytes = crate::lighting::gdtf::build_zip(&[("description.xml", xml.as_bytes())]);
+
+        let parsed = inspect(&bytes).await;
+        let modes = parsed["modes"].as_array().unwrap();
+        for n in 1..=30 {
+            let mode = modes
+                .iter()
+                .find(|m| m["name"] == format!("Mode {n}").as_str())
+                .unwrap_or_else(|| panic!("Mode {n} missing from {modes:?}"));
+            assert_eq!(mode["capabilities"], json!(["color", "strobe"]), "{mode}");
+            assert!(mode.get("refused").is_none(), "{mode}");
+        }
+        assert!(modes.iter().any(|m| m["name"] == "Mover 16bit"));
+        assert_eq!(modes.len(), 31);
+    }
+
+    #[tokio::test]
+    async fn inspect_gdtf_refuses_a_mode_it_cannot_tell_from_another() {
+        // Two modes with one name: an import takes the first, so the second
+        // is listed with its reason, not offered.
+        let xml = crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.replace("Mover 16bit", "8: RGBS");
+        let bytes = crate::lighting::gdtf::build_zip(&[("description.xml", xml.as_bytes())]);
+        let parsed = inspect(&bytes).await;
+        let modes = parsed["modes"].as_array().unwrap();
+        assert_eq!(modes.len(), 2);
+        assert!(modes[0].get("refused").is_none());
         assert!(
-            parsed["error"]
+            modes[1]["refused"]
                 .as_str()
                 .unwrap()
-                .contains("no mode matching"),
-            "{parsed}"
+                .contains("another mode"),
+            "{modes:?}"
         );
+        assert!(modes[1].get("capabilities").is_none());
     }
 
-    #[tokio::test]
-    async fn put_fixture_type_json() {
-        let (state, _dir) = test_state();
-        let rel = "ft_put_json";
-        let app = router().with_state(state);
-
-        let json_body = serde_json::json!({
-            "channels": {
-                "red": 1,
-                "green": 2,
-                "blue": 3
-            }
-        });
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/JSONFixture?dir={}", rel))
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&json_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "saved");
-
-        // Verify the file was created and contains valid DSL.
-        let file_path = _dir.path().join(rel).join("jsonfixture.light");
-        assert!(file_path.exists());
-        let content = std::fs::read_to_string(&file_path).unwrap();
-        let types = lighting::parser::parse_fixture_types(&content).unwrap();
-        assert!(types.contains_key("JSONFixture"));
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_invalid_name() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        // Empty name won't match the route, so test path traversal.
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/fixture-types/..%2Fevil?dir=ft_test")
-                    .header("content-type", "text/plain")
-                    .body(Body::from("content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_invalid_dsl() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/fixture-types/BadDSL?dir=ft_bad")
-                    .header("content-type", "text/plain")
-                    .body(Body::from("invalid {{{ content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_invalid_json() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/fixture-types/BadJSON?dir=ft_badjson")
-                    .header("content-type", "application/json")
-                    .body(Body::from("not valid json"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn delete_fixture_type_success() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_del");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let file_path = ft_dir.join("todelete.light");
-        std::fs::write(&file_path, sample_fixture_type_dsl("ToDelete")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/fixture-types/ToDelete?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "deleted");
-        assert!(!file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn delete_fixture_type_removes_a_fixture_file() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_del_fixture");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let file_path = ft_dir.join("brick.fixture");
-        std::fs::write(&file_path, sample_referential_fixture_type_dsl("Brick")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/fixture-types/Brick?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn delete_fixture_type_not_found() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_del_nf");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/fixture-types/nonexistent?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // -----------------------------------------------------------------------
-    // Venues endpoint tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn get_venues_empty() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_empty");
-        std::fs::create_dir(&v_dir).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["venues"].is_object());
-        assert_eq!(parsed["venues"].as_object().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn get_venues_nonexistent_dir() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/venues?dir=nonexistent_venues")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["venues"].as_object().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn get_venues_with_files() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_test");
-        std::fs::create_dir(&v_dir).unwrap();
-        std::fs::write(v_dir.join("club.light"), sample_venue_dsl("Club")).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["venues"]["Club"].is_object());
-    }
-
-    #[tokio::test]
-    async fn get_venue_success() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_get");
-        std::fs::create_dir(&v_dir).unwrap();
-        std::fs::write(v_dir.join("club.light"), sample_venue_dsl("Club")).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues/Club?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["venue"].is_object());
-        assert!(parsed["dsl"].is_string());
-    }
-
-    #[tokio::test]
-    async fn get_venue_not_found() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_notfound");
-        std::fs::create_dir(&v_dir).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues/nonexistent?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn put_venue_raw_dsl() {
-        let (state, _dir) = test_state();
-        let rel = "v_put_raw";
-        let app = router().with_state(state);
-
-        let dsl = sample_venue_dsl("MyVenue");
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/MyVenue?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "saved");
-        assert_eq!(parsed["name"], "MyVenue");
-
-        // Verify file was created.
-        let file_path = _dir.path().join(rel).join("myvenue.light");
-        assert!(file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn put_venue_json() {
-        let (state, _dir) = test_state();
-        let rel = "v_put_json";
-        let app = router().with_state(state);
-
-        let json_body = serde_json::json!({
-            "fixtures": [
-                {
-                    "name": "Spot1",
-                    "fixture_type": "GenericPar",
-                    "universe": 1,
-                    "start_channel": 1
-                },
-                {
-                    "name": "Spot2",
-                    "fixture_type": "GenericPar",
-                    "universe": 1,
-                    "start_channel": 5
-                }
-            ]
-        });
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/JSONVenue?dir={}", rel))
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&json_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "saved");
-
-        // Verify the file was created and contains valid DSL.
-        let file_path = _dir.path().join(rel).join("jsonvenue.light");
-        assert!(file_path.exists());
-        let content = std::fs::read_to_string(&file_path).unwrap();
-        let venues = lighting::parser::parse_venues(&content).unwrap();
-        assert!(venues.contains_key("JSONVenue"));
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_refuses_rich_channel_syntax() {
-        let (state, _dir) = test_state();
-        let rel = "ft_rich";
-        let app = router().with_state(state);
-        let dsl =
-            "fixture_type \"Mover\" {\n  channel \"pan\" @ 1 fine 2 range -270deg..270deg\n}\n";
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/Mover?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(response).await;
-        assert!(body.contains(".fixture"), "{body}");
-        assert!(!_dir.path().join(rel).join("mover.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_accepts_rich_channel_syntax_as_fixture() {
-        let (state, _dir) = test_state();
-        let rel = "ft_rich_ok";
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Mover?dir={}&ext=fixture",
-                        rel
-                    ))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_rich_fixture_type_dsl("Mover")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(_dir.path().join(rel).join("mover.fixture").exists());
-        assert!(!_dir.path().join(rel).join("mover.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_json_refuses_a_fixture_file() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_form_refusal");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let file_path = ft_dir.join("mover.fixture");
-        std::fs::write(&file_path, sample_rich_fixture_type_dsl("Mover")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/Mover?dir={}", rel))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({"channels": {"dimmer": 1}}))
-                            .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response_body(response).await;
-        assert!(body.contains("as text"), "{body}");
-        // The rich definition is untouched.
-        assert!(std::fs::read_to_string(&file_path)
-            .unwrap()
-            .contains("fine 2"));
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_refuses_a_renamed_declaration() {
-        // The file is keyed on the URL name, so a body that renames the
-        // declaration would write `mover.light` holding "Rover" — a file no
-        // later GET, PUT or DELETE could reach.
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_rename");
-        std::fs::create_dir(&ft_dir).unwrap();
-        let file_path = ft_dir.join("mover.light");
-        std::fs::write(&file_path, sample_fixture_type_dsl("Mover")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/Mover?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_fixture_type_dsl("Rover")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(response).await;
-        assert!(body.contains("declares no fixture type"), "{body}");
-        assert!(body.contains("Rover"), "{body}");
-        // The original is untouched, and no orphan was written.
-        assert!(std::fs::read_to_string(&file_path)
-            .unwrap()
-            .contains("Mover"));
-        assert!(!ft_dir.join("rover.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_venue_refuses_a_renamed_declaration() {
-        let (state, _dir) = test_state();
-        let rel = "venue_rename";
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/MyVenue?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_venue_dsl("OtherVenue")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(response).await;
-        assert!(body.contains("declares no venue"), "{body}");
-        assert!(!_dir.path().join(rel).join("myvenue.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_rejects_an_unknown_extension() {
-        let (state, _dir) = test_state();
-        let rel = "ft_bad_ext";
-        let app = router().with_state(state.clone());
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Mover?dir={}&ext=bogus",
-                        rel
-                    ))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_fixture_type_dsl("Mover")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(response).await;
-        assert!(body.contains("Unknown fixture type extension"), "{body}");
-
-        // The JSON body is held to the same query, so a typo is caught in
-        // the form editor too rather than silently writing a `.light`.
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Mover?dir={}&ext=bogus",
-                        rel
-                    ))
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&serde_json::json!({"channels": {"dimmer": 1}}))
-                            .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        // Nothing was created — not even the directory.
-        assert!(!_dir.path().join(rel).exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_converts_a_light_to_a_fixture() {
-        // The only way out of v1: an explicit `ext` wins over the existing
-        // file's extension, and the `.light` is retired behind it.
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_convert");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(ft_dir.join("mover.light"), sample_fixture_type_dsl("Mover")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Mover?dir={}&ext=fixture",
-                        rel
-                    ))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_rich_fixture_type_dsl("Mover")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(ft_dir.join("mover.fixture").exists());
-        assert!(!ft_dir.join("mover.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_keeps_the_existing_extension_without_ext() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_keep_ext");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(
-            ft_dir.join("mover.fixture"),
-            sample_rich_fixture_type_dsl("Mover"),
-        )
-        .unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/Mover?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_rich_fixture_type_dsl("Mover")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(ft_dir.join("mover.fixture").exists());
-        assert!(!ft_dir.join("mover.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_refuses_a_missing_gdtf_archive() {
-        // The lighting system resolves the archive against the project at
-        // load; a save is the last moment the text is still in front of the
-        // person who can fix the path.
-        let (state, _dir) = test_state();
-        let rel = "ft_missing_archive";
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Brick?dir={}&ext=fixture",
-                        rel
-                    ))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_referential_fixture_type_dsl("Brick")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(response).await;
-        assert!(body.contains("GDTF archive"), "{body}");
-        assert!(body.contains("library/synth.gdtf"), "{body}");
-        assert!(!_dir.path().join(rel).exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_accepts_a_referential_type_whose_archive_is_there() {
-        let (state, _dir) = test_state();
-        let library = _dir.path().join("library");
-        std::fs::create_dir(&library).unwrap();
-        std::fs::write(library.join("synth.gdtf"), synthetic_gdtf_bytes()).unwrap();
-        let rel = "ft_present_archive";
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Brick?dir={}&ext=fixture",
-                        rel
-                    ))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_referential_fixture_type_dsl("Brick")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(_dir.path().join(rel).join("brick.fixture").exists());
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_refuses_a_gdtf_archive_outside_the_project() {
-        let (state, _dir) = test_state();
-        let rel = "ft_escaping_archive";
-        let app = router().with_state(state);
-        let dsl = "fixture_type \"Brick\" from gdtf(\"../../etc/passwd\", mode \"8: RGBS\") {\n}\n";
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/lighting/fixture-types/Brick?dir={}&ext=fixture",
-                        rel
-                    ))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!_dir.path().join(rel).exists());
-    }
-
-    #[tokio::test]
-    async fn get_fixture_types_reports_a_name_defined_twice() {
-        // Last-wins would show one file and hide the other, while the
-        // lighting system registers the name twice.
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_dupes");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(ft_dir.join("a.light"), sample_fixture_type_dsl("Mover")).unwrap();
-        std::fs::write(
-            ft_dir.join("b.fixture"),
-            sample_rich_fixture_type_dsl("Mover"),
-        )
-        .unwrap();
-        std::fs::write(ft_dir.join("c.light"), sample_fixture_type_dsl("Par")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let errors = parsed["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 1, "{parsed}");
-        let message = errors[0]["error"].as_str().unwrap();
-        assert!(message.contains("defined in both"), "{message}");
-        assert!(message.contains("a.light"), "{message}");
-        assert!(message.contains("b.fixture"), "{message}");
-        // The rest of the directory still lists, including the duplicate
-        // under one of its two files.
-        assert!(parsed["fixture_types"]["Par"].is_object(), "{parsed}");
-        assert!(parsed["fixture_types"]["Mover"].is_object(), "{parsed}");
-    }
-
-    #[tokio::test]
-    async fn get_venues_reports_a_name_defined_twice() {
-        // The same shape as the fixture types: a venue directory holds both
-        // extensions, so two files can claim one name.
-        let (state, _dir) = test_state();
-        let venue_dir = _dir.path().join("venue_dupes");
-        std::fs::create_dir(&venue_dir).unwrap();
-        std::fs::write(venue_dir.join("a.light"), sample_venue_dsl("MainHall")).unwrap();
-        std::fs::write(venue_dir.join("b.venue"), sample_venue_dsl("MainHall")).unwrap();
-        std::fs::write(venue_dir.join("c.light"), sample_venue_dsl("Club")).unwrap();
-        let rel = venue_dir
-            .strip_prefix(_dir.path())
-            .unwrap()
-            .to_str()
-            .unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let errors = parsed["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 1, "{parsed}");
-        let message = errors[0]["error"].as_str().unwrap();
-        assert!(message.contains("venue \"MainHall\""), "{message}");
-        assert!(message.contains("defined in both"), "{message}");
-        assert!(message.contains("a.light"), "{message}");
-        assert!(message.contains("b.venue"), "{message}");
-        // One bad pair does not empty the list.
-        assert!(parsed["venues"]["Club"].is_object(), "{parsed}");
-        assert!(parsed["venues"]["MainHall"].is_object(), "{parsed}");
-    }
-
-    #[tokio::test]
-    async fn put_fixture_type_retires_the_stale_twin() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_twin");
-        std::fs::create_dir(&ft_dir).unwrap();
-        // A GDTF import can land a `.fixture` beside a hand-written `.light`
-        // of the same name; the next save resolves the pair to one file.
-        std::fs::write(ft_dir.join("mover.light"), sample_fixture_type_dsl("Mover")).unwrap();
-        std::fs::write(
-            ft_dir.join("mover.fixture"),
-            sample_rich_fixture_type_dsl("Mover"),
-        )
-        .unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/Mover?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(sample_rich_fixture_type_dsl("Mover")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(ft_dir.join("mover.fixture").exists());
-        assert!(!ft_dir.join("mover.light").exists());
-    }
-
-    #[tokio::test]
-    async fn put_venue_json_with_geometry_lands_in_a_venue_file() {
-        let (state, _dir) = test_state();
-        let rel = "v_put_geometry";
-        let app = router().with_state(state);
-
-        // First a plain venue: it is a .light.
-        let plain = serde_json::json!({
-            "fixtures": [{"name": "Spot1", "fixture_type": "GenericPar", "universe": 1, "start_channel": 1}]
-        });
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/Geo?dir={}", rel))
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&plain).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(_dir.path().join(rel).join("geo.light").exists());
-
-        // Then the same venue gains a position and a focus point: it moves
-        // to .venue and the .light twin is retired.
-        let geometry = serde_json::json!({
-            "fixtures": [{
-                "name": "Spot1", "fixture_type": "GenericPar", "universe": 1, "start_channel": 1,
-                "tags": ["spot"], "position": [-2.0, 3.5, 4.2], "rotation": [0, 0, 180]
-            }],
-            "focus_points": {"drummer": [0.0, 2.8, 1.4]},
-            "source": {"mvr": "lighting/library/geo.mvr", "origin": [0, -3.5, 0]}
-        });
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/Geo?dir={}", rel))
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&geometry).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let venue_path = _dir.path().join(rel).join("geo.venue");
-        assert!(venue_path.exists());
-        assert!(!_dir.path().join(rel).join("geo.light").exists());
-        let content = std::fs::read_to_string(&venue_path).unwrap();
-        let venue = &lighting::parser::parse_venues(&content).unwrap()["Geo"];
-        assert_eq!(venue.fixtures()["Spot1"].position(), Some([-2.0, 3.5, 4.2]));
-        assert_eq!(venue.focus_points()["drummer"], [0.0, 2.8, 1.4]);
-        assert_eq!(venue.source().unwrap().mvr, "lighting/library/geo.mvr");
-
-        // GET resolves the .venue and its JSON carries the geometry back.
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues/Geo?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_str(&response_body(response).await).unwrap();
+    #[test]
+    fn a_suggested_type_name_is_safe_in_a_fixture_file() {
         assert_eq!(
-            body["venue"]["fixtures"]["Spot1"]["position"],
-            serde_json::json!([-2.0, 3.5, 4.2])
+            suggested_type_name("Spiider \"Pro\" {v2}"),
+            "Spiider Pro v2"
         );
-        assert_eq!(
-            body["venue"]["focus_points"]["drummer"],
-            serde_json::json!([0.0, 2.8, 1.4])
-        );
-
-        // The listing sees it, and DELETE finds it.
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_str(&response_body(response).await).unwrap();
-        assert!(body["venues"]["Geo"].is_object(), "{body}");
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/venues/Geo?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!venue_path.exists());
-    }
-
-    #[tokio::test]
-    async fn put_venue_invalid_name() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/venues/..%2Fevil?dir=v_test")
-                    .header("content-type", "text/plain")
-                    .body(Body::from("content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_venue_invalid_dsl() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/venues/BadDSL?dir=v_bad")
-                    .header("content-type", "text/plain")
-                    .body(Body::from("invalid {{{ content"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_venue_invalid_json() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/lighting/venues/BadJSON?dir=v_badjson")
-                    .header("content-type", "application/json")
-                    .body(Body::from("not valid json"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn delete_venue_success() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_del");
-        std::fs::create_dir(&v_dir).unwrap();
-        let file_path = v_dir.join("todelete.light");
-        std::fs::write(&file_path, sample_venue_dsl("ToDelete")).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/venues/ToDelete?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["status"], "deleted");
-        assert!(!file_path.exists());
-    }
-
-    #[tokio::test]
-    async fn delete_venue_not_found() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_del_nf");
-        std::fs::create_dir(&v_dir).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/venues/nonexistent?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // -----------------------------------------------------------------------
-    // Fixture types / venues: round-trip tests (PUT then GET)
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn put_then_get_fixture_type() {
-        let (state, _dir) = test_state();
-        let rel = "ft_roundtrip";
-        let dsl = sample_fixture_type_dsl("RoundTrip");
-
-        // PUT
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/RoundTrip?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // GET
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types/RoundTrip?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["fixture_type"].is_object());
-    }
-
-    #[tokio::test]
-    async fn put_then_get_venue() {
-        let (state, _dir) = test_state();
-        let rel = "v_roundtrip";
-        let dsl = sample_venue_dsl("RoundTrip");
-
-        // PUT
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/RoundTrip?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // GET
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues/RoundTrip?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed["venue"].is_object());
-    }
-
-    #[tokio::test]
-    async fn put_then_delete_fixture_type() {
-        let (state, _dir) = test_state();
-        let rel = "ft_put_del";
-        let dsl = sample_fixture_type_dsl("Deletable");
-
-        // PUT
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/fixture-types/Deletable?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // DELETE
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/fixture-types/Deletable?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // GET should now 404
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types/Deletable?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn put_then_delete_venue() {
-        let (state, _dir) = test_state();
-        let rel = "v_put_del";
-        let dsl = sample_venue_dsl("Deletable");
-
-        // PUT
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/lighting/venues/Deletable?dir={}", rel))
-                    .header("content-type", "text/plain")
-                    .body(Body::from(dsl))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // DELETE
-        let app = router().with_state(state.clone());
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri(format!("/lighting/venues/Deletable?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // GET should now 404
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues/Deletable?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    // -----------------------------------------------------------------------
-    // resolve_lighting_dir: absolute path rejected
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn get_fixture_types_absolute_dir_rejected() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/fixture-types?dir=%2Ftmp%2Fevil")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn get_venues_absolute_dir_rejected() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/venues?dir=%2Ftmp%2Fevil")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    // -----------------------------------------------------------------------
-    // Multiple fixture types in listing
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn get_fixture_types_multiple_files() {
-        let (state, _dir) = test_state();
-        let ft_dir = _dir.path().join("ft_multi");
-        std::fs::create_dir(&ft_dir).unwrap();
-        std::fs::write(ft_dir.join("a.light"), sample_fixture_type_dsl("TypeA")).unwrap();
-        std::fs::write(ft_dir.join("b.light"), sample_fixture_type_dsl("TypeB")).unwrap();
-        let rel = ft_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/fixture-types?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let types = parsed["fixture_types"].as_object().unwrap();
-        assert_eq!(types.len(), 2);
-        assert!(types.contains_key("TypeA"));
-        assert!(types.contains_key("TypeB"));
-    }
-
-    #[tokio::test]
-    async fn get_venues_multiple_files() {
-        let (state, _dir) = test_state();
-        let v_dir = _dir.path().join("v_multi");
-        std::fs::create_dir(&v_dir).unwrap();
-        std::fs::write(v_dir.join("a.light"), sample_venue_dsl("VenueA")).unwrap();
-        std::fs::write(v_dir.join("b.light"), sample_venue_dsl("VenueB")).unwrap();
-        let rel = v_dir.strip_prefix(_dir.path()).unwrap().to_str().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri(format!("/lighting/venues?dir={}", rel))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let venues = parsed["venues"].as_object().unwrap();
-        assert_eq!(venues.len(), 2);
-        assert!(venues.contains_key("VenueA"));
-        assert!(venues.contains_key("VenueB"));
-    }
-
-    #[tokio::test]
-    async fn assets_are_served_from_the_store_with_containment() {
-        let (state, dir) = test_state();
-        let store = dir.path().join("lighting/.cache/assets/abc123");
-        std::fs::create_dir_all(store.join("models")).unwrap();
-        std::fs::write(store.join("rig-1-v1.json"), "{\"version\":1}").unwrap();
-        std::fs::write(store.join("models/yoke.glb"), b"glTF").unwrap();
-        std::fs::write(store.join("thumbnail.svg"), "<svg><script/></svg>").unwrap();
-        std::fs::write(store.join("notes.txt"), "no").unwrap();
-        // Something outside the store that a traversal would reach.
-        std::fs::write(dir.path().join("lighting/secret.json"), "{}").unwrap();
-
-        let get = |uri: String| {
-            let app = router().with_state(state.clone());
-            async move {
-                app.oneshot(
-                    http::Request::builder()
-                        .uri(uri)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-            }
-        };
-
-        let response = get("/lighting/assets/abc123/rig-1-v1.json".to_string()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()["content-type"],
-            "application/json",
-            "json is served as json"
-        );
-        assert!(response.headers()["cache-control"]
-            .to_str()
-            .unwrap()
-            .contains("immutable"));
-        assert_eq!(response_body(response).await, "{\"version\":1}");
-
-        let response = get("/lighting/assets/abc123/models/yoke.glb".to_string()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "model/gltf-binary");
-        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert!(response.headers().get("content-security-policy").is_none());
-
-        let response = get("/lighting/assets/abc123/thumbnail.svg".to_string()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "image/svg+xml");
-        let csp = response.headers()["content-security-policy"]
-            .to_str()
-            .unwrap();
-        assert!(
-            csp.contains("default-src 'none'") && csp.contains("sandbox"),
-            "{csp}"
-        );
-
-        // Not an asset type, missing, a directory, and a traversal.
-        for (uri, why) in [
-            (
-                "/lighting/assets/abc123/notes.txt",
-                "text is not an asset type",
-            ),
-            ("/lighting/assets/abc123/models/head.glb", "missing"),
-            ("/lighting/assets/abc123/models", "a directory"),
-            ("/lighting/assets/../secret.json", "traversal"),
-            ("/lighting/assets/abc123/../../secret.json", "traversal"),
-        ] {
-            let response = get(uri.to_string()).await;
-            assert!(
-                response.status() == StatusCode::NOT_FOUND
-                    || response.status() == StatusCode::BAD_REQUEST
-                    || response.status() == StatusCode::FORBIDDEN,
-                "{uri} ({why}): {}",
-                response.status()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_project_without_a_store_answers_not_found() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/lighting/assets/abc/rig.json")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(suggested_type_name("  A   B "), "A B");
+        assert_eq!(suggested_type_name("\"\"{}"), "fixture");
     }
 }

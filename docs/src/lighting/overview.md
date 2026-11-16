@@ -37,21 +37,65 @@ you want to.
 - **Tag-Based Group Resolution**: Fixtures are tagged with capabilities and roles.
   The system automatically selects optimal fixtures based on constraints.
 - **Effects Engine**: Built-in effects (static, cycle, chase, strobe, pulse, dimmer,
-  rainbow) with layering, blend modes, and timing control. All effects require an explicit
-  duration — there are no perpetual or permanent effects.
+  rainbow, move) with layering, blend modes, and timing control. All effects require an
+  explicit duration — there are no perpetual or permanent effects.
+- **Movers and Positions**: The `move` effect aims moving heads at named focus points in a
+  `.venue` file, or at explicit pan and tilt angles. See the
+  [Move Effect](effects.md#move-effect) and [Venue files with positions](configuration.md#venue-files-with-positions-venue).
+- **GDTF and MVR**: A manufacturer's GDTF file is a fixture type as it stands: import it (or
+  copy it into `lighting/library/`) and every one of its modes is available, with nothing to
+  transcribe. Each fixture in a venue names the mode its unit is set to. A venue's MVR comes in
+  as a positioned venue, and a venue goes back out as MVR. See
+  [GDTF fixture types](configuration.md#gdtf-fixture-types)
+  and [Importing a venue's MVR](configuration.md#importing-a-venues-mvr).
+- **Testing a fixture**: A fixture's page sends to the real light — full white, swatches,
+  sliders, every channel raw — and says what to check when nothing happens. See
+  [Testing a fixture](web-ui.md#testing-a-fixture).
+- **Pixel Fixtures**: Fixtures with cells can be driven per pixel with `per: cell` and
+  `spread`. See [Rich channel definitions](configuration.md#rich-channel-definitions-fixture).
+- **Stage 3D**: The stage card (on the dashboard and the Venues page) switches between the plot
+  and the venue as a 3D room with live beams, and on the Venues page previews a song's show at
+  any moment. See [Stage 3D](configuration.md#stage-3d).
 - **Timeline Editor**: Visual DAW-style cue authoring in the web UI with integrated
   audio playback and real-time stage preview.
 - **Sequences**: Reusable cue patterns that can be referenced from multiple shows.
 - **Tempo-Aware Cueing**: Cues can be placed at measure/beat positions with automatic
   tempo change support.
 
+## The Lighting area
+
+The web UI's **Lighting** item holds all of it: an **Overview** that checks whether your shows
+will reach the lights and says what to fix, **Fixture types** (import a GDTF, see a fixture in
+3D with all its modes, test it, set what the GDTF does not say), **Venues** (patch, place and aim
+fixtures on a stage plot or in 3D), **Groups** (the current venue and the logical groups, per
+hardware profile) and **Fit shows** (tag an imported venue for your shows). See
+[Lighting](web-ui.md) in the web UI guide.
+
 ## Configuration Structure
 
 The lighting system uses a three-layer architecture:
 
-1. **Configuration Layer**: Define logical groups with constraints in `mtrack.yaml`
+1. **Configuration Layer**: Define logical groups with constraints, and pick the current venue,
+   in the hardware profile (`dmx.lighting` in `mtrack.yaml` or a profile file)
 2. **Venue Layer**: Tag physical fixtures with capabilities in DSL files
 3. **Song Layer**: Reference `.light` DSL files in song YAML files, which use logical groups
+
+## The files
+
+| File | What it holds | Where it lives | Who writes it |
+|---|---|---|---|
+| `*.light` (show) | A song's cues: effects on groups, timed | The song's directory, named in `song.yaml` under `lighting:` | The song's timeline editor in the web UI, or you |
+| `*.light` (fixture type) | A hand-written fixture type as a channel map | `lighting/fixture_types/` | The Fixture types page, or you |
+| `*.fixture` | A hand-written fixture type with full channel definitions and cells, or the record of a GDTF fixture (its name, movement limits, strobe curve) | `lighting/fixture_types/` | The Fixture types page, `import-gdtf --name`, or you |
+| `*.light` / `*.venue` (venue) | The rig at one place: fixtures, their types and modes, addresses, tags; `.venue` also positions, rotations and focus points | `lighting/venues/` | The Venues page, `import-mvr --write`, or you |
+| `*.gdtf` | A manufacturer's fixture description; each one in the library is a fixture type | `lighting/library/` | `import-gdtf`, the Fixture types page, `import-mvr`, or a copy you make |
+| `*.mvr` | A rig exchanged with a console or pre-viz tool | Input from anywhere; exports in `lighting/export/` | `export-mvr` and the Venues page; imports come from the venue |
+| `lighting/.cache/` | Expanded GDTF modes, the library index, and the meshes and rig models the 3D view draws; rebuildable | `lighting/.cache/` | mtrack. Keep it out of version control |
+| `mtrack.yaml` / profile files | The machine's DMX universes, its current venue and its logical groups | The project root, `profiles_dir` | The Config and Groups pages, or you |
+
+All paths are relative to the directory holding `mtrack.yaml`; `lighting.directories` in the
+profile moves the fixture types and venues directories. The formats are described in
+[Configuration](configuration.md).
 
 ## Constraint Types
 
@@ -78,21 +122,23 @@ The system supports several constraint types for group resolution:
 
 Effects in mtrack are **finite, independent blocks on a timeline**:
 
-- **Explicit durations** — Every effect must have a `duration` (or `hold_time`) parameter.
-  Effects that don't specify a duration are rejected by the parser.
+- **Explicit durations** — Every effect must have a `duration` (or `hold_time`) parameter, and
+  the parser rejects one without. Two exceptions, both ways: `dimmer`'s `duration` defaults to
+  1 s, and `move` needs `duration` itself, because a travel time is not something `hold_time`
+  can stand in for.
 - **No replacement semantics** — Multiple effects can coexist on the same layer simultaneously.
   The blend mode determines how overlapping effects combine.
 - **No persistent state** — When an effect's duration expires, its contribution to the output
   is removed. Dimmer effects do not persist their final brightness level.
 
 This model simplifies reasoning about light shows: each effect is a self-contained block with
-a defined start time and duration. The timeline editor's layer lanes (foreground, midground,
-background) make it easy to visualize how effects overlap and compose.
+a defined start time and duration. The timeline editor's layer lanes (one for each of the player's
+[layers](configuration.md#layers), the top layer on top; `foreground`, `midground` and
+`background` by default) make it easy to visualize how effects overlap and compose.
 
 ## Getting Started
 
-1. Define fixture types and venues (see [Configuration](configuration.md))
-2. Create a `.light` file for your song (see [Effects Reference](effects.md) and
-   [Cueing Features](cueing.md))
-3. Reference the light file in your song's `song.yaml`
-4. Use the web UI's timeline editor to visually author and preview your show
+[First Light](first-light.md) takes one fixture from its GDTF to a cue in a song, all in the web
+UI, and is the place to start. The files behind each of its steps are described in
+[Configuration](configuration.md); the show language in the [Effects Reference](effects.md) and
+[Cueing Features](cueing.md).

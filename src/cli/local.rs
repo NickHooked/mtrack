@@ -14,7 +14,9 @@
 
 use std::collections::HashSet;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -23,7 +25,8 @@ use tracing::info;
 use crate::audio::format::SampleFormat;
 use crate::calibrate;
 use crate::config;
-use crate::lighting::parser::parse_light_shows;
+use crate::lighting::effects::LayerSet;
+use crate::lighting::parser::parse_light_file;
 use crate::lighting::validation::validate_groups;
 use crate::playlist::Playlist;
 use crate::songs;
@@ -63,15 +66,49 @@ fn apply_thread_priority() {
     }
 }
 
-pub fn songs(path: &str, init: bool) -> Result<(), Box<dyn Error>> {
+/// The lighting layers the project at `config` (a directory or its
+/// mtrack.yaml) gives this host, else the defaults when none is named. A
+/// config named and unreadable is an error: reading on with the defaults
+/// would refuse a show for naming a layer the player has.
+fn cli_layers(config: Option<&str>) -> Result<LayerSet, Box<dyn Error>> {
+    let Some(config) = config else {
+        return Ok(LayerSet::default());
+    };
+    let config_path = super::migrate::resolve_config_path(config);
+    let player_config = config::Player::deserialize(&config_path)
+        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    Ok(player_config.layer_set())
+}
+
+/// `result`, an error that names an unknown layer saying the layers read
+/// were the defaults when no config was given: the project's may have it.
+fn with_layers_hint<T>(
+    result: Result<T, Box<dyn Error>>,
+    config: Option<&str>,
+) -> Result<T, Box<dyn Error>> {
+    result.map_err(|e| {
+        if config.is_none() && e.to_string().contains("unknown layer") {
+            format!(
+                "{e}\n(read against the default layers: pass --config with the project \
+                 directory to use the layers its profile configures)"
+            )
+            .into()
+        } else {
+            e
+        }
+    })
+}
+
+pub fn songs(path: &str, init: bool, config: Option<&str>) -> Result<(), Box<dyn Error>> {
+    let layers = cli_layers(config)?;
     if init {
         info!("Initializing songs");
-        songs::initialize_songs(Path::new(path))?;
+        with_layers_hint(songs::initialize_songs(Path::new(path), &layers), config)?;
     } else {
         info!("Not initializing songs");
     }
 
-    let songs = songs::get_all_songs(Path::new(path))?;
+    let songs = songs::get_all_songs_with_defaults(Path::new(path), false, &layers)?;
 
     if songs.is_empty() {
         println!("No songs found in {}.", path);
@@ -101,8 +138,79 @@ pub fn songs(path: &str, init: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-pub fn playlist(repository_path: &str, playlist_path: &str) -> Result<(), Box<dyn Error>> {
-    let songs = songs::get_all_songs(Path::new(repository_path))?;
+/// Prints where the one-brightness-model lighting fix changes a project's
+/// shows (`crate::lighting::brightness_changes`), by song. Exits 0 with or
+/// without findings; fails only when the project cannot be read.
+pub fn brightness_changes(project: &str, hostname: Option<String>) -> Result<(), Box<dyn Error>> {
+    let (report, _) = brightness_changes_report(project, hostname)?;
+    print!("{report}");
+    Ok(())
+}
+
+/// [`brightness_changes`]' output and the number of findings in it.
+fn brightness_changes_report(
+    project: &str,
+    hostname: Option<String>,
+) -> Result<(String, usize), Box<dyn Error>> {
+    use crate::lighting::system::LightingSystem;
+    use std::fmt::Write;
+
+    let config_path = super::migrate::resolve_config_path(project);
+    let player_config = config::Player::deserialize(&config_path)
+        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    let host = hostname.unwrap_or_else(config::resolve_hostname);
+
+    let mut out = String::new();
+    let mut system = LightingSystem::new();
+    let lighting = player_config
+        .profiles(&host)
+        .first()
+        .and_then(|profile| profile.dmx())
+        .and_then(|dmx| dmx.lighting());
+    match lighting {
+        Some(lighting) => system
+            .load(lighting, &crate::util::project_dir_of(&config_path))
+            .map_err(|e| format!("cannot load the lighting configuration: {e}"))?,
+        None => writeln!(
+            out,
+            "No lighting configuration for host \"{host}\": fixtures are unknown, so nothing \
+             can be checked."
+        )?,
+    }
+
+    let layers = crate::config::lighting::layer_set(lighting);
+    let songs =
+        songs::get_all_songs_with_defaults(&player_config.songs(&config_path), false, &layers)?;
+    let findings =
+        crate::lighting::brightness_changes::project_findings(&mut system, &songs, &layers);
+    let total: usize = findings.iter().map(|(_, f)| f.len()).sum();
+    for (song, warnings) in &findings {
+        writeln!(out, "{song}:")?;
+        for warning in warnings {
+            writeln!(out, "  [{}] {}", warning.kind, warning.message)?;
+        }
+    }
+    if total == 0 {
+        writeln!(out, "No brightness changes found.")?;
+    } else {
+        writeln!(
+            out,
+            "\n{total} brightness change{} in {} song{}.",
+            if total == 1 { "" } else { "s" },
+            findings.len(),
+            if findings.len() == 1 { "" } else { "s" },
+        )?;
+    }
+    Ok((out, total))
+}
+
+pub fn playlist(
+    repository_path: &str,
+    playlist_path: &str,
+    config: Option<&str>,
+) -> Result<(), Box<dyn Error>> {
+    let layers = cli_layers(config)?;
+    let songs = songs::get_all_songs_with_defaults(Path::new(repository_path), false, &layers)?;
     let playlist = Playlist::new(
         "playlist",
         &config::Playlist::deserialize(Path::new(playlist_path))?,
@@ -122,12 +230,7 @@ fn annotate_write(target: crate::util::WriteTarget<'_>, error: std::io::Error) -
     // The path goes in whether or not there is a hint to add. Propagating the
     // bare `io::Error` reached the operator as `Error: Read-only file system
     // (os error 30)` in a restart loop, naming no file at all.
-    let mut message = format!("could not write {}: {error}", target.path().display());
-    if let Some(hint) = crate::util::write_failure_hint(target, &error) {
-        message.push_str("\n\n");
-        message.push_str(&hint);
-    }
-    message.into()
+    crate::util::write_failure_message(target, &error).into()
 }
 
 #[cfg(feature = "video")]
@@ -177,13 +280,20 @@ pub async fn start(
 
     // Resolve path: if it's a file or has a YAML extension, use it directly (legacy).
     // Otherwise treat it as a project directory and look for mtrack.yaml inside.
-    let input = Path::new(path);
-    let player_path =
-        &if input.is_file() || input.extension().is_some_and(|e| e == "yaml" || e == "yml") {
-            input.to_path_buf()
-        } else {
-            input.join("mtrack.yaml")
-        };
+    let player_path = &super::migrate::resolve_config_path(path);
+
+    // A pull that was cut short left the project part-way between two
+    // revisions: it is finished before the project is read.
+    // One that cannot be finished does not stop the player: it starts on the
+    // files that are there, and says so, rather than not at all.
+    #[cfg(feature = "hub")]
+    match crate::hub::sync::recover(player_path) {
+        Ok(true) => info!("Finished a pull from the hub that was cut short"),
+        Ok(false) => {}
+        Err(e) => tracing::error!(
+            "{e}. Starting on the project as it is, which may be part of two revisions"
+        ),
+    }
 
     // Load or create config
     let player_config = match config::Player::deserialize(player_path) {
@@ -253,53 +363,27 @@ pub async fn start(
     }
 
     let default_metronome = player_config.metronome().is_some_and(|m| m.enabled);
-    let songs = songs::get_all_songs_with_defaults(&songs_path, default_metronome)?;
+    let layers = player_config.layer_set();
+    let songs = songs::get_all_songs_with_defaults(&songs_path, default_metronome, &layers)?;
     #[cfg(feature = "video")]
     diagnose_configured_video(&songs)?;
 
-    // Resolve playlists directory from config, defaulting to {config_dir}/playlists/.
-    let playlists_dir = player_config
-        .playlists_dir(player_path)
-        .or_else(|| player_path.parent().map(|p| p.join("playlists")));
-
-    // Resolve legacy playlist path.
-    let mut legacy_playlist_path = playlist_path
-        .as_ref()
-        .map(PathBuf::from)
-        .or(player_config.playlist());
-
-    // Make legacy playlist path absolute if relative.
-    if let Some(ref mut pp) = legacy_playlist_path {
-        if !pp.is_absolute() {
-            *pp = if let Some(parent) = player_path.parent() {
-                parent.join(&pp)
-            } else {
-                return Err(format!(
-                    "Unable to determine playlist path (config base path has no parent): {}. \
-                     Please specify the playlist path using an absolute path.",
-                    pp.display()
-                )
-                .into());
-            };
-        }
-    }
+    // Where songs and playlists are read from, by the one resolver the
+    // player uses again as the config changes: the playlists directory from
+    // the config, defaulting to {config_dir}/playlists/, and the legacy
+    // playlist the command line names over the config's.
+    let cli_playlist = playlist_path.as_ref().map(std::path::PathBuf::from);
+    let song_sources =
+        crate::player::SongSources::resolve(&player_config, player_path, cli_playlist.as_deref());
 
     // Load all playlists from directory + legacy file.
     let playlists = crate::player::load_playlists(
-        playlists_dir.as_deref(),
-        legacy_playlist_path.as_deref(),
+        song_sources.playlists_dir.as_deref(),
+        song_sources.legacy_playlist.as_deref(),
         songs.clone(),
     )?;
 
     let active_playlist = player_config.active_playlist().to_string();
-
-    // Default legacy_playlist_path for web UI backward compat (so config writes have somewhere to go).
-    let legacy_playlist_path = legacy_playlist_path.unwrap_or_else(|| {
-        player_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("playlist.yaml")
-    });
 
     // `.parent()` answers `Some("")` for a bare config filename, which is
     // harmless for plain joins but fails the first consumer that
@@ -312,6 +396,7 @@ pub async fn start(
         &player_config,
         Some(project_dir.as_path()),
     )?;
+    player.set_cli_playlist(cli_playlist);
     player.set_config_store(config_store);
     player.set_default_metronome(default_metronome);
 
@@ -321,44 +406,42 @@ pub async fn start(
         tokio::sync::watch::channel(std::sync::Arc::new(crate::state::StateSnapshot::default()));
     player.set_state_tx(state_tx);
 
-    // Start the unified web server (dashboard + gRPC-Web + REST API)
+    // The player's own watch hub feeds the gRPC `Watch` stream (native
+    // and gRPC-Web) and the DMX file watcher. Its
+    // pollers run for as long as the player does, whether or not the web
+    // server starts or a gRPC controller is configured.
+    let _hub_tasks = player.watch_hub().start(player.clone());
+
+    // Told to the gRPC controller's mDNS advert before the web server starts
+    // (controllers may start any time now), and taken back if it does not.
+    // Not for a web UI on loopback, which nothing else could reach.
+    let web_on_network = web_config
+        .address
+        .parse::<std::net::IpAddr>()
+        .map_or(true, |ip| !ip.is_loopback());
+    if web_on_network {
+        player.set_web_port(Some(web_config.port));
+    }
+
+    // Start the unified web server (dashboard + gRPC-Web + file routes)
     let _webui_handle = {
-        // Create a broadcast channel for the web UI (shared by dashboard WS and DMX file watcher)
-        let (broadcast_tx, _) = tokio::sync::broadcast::channel::<String>(128);
-
-        // Store the broadcast channel on the player so async init can wire
-        // it to the DMX engine when it comes up.
-        player.set_broadcast_tx(broadcast_tx.clone());
-
-        let profiles_dir = player_config.profiles_dir_resolved(player_path);
-
         let webui_state =
             crate::webui::server::WebUiState::new(crate::webui::server::WebUiStateParams {
                 player: player.clone(),
-                state_rx: state_rx.clone(),
-                broadcast_tx,
                 config_path: player_path.to_path_buf(),
-                // The directory that exists, not the configured spelling --
-                // which no longer resolves when it holds a `..`, and left every
-                // web UI songs endpoint answering "Root directory not found"
-                // while the player itself worked fine.
-                songs_path: songs_path.as_path().to_path_buf(),
-                playlists_dir: playlists_dir.clone(),
-                legacy_playlist_path: Some(legacy_playlist_path.clone()),
-                profiles_dir,
-                waveform_cache: crate::webui::state::new_waveform_cache(),
             });
 
-        match crate::webui::server::start(webui_state, web_config.address.clone(), web_config.port)
-            .await
-        {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                tracing::warn!("Failed to start web UI: {}", e);
-                None
-            }
-        }
+        crate::webui::server::start_or_unlock(
+            webui_state,
+            web_config.address.clone(),
+            web_config.port,
+        )
+        .await
     };
+
+    if _webui_handle.is_none() {
+        player.set_web_port(None);
+    }
 
     if tui_mode {
         crate::tui::run(player.clone(), state_rx).await?;
@@ -407,11 +490,19 @@ pub fn verify_light_show(show_path: &str, config_path: Option<&str>) -> Result<(
     }
 
     // Read and parse the light show
-    let content = std::fs::read_to_string(path)?;
+    let content = crate::util::read_to_string(path)?;
     // Verified standalone, so there is no song to inherit a tempo from: a show
     // that relies on its song's tempo cannot be checked here, and will report
     // that it needs a tempo section.
-    let shows = match parse_light_shows(&content) {
+    // The layers this host's profile configures, when a config is given
+    // (the shows are checked against them), else the defaults.
+    let layers = config_path
+        .map(Path::new)
+        .filter(|p| p.exists())
+        .and_then(|p| config::Player::deserialize(p).ok())
+        .map(|c| c.layer_set())
+        .unwrap_or_default();
+    let shows = match parse_light_file(&layers, &content, Some(path), None) {
         Ok(shows) => shows,
         Err(e) => {
             eprintln!("❌ Syntax error in light show:");
@@ -432,39 +523,34 @@ pub fn verify_light_show(show_path: &str, config_path: Option<&str>) -> Result<(
     }
 
     // Get lighting config if provided
-    let (lighting_config, valid_groups_count, valid_fixtures_count) = if let Some(config_path) =
-        config_path
-    {
+    let (lighting_config, valid_groups_count) = if let Some(config_path) = config_path {
         let config_file = Path::new(config_path);
         if !config_file.exists() {
             eprintln!("⚠️  Warning: Config file not found: {}", config_path);
-            (None, 0, 0)
+            (None, 0)
         } else {
             match config::Player::deserialize(config_file) {
                 Ok(player_config) => {
-                    if let Some(dmx) = player_config.dmx() {
-                        if let Some(lighting) = dmx.lighting() {
-                            let groups_count = lighting.groups().len();
-                            let fixtures_count = lighting.fixtures().len();
-                            // Clone the lighting config to own it
-                            (Some(lighting.clone()), groups_count, fixtures_count)
-                        } else {
-                            eprintln!("⚠️  Warning: No lighting configuration found in DMX config");
-                            (None, 0, 0)
-                        }
+                    // This host's profile, as the player reads it.
+                    if let Some(lighting) = player_config.host_lighting() {
+                        let groups_count = lighting.groups().len();
+                        // Clone the lighting config to own it
+                        (Some(lighting.clone()), groups_count)
                     } else {
-                        eprintln!("⚠️  Warning: No DMX configuration found in config file");
-                        (None, 0, 0)
+                        eprintln!(
+                            "⚠️  Warning: No lighting configuration found in this host's profile"
+                        );
+                        (None, 0)
                     }
                 }
                 Err(e) => {
                     eprintln!("⚠️  Warning: Failed to parse config file: {}", e);
-                    (None, 0, 0)
+                    (None, 0)
                 }
             }
         }
     } else {
-        (None, 0, 0)
+        (None, 0)
     };
 
     // Use validation module to check groups
@@ -494,10 +580,10 @@ pub fn verify_light_show(show_path: &str, config_path: Option<&str>) -> Result<(
             )
             .into());
         } else {
-            println!("\n✅ All groups/fixtures are valid in config");
+            println!("\n✅ All groups are valid in config");
             println!(
-                "   Validated against {} group(s) and {} fixture(s) in config",
-                valid_groups_count, valid_fixtures_count
+                "   Validated against {} group(s) in config",
+                valid_groups_count
             );
         }
     }
@@ -565,13 +651,13 @@ pub fn test_audio(config: &str, hostname: Option<String>) -> Result<(), Box<dyn 
 
 pub fn verify(
     config: &str,
-    check: Option<Vec<String>>,
+    check: Option<Vec<verify::Check>>,
     hostname: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
     let config_path = Path::new(config);
     let player_config = config::Player::deserialize(config_path)?;
     let songs_path = crate::util::resolved_dir(&player_config.songs(config_path));
-    let songs = songs::get_all_songs(&songs_path)?;
+    let songs = songs::get_all_songs_with_defaults(&songs_path, false, &player_config.layer_set())?;
 
     if songs.is_empty() {
         println!("No songs found in {}.", songs_path.display());
@@ -579,12 +665,12 @@ pub fn verify(
     }
 
     let run_all = check.is_none();
-    let checks: Vec<String> = check.unwrap_or_default();
+    let checks: Vec<verify::Check> = check.unwrap_or_default();
 
     let mut report = verify::VerificationReport::default();
 
     // Track mapping checks.
-    if run_all || checks.iter().any(|c| c == "track-mappings") {
+    if run_all || checks.contains(&verify::Check::TrackMappings) {
         let all_profiles = player_config.all_profiles();
 
         if all_profiles.len() > 1 {
@@ -666,22 +752,45 @@ pub(crate) fn parse_origin_mm(text: &str) -> Result<[f64; 3], Box<dyn Error>> {
     Ok(origin)
 }
 
+/// The project a lighting command works in, `project` naming its directory
+/// or its config file ([`super::migrate::resolve_config_path`]), and its
+/// lighting directories relative to it: those given, else the ones its
+/// config gives this host's profile (`Player::lighting_dirs`, as the engine,
+/// the web UI and MCP read them), else the defaults when it has no config.
+/// The library is the project's `lighting/library`.
+pub(super) fn project_lighting(
+    project: &str,
+    fixture_types_dir: Option<String>,
+    venues_dir: Option<String>,
+) -> Result<(std::path::PathBuf, crate::config::lighting::ProjectDirs), Box<dyn Error>> {
+    let config_path = super::migrate::resolve_config_path(project);
+    let dirs = config::Player::lighting_dirs_at(&config_path)
+        .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
+    let dirs = crate::config::lighting::ProjectDirs {
+        fixture_types: fixture_types_dir.unwrap_or(dirs.fixture_types),
+        venues: venues_dir.unwrap_or(dirs.venues),
+    };
+    Ok((crate::util::project_dir_of(&config_path), dirs))
+}
+
 pub fn import_mvr(
     mvr_path: &str,
     write: bool,
     name: Option<String>,
     origin: Option<&str>,
     project: &str,
-    fixture_types_dir: String,
-    venues_dir: String,
+    fixture_types_dir: Option<String>,
+    venues_dir: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
     use crate::lighting::import::{import_mvr, inspect_mvr, MvrImportOptions, MvrPlan};
 
+    let (project, dirs) = project_lighting(project, fixture_types_dir, venues_dir)?;
     let options = MvrImportOptions {
         name,
         origin_mm: origin.map(parse_origin_mm).transpose()?,
-        fixture_types_dir,
-        venues_dir,
+        fixture_types_dir: dirs.fixture_types,
+        venues_dir: dirs.venues,
+        keep: Default::default(),
     };
 
     fn print_plan(plan: &MvrPlan) {
@@ -702,12 +811,17 @@ pub fn import_mvr(
         );
         println!("  fixture types:");
         for ft in &plan.fixture_types {
+            let modes: Vec<String> = ft.modes.iter().map(|m| format!("\"{m}\"")).collect();
             println!(
-                "    {:40} {} mode \"{}\"{}",
+                "    {:40} {} in {}{}",
                 format!("\"{}\"", ft.name),
                 ft.archive,
-                ft.mode,
-                if ft.existing { " (existing)" } else { "" }
+                modes.join(", "),
+                if ft.existing {
+                    " (already in the library)"
+                } else {
+                    ""
+                }
             );
         }
         println!("  fixtures:");
@@ -726,15 +840,26 @@ pub fn import_mvr(
                     format!("\"{}\"", fixture.name)
                 ),
                 None => println!(
-                    "    {:29} @ {patch:8} {position} {}{}",
+                    "    {:29} @ {patch:8} {position} {}{}{}",
                     format!("\"{}\"", fixture.name),
                     fixture.fixture_type.as_deref().unwrap_or_default(),
+                    fixture
+                        .mode
+                        .as_deref()
+                        .map(|m| format!(" mode \"{m}\""))
+                        .unwrap_or_default(),
                     fixture
                         .change
                         .as_deref()
                         .map(|c| format!("  [{c}]"))
                         .unwrap_or_default()
                 ),
+            }
+            for edit in &fixture.overwrites {
+                println!(
+                    "        OVERWRITES your {}: {} → {} (hand-edited; the MVR's value wins)",
+                    edit.field, edit.mine, edit.mvr
+                );
             }
         }
         for removed in &plan.removed_fixtures {
@@ -776,6 +901,12 @@ pub fn import_mvr(
                         .map(|c| format!("  [{c}]"))
                         .unwrap_or_default()
                 );
+                for edit in &focus.overwrites {
+                    println!(
+                        "        OVERWRITES your {}: {} → {} (hand-edited; the MVR's value wins)",
+                        edit.field, edit.mine, edit.mvr
+                    );
+                }
             }
             for kept in &plan.kept_focus_points {
                 println!("    KEPT \"{kept}\"");
@@ -795,13 +926,13 @@ pub fn import_mvr(
     }
 
     if !write {
-        let plan = inspect_mvr(Path::new(mvr_path), &options, Path::new(project))?;
+        let plan = inspect_mvr(Path::new(mvr_path), &options, &project)?;
         print_plan(&plan);
         println!("\nNothing written. Re-run with --write to import.");
         return Ok(());
     }
 
-    let report = import_mvr(Path::new(mvr_path), &options, Path::new(project))?;
+    let report = import_mvr(Path::new(mvr_path), &options, &project)?;
     print_plan(&report.plan);
     println!("  written:");
     for file in &report.written {
@@ -823,19 +954,20 @@ pub fn export_mvr(
     output: Option<String>,
     layers_from_tags: bool,
     project: &str,
-    fixture_types_dir: String,
-    venues_dir: String,
+    fixture_types_dir: Option<String>,
+    venues_dir: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
     use crate::lighting::export::{export_mvr, MvrExportOptions};
 
+    let (project, dirs) = project_lighting(project, fixture_types_dir, venues_dir)?;
     let options = MvrExportOptions {
         venue: venue.to_string(),
         output,
-        fixture_types_dir,
-        venues_dir,
+        fixture_types_dir: dirs.fixture_types,
+        venues_dir: dirs.venues,
         layers_from_tags,
     };
-    let report = export_mvr(&options, Path::new(project))?;
+    let report = export_mvr(&options, &project)?;
     println!(
         "Venue \"{}\" → {} ({} fixtures, {} focus points)",
         report.venue, report.output, report.fixtures, report.focus_points
@@ -860,15 +992,14 @@ pub fn export_mvr(
 
 pub fn import_gdtf(
     gdtf_path: &str,
-    mode: Option<&str>,
     name: Option<&str>,
+    list_modes: bool,
     project: &str,
-    fixture_types_dir: &str,
+    fixture_types_dir: Option<String>,
 ) -> Result<(), Box<dyn Error>> {
     use crate::lighting::gdtf;
 
-    let Some(mode) = mode else {
-        // Mode selection is human input: list what the archive offers.
+    if list_modes {
         let bytes = std::fs::read(gdtf_path)
             .map_err(|e| format!("cannot read GDTF archive {gdtf_path}: {e}"))?;
         let description = gdtf::parse_archive(&bytes)?;
@@ -886,42 +1017,42 @@ pub fn import_gdtf(
                 summary.footprint
             );
         }
-        println!("\nRe-run with --mode <name> to import one.");
         return Ok(());
-    };
+    }
 
+    let (project, dirs) = project_lighting(project, fixture_types_dir, None)?;
     let report = crate::lighting::import::import_gdtf(
         Path::new(gdtf_path),
-        mode,
         name,
-        Path::new(project),
-        fixture_types_dir,
+        &project,
+        &dirs.fixture_types,
     )?;
 
-    println!(
-        "Imported \"{}\" (mode \"{}\"):",
-        report.type_name, report.mode
-    );
-    println!(
-        "  archive: {}{}",
-        report.archive,
-        if report.replaced_archive {
-            " (replaced existing)"
-        } else {
-            ""
-        }
-    );
-    println!("  fixture: {}", report.fixture_file);
-    for (offset, channel) in &report.channels {
-        println!("  channel {offset}: {channel}");
+    if report.already_imported {
+        println!(
+            "\"{}\" ({}) is already imported as \"{}\"; nothing changed.",
+            report.fixture, report.manufacturer, report.type_name
+        );
+        return Ok(());
     }
-    if report.warnings.is_empty() {
-        println!("  no distillation warnings");
-    } else {
-        println!("  {} warning(s):", report.warnings.len());
-        for warning in &report.warnings {
-            println!("    {warning}");
-        }
+    println!(
+        "Imported \"{}\" ({}) as \"{}\" — {} modes.",
+        report.fixture, report.manufacturer, report.type_name, report.modes
+    );
+    if let Some(from) = &report.renamed_from {
+        println!(
+            "  another fixture is already called \"{from}\", so this one is \"{}\"",
+            report.type_name
+        );
+    }
+    println!("  archive: {}", report.archive);
+    println!(
+        "  patch it in a venue in any of its modes, e.g.\n    \
+         fixture \"Spot 1\" \"{}\" mode \"<mode>\" @ 1:1",
+        report.type_name
+    );
+    for refused in &report.refused_modes {
+        println!("  cannot drive \"{}\": {}", refused.mode, refused.reason);
     }
     Ok(())
 }
@@ -930,18 +1061,7 @@ pub fn import_gdtf(
 mod import_gdtf_tests {
     use super::*;
 
-    fn write_synthetic_gdtf(dir: &Path) -> PathBuf {
-        let path = dir.join("synth.gdtf");
-        std::fs::write(
-            &path,
-            crate::lighting::gdtf::build_zip(&[(
-                "description.xml",
-                crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.as_bytes(),
-            )]),
-        )
-        .unwrap();
-        path
-    }
+    use crate::testutil::lighting::write_synthetic_gdtf;
 
     #[test]
     fn listing_modes_writes_nothing() {
@@ -953,16 +1073,16 @@ mod import_gdtf_tests {
         import_gdtf(
             gdtf.to_str().unwrap(),
             None,
-            None,
+            true,
             project.to_str().unwrap(),
-            "lighting/fixture_types",
+            None,
         )
         .unwrap();
         assert!(!project.join("lighting").exists(), "listing must not write");
     }
 
     #[test]
-    fn importing_delegates_to_the_shared_importer() {
+    fn importing_copies_the_archive_and_writes_no_record() {
         let dir = tempfile::tempdir().unwrap();
         let gdtf = write_synthetic_gdtf(dir.path());
         let project = dir.path().join("project");
@@ -970,15 +1090,110 @@ mod import_gdtf_tests {
 
         import_gdtf(
             gdtf.to_str().unwrap(),
-            Some("8: RGBS"),
-            Some("Brick"),
+            None,
+            false,
             project.to_str().unwrap(),
-            "lighting/fixture_types",
+            None,
         )
         .unwrap();
-        assert!(project
-            .join("lighting/fixture_types/brick.fixture")
-            .exists());
+        assert!(project.join("lighting/library/synth.gdtf").is_file());
+        assert!(!project.join("lighting/fixture_types").exists());
+    }
+
+    #[test]
+    fn a_name_writes_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdtf = write_synthetic_gdtf(dir.path());
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        import_gdtf(
+            gdtf.to_str().unwrap(),
+            Some("Brick"),
+            false,
+            project.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let record =
+            std::fs::read_to_string(project.join("lighting/fixture_types/brick.fixture")).unwrap();
+        assert!(
+            record.contains("fixture_type \"Brick\"\n  from gdtf(\"lighting/library/synth.gdtf\")"),
+            "{record}"
+        );
+    }
+
+    /// A config naming its lighting directories in the profile this host
+    /// runs (a profile for another host comes first, as the engine skips
+    /// it).
+    fn project_with_dirs(root: &Path) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join("mtrack.yaml"),
+            r#"songs: songs
+profiles:
+  - hostname: not-this-host-x9
+    dmx:
+      universes: []
+      lighting:
+        directories:
+          fixture_types: other/types
+          venues: other/venues
+  - dmx:
+      universes: []
+      lighting:
+        directories:
+          fixture_types: rig/types
+          venues: rig/venues
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_lighting_dirs_come_from_the_hosts_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        project_with_dirs(&project);
+        for given in [
+            project.to_str().unwrap().to_string(),
+            project.join("mtrack.yaml").to_str().unwrap().to_string(),
+        ] {
+            let (root, dirs) = project_lighting(&given, None, None).unwrap();
+            assert_eq!(root, project);
+            assert_eq!(dirs.fixture_types, "rig/types");
+            assert_eq!(dirs.venues, "rig/venues");
+        }
+        // Given ones win; without a config, the defaults.
+        let (_, dirs) =
+            project_lighting(project.to_str().unwrap(), Some("t".into()), None).unwrap();
+        assert_eq!(
+            (dirs.fixture_types.as_str(), dirs.venues.as_str()),
+            ("t", "rig/venues")
+        );
+        let bare = dir.path().join("bare");
+        let (_, dirs) = project_lighting(bare.to_str().unwrap(), None, None).unwrap();
+        assert_eq!(dirs, crate::config::lighting::ProjectDirs::of(None));
+    }
+
+    #[test]
+    fn a_named_import_writes_its_record_in_the_configured_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let gdtf = write_synthetic_gdtf(dir.path());
+        let project = dir.path().join("project");
+        project_with_dirs(&project);
+
+        import_gdtf(
+            gdtf.to_str().unwrap(),
+            Some("Brick"),
+            false,
+            project.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(project.join("rig/types/brick.fixture").is_file());
+        assert!(project.join("lighting/library/synth.gdtf").is_file());
+        assert!(!project.join("lighting/fixture_types").exists());
     }
 }
 
@@ -1103,13 +1318,167 @@ mod tests {
         }
     }
 
+    mod brightness_changes_tests {
+        use super::*;
+
+        /// A project with one song whose show dims on the background layer and
+        /// puts colour on the foreground, over a dimmer-channel par.
+        fn project(light: &str) -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            std::fs::create_dir_all(root.join("lighting/fixture_types")).unwrap();
+            std::fs::create_dir_all(root.join("lighting/venues")).unwrap();
+            std::fs::write(
+                root.join("lighting/fixture_types/par.light"),
+                "fixture_type \"Par\" {\n  channels: 4\n  channel_map: { \"dimmer\": 1, \"red\": 2, \
+                 \"green\": 3, \"blue\": 4 }\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("lighting/venues/v.light"),
+                "venue \"v\" {\n  fixture \"A\" Par @ 1:1 tags [\"wash\"]\n}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("mtrack.yaml"),
+                "songs: songs\nprofiles:\n  - dmx:\n      universes:\n        - universe: 1\n          \
+                 name: u\n      lighting:\n        current_venue: v\n        groups:\n          \
+                 washes:\n            name: washes\n            constraints:\n              - \
+                 AllOf: [\"wash\"]\n        directories:\n          fixture_types: \
+                 lighting/fixture_types\n          venues: lighting/venues\n",
+            )
+            .unwrap();
+            let song = root.join("songs/Song");
+            std::fs::create_dir_all(song.join("lighting")).unwrap();
+            crate::testutil::write_wav(song.join("track.wav"), vec![vec![1_i32; 100]], 44100)
+                .unwrap();
+            std::fs::write(
+                song.join("song.yaml"),
+                "kind: song\nname: Song\nlighting:\n  - file: lighting/show.light\ntracks:\n  - \
+                 name: track\n    file: track.wav\n",
+            )
+            .unwrap();
+            std::fs::write(song.join("lighting/show.light"), light).unwrap();
+            tmp
+        }
+
+        #[test]
+        fn reports_findings_by_song_with_a_summary() {
+            let tmp = project(
+                "show \"s\" {\n  @00:00.000\n  washes: dimmer start_level: 1.0, end_level: 0.5, \
+                 duration: 4s\n  @00:01.000\n  washes: static color: \"blue\", duration: 2s, \
+                 layer: foreground\n}\n",
+            );
+            let (report, total) =
+                brightness_changes_report(tmp.path().to_str().unwrap(), Some("host".into()))
+                    .unwrap();
+            assert!(total >= 1, "{report}");
+            assert!(report.starts_with("Song:\n"), "{report}");
+            assert!(
+                report.contains("[brightness_change_upper_colour] show \"s\" at 1.000s"),
+                "{report}"
+            );
+            assert!(report.contains(" in 1 song."), "{report}");
+        }
+
+        #[test]
+        fn a_project_with_nothing_to_report_says_so() {
+            let tmp = project(
+                "show \"s\" {\n  @00:00.000\n  washes: static color: \"blue\", dimmer: 50%, \
+                 duration: 2s\n}\n",
+            );
+            let (report, total) =
+                brightness_changes_report(tmp.path().to_str().unwrap(), Some("host".into()))
+                    .unwrap();
+            assert_eq!(total, 0, "{report}");
+            assert_eq!(report, "No brightness changes found.\n");
+        }
+
+        #[test]
+        fn an_unreadable_project_is_an_error() {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("mtrack.yaml"), "songs: [").unwrap();
+            assert!(brightness_changes_report(tmp.path().to_str().unwrap(), None).is_err());
+        }
+    }
+
     mod songs_tests {
         use super::*;
+
+        /// A project whose profile adds a fourth layer, `sparkle`, and in its
+        /// songs folder a song whose show draws on it: its folder holds a
+        /// track and the show, and no config.
+        pub(super) fn project_with_a_fourth_layer() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("mtrack.yaml"),
+                "songs: songs\n\
+                 dmx:\n  \
+                   universes:\n    - universe: 1\n      name: main\n  \
+                   lighting:\n    \
+                     layers: [background, midground, foreground, sparkle]\n",
+            )
+            .unwrap();
+            let song_dir = tmp.path().join("songs/Spark");
+            std::fs::create_dir_all(&song_dir).unwrap();
+            crate::testutil::write_wav(
+                song_dir.join("track.wav"),
+                vec![vec![1_i32, 2, 3, 4, 5]],
+                44100,
+            )
+            .unwrap();
+            std::fs::write(
+                song_dir.join("show.light"),
+                "show \"Spark\" {\n    @00:00.000\n    \
+                 front_wash: static color: \"red\", duration: 1s, layer: sparkle\n}\n",
+            )
+            .unwrap();
+            tmp
+        }
+
+        #[test]
+        fn init_reads_shows_against_the_configured_layers() {
+            let tmp = project_with_a_fourth_layer();
+            let songs_dir = tmp.path().join("songs");
+            songs(
+                songs_dir.to_str().unwrap(),
+                true,
+                Some(tmp.path().to_str().unwrap()),
+            )
+            .unwrap();
+            assert!(songs_dir.join("Spark/song.yaml").exists());
+        }
+
+        /// The control: without the config the show's layer is unknown, so
+        /// the same folder is refused, which is what `--config` is for.
+        #[test]
+        fn init_without_the_config_refuses_a_configured_layer() {
+            let tmp = project_with_a_fourth_layer();
+            let songs_dir = tmp.path().join("songs");
+            let err = songs(songs_dir.to_str().unwrap(), true, None).unwrap_err();
+            assert!(err.to_string().contains("unknown layer 'sparkle'"), "{err}");
+            assert!(err.to_string().contains("pass --config"), "{err}");
+            assert!(!songs_dir.join("Spark/song.yaml").exists());
+        }
+
+        /// A config named and unreadable stops the command, rather than
+        /// reading on with the default layers.
+        #[test]
+        fn an_unreadable_config_is_an_error() {
+            let tmp = tempfile::tempdir().unwrap();
+            let err = songs(
+                tmp.path().to_str().unwrap(),
+                false,
+                Some("/nonexistent/project"),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("cannot read"), "{err}");
+        }
 
         #[test]
         fn empty_directory_reports_no_songs() {
             let tmp = tempfile::tempdir().unwrap();
-            assert!(songs(tmp.path().to_str().unwrap(), false).is_ok());
+            assert!(songs(tmp.path().to_str().unwrap(), false, None).is_ok());
         }
 
         #[test]
@@ -1129,7 +1498,7 @@ mod tests {
                 44100,
             )
             .unwrap();
-            assert!(songs(tmp.path().to_str().unwrap(), false).is_ok());
+            assert!(songs(tmp.path().to_str().unwrap(), false, None).is_ok());
         }
 
         #[test]
@@ -1143,14 +1512,14 @@ mod tests {
                 44100,
             )
             .unwrap();
-            assert!(songs(tmp.path().to_str().unwrap(), true).is_ok());
+            assert!(songs(tmp.path().to_str().unwrap(), true, None).is_ok());
             // init should have created a song.yaml
             assert!(song_dir.join("song.yaml").exists());
         }
 
         #[test]
         fn nonexistent_path_returns_error() {
-            assert!(songs("/nonexistent/path/to/songs", false).is_err());
+            assert!(songs("/nonexistent/path/to/songs", false, None).is_err());
         }
 
         #[test]
@@ -1188,7 +1557,7 @@ mod tests {
             .unwrap();
 
             // This exercises the track dedup via HashSet and sorting
-            assert!(songs(tmp.path().to_str().unwrap(), false).is_ok());
+            assert!(songs(tmp.path().to_str().unwrap(), false, None).is_ok());
         }
 
         #[test]
@@ -1212,7 +1581,7 @@ mod tests {
             )
             .unwrap();
 
-            assert!(songs(tmp.path().to_str().unwrap(), true).is_ok());
+            assert!(songs(tmp.path().to_str().unwrap(), true, None).is_ok());
             assert!(song1_dir.join("song.yaml").exists());
             assert!(song2_dir.join("song.yaml").exists());
         }
@@ -1232,22 +1601,51 @@ mod tests {
                 44100,
             )
             .unwrap();
-            crate::songs::initialize_songs(tmp.path()).unwrap();
+            crate::songs::initialize_songs(tmp.path(), &LayerSet::default()).unwrap();
 
             let playlist_path = tmp.path().join("playlist.yaml");
             std::fs::write(&playlist_path, "songs:\n- Cool Song\n").unwrap();
 
             assert!(playlist(
                 tmp.path().to_str().unwrap(),
-                playlist_path.to_str().unwrap()
+                playlist_path.to_str().unwrap(),
+                None
             )
             .is_ok());
+        }
+
+        /// A playlist naming a song whose show draws on a configured layer
+        /// is checked against the project's layers when given its config.
+        #[test]
+        fn reads_shows_against_the_configured_layers() {
+            let tmp = super::songs_tests::project_with_a_fourth_layer();
+            let songs_dir = tmp.path().join("songs");
+            std::fs::write(
+                songs_dir.join("Spark/song.yaml"),
+                "kind: song\nname: Spark\nlighting:\n  - file: show.light\n\
+                 tracks:\n  - name: track\n    file: track.wav\n",
+            )
+            .unwrap();
+            let playlist_path = tmp.path().join("playlist.yaml");
+            std::fs::write(&playlist_path, "songs:\n- Spark\n").unwrap();
+            let (songs_dir, playlist_path) =
+                (songs_dir.to_str().unwrap(), playlist_path.to_str().unwrap());
+
+            playlist(songs_dir, playlist_path, Some(tmp.path().to_str().unwrap())).unwrap();
+            // The control: read with the defaults the song does not load, so
+            // the playlist names a song that is not there.
+            assert!(playlist(songs_dir, playlist_path, None).is_err());
         }
 
         #[test]
         fn invalid_playlist_path() {
             let tmp = tempfile::tempdir().unwrap();
-            assert!(playlist(tmp.path().to_str().unwrap(), "/nonexistent/playlist.yaml").is_err());
+            assert!(playlist(
+                tmp.path().to_str().unwrap(),
+                "/nonexistent/playlist.yaml",
+                None
+            )
+            .is_err());
         }
     }
 
@@ -1615,7 +2013,7 @@ dmx:
                 )
                 .unwrap();
             }
-            crate::songs::initialize_songs(&songs_dir).unwrap();
+            crate::songs::initialize_songs(&songs_dir, &LayerSet::default()).unwrap();
             songs_dir
         }
 
@@ -1652,7 +2050,7 @@ dmx:
             // Provide a specific check
             assert!(verify(
                 config_path.to_str().unwrap(),
-                Some(vec!["track-mappings".to_string()]),
+                Some(vec![verify::Check::TrackMappings]),
                 None
             )
             .is_ok());
@@ -1671,13 +2069,8 @@ dmx:
                 ),
             )
             .unwrap();
-            // Provide a check that doesn't match track-mappings, so that branch is skipped
-            assert!(verify(
-                config_path.to_str().unwrap(),
-                Some(vec!["other-check".to_string()]),
-                None
-            )
-            .is_ok());
+            // Select no checks, so the track-mappings branch is skipped
+            assert!(verify(config_path.to_str().unwrap(), Some(vec![]), None).is_ok());
         }
 
         #[test]

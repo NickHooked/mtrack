@@ -14,17 +14,33 @@
      * -->
 <script lang="ts">
   /* eslint-disable @typescript-eslint/no-explicit-any */
+  import type {
+    EntryFades,
+    FadeConfig,
+    PlaylistDetail,
+    PlaylistInfo,
+  } from "../gen/rules/mtrack_rules";
   import {
     fetchPlaylists,
     fetchPlaylist,
     savePlaylist,
     deletePlaylist,
     activatePlaylist,
-    type PlaylistInfo,
-    type PlaylistData,
+    type AutoPlay,
+    type PlaylistAmbient,
   } from "../lib/api/config";
   import { playbackStore } from "../lib/ws/stores";
   import { registerDirtyGuard } from "../lib/dirtyGuard";
+  import { entrySummary } from "../lib/playlistEntry";
+  import FadeFields from "../components/playlists/FadeFields.svelte";
+  import AmbientFields from "../components/playlists/AmbientFields.svelte";
+  import PaletteStrip from "../components/palette/PaletteStrip.svelte";
+  import SlotOverrides from "../components/palette/SlotOverrides.svelte";
+  import {
+    resolvePlaylist,
+    songColors,
+    unknownOverrides,
+  } from "../lib/palette/resolve";
   import { t } from "svelte-i18n";
   import { get } from "svelte/store";
 
@@ -45,8 +61,20 @@
 
   let playlists = $state<PlaylistInfo[]>([]);
   let selected = $state<string | null>(null);
-  let detail = $state<PlaylistData | null>(null);
+  let detail = $state<PlaylistDetail | null>(null);
   let editSongs = $state<string[]>([]);
+  /** Each song's auto play, kept in step with `editSongs`. */
+  let editAutoPlay = $state<AutoPlay[]>([]);
+  /** Each song's fades, kept in step with `editSongs`. */
+  let editFades = $state<EntryFades[]>([]);
+  /** Each song's ambient light, kept in step with `editSongs`: null for the
+   *  playlist's, false for none, or its own. */
+  let editEntryAmbient = $state<PlaylistAmbient[]>([]);
+  /** Each song's palette overrides, kept in step with `editSongs`. */
+  let editEntryPalette = $state<Record<string, string>[]>([]);
+  /** The slot whose transitions panel is open. */
+  let openTransitions = $state<number | null>(null);
+  let editAmbient = $state<PlaylistAmbient>(null);
   let loading = $state(true);
   let error = $state("");
   let saving = $state(false);
@@ -73,6 +101,26 @@
         )
       : [],
   );
+
+  /** Every entry with the colors it plays in: the show's, the song's, then
+   *  the entry's own. */
+  let strip = $derived(
+    resolvePlaylist(editSongs, detail?.song_palettes ?? {}, editEntryPalette),
+  );
+  /** Whether any song has a palette to show: with none the strip and the
+   *  color settings have nothing to say. */
+  let hasPalettes = $derived(
+    strip.some(
+      (e) => e.palette.slots.length > 0 || e.palette.unknown.length > 0,
+    ),
+  );
+
+  function setEntryPalette(index: number, overrides: Record<string, string>) {
+    editEntryPalette = editEntryPalette.map((p, i) =>
+      i === index ? overrides : p,
+    );
+    dirty = true;
+  }
 
   async function loadPlaylists() {
     try {
@@ -109,6 +157,21 @@
       if (selected !== name) return;
       detail = fetched;
       editSongs = [...fetched.songs];
+      editAutoPlay = fetched.songs.map(
+        (_, i) => fetched.auto_play?.[i] ?? null,
+      );
+      editFades = fetched.songs.map((_, i) => ({
+        fade_out: fetched.fades?.[i]?.fade_out ?? null,
+        fade_in: fetched.fades?.[i]?.fade_in ?? null,
+      }));
+      editEntryAmbient = fetched.songs.map(
+        (_, i) => fetched.entry_ambient?.[i] ?? null,
+      );
+      editEntryPalette = fetched.songs.map((_, i) => ({
+        ...(fetched.entry_palette?.[i] ?? {}),
+      }));
+      openTransitions = null;
+      editAmbient = fetched.ambient ?? null;
       assignSlotIds(editSongs);
       dirty = false;
     } catch (e: any) {
@@ -120,6 +183,11 @@
         error = e.message;
         detail = null;
         editSongs = [];
+        editAutoPlay = [];
+        editFades = [];
+        editEntryAmbient = [];
+        editEntryPalette = [];
+        editAmbient = null;
         dirty = false;
       }
     }
@@ -134,7 +202,13 @@
     try {
       saving = true;
       error = "";
-      await savePlaylist(selected, editSongs);
+      await savePlaylist(selected, editSongs, {
+        auto_play: editAutoPlay,
+        fades: editFades,
+        entry_ambient: editEntryAmbient,
+        entry_palette: editEntryPalette,
+        ambient: editAmbient,
+      });
       dirty = false;
       await loadPlaylists();
       // Re-fetch to get updated available_songs
@@ -168,6 +242,10 @@
         selected = null;
         detail = null;
         editSongs = [];
+        editAutoPlay = [];
+        editFades = [];
+        editEntryAmbient = [];
+        editEntryPalette = [];
         editSlotIds = [];
       }
       confirmDelete = null;
@@ -186,7 +264,7 @@
     }
     try {
       error = "";
-      await savePlaylist(name, []);
+      await savePlaylist(name, [], {}, true);
       newName = "";
       showNewInput = false;
       await loadPlaylists();
@@ -198,12 +276,20 @@
 
   function addSong(song: string) {
     editSongs = [...editSongs, song];
+    editAutoPlay = [...editAutoPlay, null];
+    editFades = [...editFades, { fade_out: null, fade_in: null }];
+    editEntryAmbient = [...editEntryAmbient, null];
+    editEntryPalette = [...editEntryPalette, {}];
     editSlotIds = [...editSlotIds, slotIdCounter++];
     dirty = true;
   }
 
   function removeSong(index: number) {
     editSongs = editSongs.filter((_, i) => i !== index);
+    editAutoPlay = editAutoPlay.filter((_, i) => i !== index);
+    editFades = editFades.filter((_, i) => i !== index);
+    editEntryAmbient = editEntryAmbient.filter((_, i) => i !== index);
+    editEntryPalette = editEntryPalette.filter((_, i) => i !== index);
     editSlotIds = editSlotIds.filter((_, i) => i !== index);
     dirty = true;
   }
@@ -212,12 +298,75 @@
     if (to < 0 || to >= editSongs.length) return;
     const songs = [...editSongs];
     const ids = [...editSlotIds];
+    const autoPlay = [...editAutoPlay];
+    const fades = [...editFades];
+    const entryAmbient = [...editEntryAmbient];
+    const entryPalette = [...editEntryPalette];
     const [item] = songs.splice(from, 1);
     const [id] = ids.splice(from, 1);
+    const [ap] = autoPlay.splice(from, 1);
+    const [fade] = fades.splice(from, 1);
+    const [amb] = entryAmbient.splice(from, 1);
+    const [pal] = entryPalette.splice(from, 1);
     songs.splice(to, 0, item);
     ids.splice(to, 0, id);
+    autoPlay.splice(to, 0, ap);
+    fades.splice(to, 0, fade);
+    entryAmbient.splice(to, 0, amb);
+    entryPalette.splice(to, 0, pal);
     editSongs = songs;
     editSlotIds = ids;
+    editAutoPlay = autoPlay;
+    editFades = fades;
+    editEntryAmbient = entryAmbient;
+    editEntryPalette = entryPalette;
+    dirty = true;
+  }
+
+  function setAutoPlay(index: number, value: AutoPlay) {
+    editAutoPlay = editAutoPlay.map((ap, i) => (i === index ? value : ap));
+    dirty = true;
+  }
+
+  /** A gap typed in: empty starts the song at once. */
+  function setAutoPlayGap(index: number, gap: string) {
+    setAutoPlay(index, gap ? gap : true);
+  }
+
+  function setFade(
+    index: number,
+    kind: keyof EntryFades,
+    value: FadeConfig | null,
+  ) {
+    editFades = editFades.map((f, i) =>
+      i === index ? { ...f, [kind]: value } : f,
+    );
+    dirty = true;
+  }
+
+  function setEntryAmbient(index: number, value: PlaylistAmbient) {
+    editEntryAmbient = editEntryAmbient.map((a, i) =>
+      i === index ? value : a,
+    );
+    dirty = true;
+  }
+
+  /** A row's settings in short, for its closed transitions button. */
+  function rowSummary(i: number): string {
+    const tr = get(t);
+    return entrySummary(
+      {
+        fades: editFades[i],
+        autoPlay: editAutoPlay[i],
+        ambient: editEntryAmbient[i],
+        palette: editEntryPalette[i],
+      },
+      tr,
+    );
+  }
+
+  function setPlaylistAmbient(value: PlaylistAmbient) {
+    editAmbient = value;
     dirty = true;
   }
 
@@ -241,12 +390,28 @@
 
     const songs = [...editSongs];
     const ids = [...editSlotIds];
+    const autoPlay = [...editAutoPlay];
+    const fades = [...editFades];
+    const entryAmbient = [...editEntryAmbient];
+    const entryPalette = [...editEntryPalette];
     const [moved] = songs.splice(dragIndex, 1);
     const [movedId] = ids.splice(dragIndex, 1);
+    const [movedAp] = autoPlay.splice(dragIndex, 1);
+    const [movedFade] = fades.splice(dragIndex, 1);
+    const [movedAmb] = entryAmbient.splice(dragIndex, 1);
+    const [movedPal] = entryPalette.splice(dragIndex, 1);
     songs.splice(targetIndex, 0, moved);
     ids.splice(targetIndex, 0, movedId);
+    autoPlay.splice(targetIndex, 0, movedAp);
+    fades.splice(targetIndex, 0, movedFade);
+    entryAmbient.splice(targetIndex, 0, movedAmb);
+    entryPalette.splice(targetIndex, 0, movedPal);
     editSongs = songs;
     editSlotIds = ids;
+    editAutoPlay = autoPlay;
+    editFades = fades;
+    editEntryAmbient = entryAmbient;
+    editEntryPalette = entryPalette;
     dirty = true;
     dragIndex = null;
     dragOverIndex = null;
@@ -264,7 +429,7 @@
   $effect(() => {
     if (loading || !routePlaylist || selected === routePlaylist) return;
     const match = playlists.find((p) => p.name === routePlaylist);
-    if (match && match.name !== "all_songs") {
+    if (match && !match.reserved) {
       applySelection(match.name);
     }
   });
@@ -325,7 +490,7 @@
       <p class="muted">{$t("playlists.noPlaylists")}</p>
     {:else}
       <ul class="playlist-list">
-        {#each playlists.filter((p) => p.name !== "all_songs") as pl (pl.name)}
+        {#each playlists.filter((p) => !p.reserved) as pl (pl.name)}
           <li class:selected={selected === pl.name}>
             <button
               class="playlist-item"
@@ -421,6 +586,29 @@
         </div>
       </div>
 
+      <div class="ambient-settings" data-testid="playlist-ambient">
+        <AmbientFields
+          value={editAmbient}
+          idPrefix="playlist-ambient"
+          label={$t("playlists.ambient")}
+          hint={$t("playlists.ambientHint")}
+          inheritLabel={$t("playlists.ambientProfile")}
+          inheritValue="profile"
+          inheritPlaceholder={$t("playlists.ambientInherit")}
+          disabled={$playbackStore.locked}
+          onchange={setPlaylistAmbient}
+        />
+      </div>
+
+      {#if hasPalettes}
+        <div class="palette-strip-wrap">
+          <PaletteStrip
+            entries={strip}
+            onselect={(i) => (openTransitions = editSlotIds[i])}
+          />
+        </div>
+      {/if}
+
       <div class="song-columns">
         <div class="song-col">
           <h4>
@@ -436,7 +624,10 @@
             <ul class="song-list">
               {#each editSongs as song, i (editSlotIds[i])}
                 <li
-                  draggable="true"
+                  draggable={openTransitions === editSlotIds[i]
+                    ? "false"
+                    : "true"}
+                  class="song-row"
                   ondragstart={(e) => handleDragStart(e, i)}
                   ondragover={(e) => handleDragOver(e, i)}
                   ondrop={(e) => handleDrop(e, i)}
@@ -460,6 +651,45 @@
                     >
                   </div>
                   <span class="song-name">{song}</span>
+                  {#if unknownOverrides(detail.song_palettes?.[song], editEntryPalette[i] ?? {}).length > 0}
+                    <span
+                      class="warn-badge"
+                      data-testid="entry-palette-warn"
+                      title={$t("palette.unknownSlotHint")}
+                      >{$t("palette.unknownSlot")}</span
+                    >
+                  {/if}
+                  <label
+                    class="auto-play"
+                    title={$t("playlists.autoPlayTooltip")}
+                  >
+                    <input
+                      type="checkbox"
+                      data-testid="auto-play-toggle"
+                      checked={editAutoPlay[i] !== null}
+                      disabled={$playbackStore.locked}
+                      onchange={(e) =>
+                        setAutoPlay(
+                          i,
+                          (e.target as HTMLInputElement).checked ? true : null,
+                        )}
+                    />
+                    {$t("playlists.autoPlay")}
+                  </label>
+                  <button
+                    class="transitions-toggle"
+                    data-testid="transitions-toggle"
+                    aria-expanded={openTransitions === editSlotIds[i]}
+                    aria-controls={`transitions-${editSlotIds[i]}`}
+                    title={$t("playlists.transitionsTooltip")}
+                    onclick={() =>
+                      (openTransitions =
+                        openTransitions === editSlotIds[i]
+                          ? null
+                          : editSlotIds[i])}
+                  >
+                    {rowSummary(i) || $t("playlists.transitions")}
+                  </button>
                   <button
                     class="btn-icon"
                     title={$playbackStore.locked
@@ -471,6 +701,104 @@
                   >
                     &#10005;
                   </button>
+                  {#if openTransitions === editSlotIds[i]}
+                    <div
+                      class="transitions-panel"
+                      id={`transitions-${editSlotIds[i]}`}
+                      data-testid="transitions-panel"
+                    >
+                      <section
+                        class="transitions-group"
+                        data-testid="transitions-before"
+                      >
+                        <h5>{$t("playlists.beforeThisSong")}</h5>
+                        {#if editAutoPlay[i] !== null}
+                          <div class="field">
+                            <label for={`transitions-${editSlotIds[i]}-gap`}
+                              >{$t("playlists.autoPlayGap")}</label
+                            >
+                            <input
+                              id={`transitions-${editSlotIds[i]}-gap`}
+                              class="input auto-play-gap"
+                              type="text"
+                              data-testid="auto-play-gap"
+                              aria-label={$t("playlists.autoPlayGapLabel", {
+                                values: { song },
+                              })}
+                              placeholder={$t(
+                                "playlists.autoPlayGapPlaceholder",
+                              )}
+                              value={typeof editAutoPlay[i] === "string"
+                                ? editAutoPlay[i]
+                                : ""}
+                              disabled={$playbackStore.locked}
+                              onchange={(e) =>
+                                setAutoPlayGap(
+                                  i,
+                                  (e.target as HTMLInputElement).value.trim(),
+                                )}
+                            />
+                          </div>
+                        {/if}
+                        <div class="entry-ambient" data-testid="entry-ambient">
+                          <AmbientFields
+                            value={editEntryAmbient[i] ?? null}
+                            idPrefix={`transitions-${editSlotIds[i]}-ambient`}
+                            label={$t("playlists.ambient")}
+                            hint={$t("playlists.entryAmbientHint")}
+                            inheritLabel={$t("playlists.entryAmbientPlaylist")}
+                            inheritValue="playlist"
+                            inheritPlaceholder={$t(
+                              "playlists.entryAmbientInherit",
+                            )}
+                            disabled={$playbackStore.locked}
+                            onchange={(value) => setEntryAmbient(i, value)}
+                          />
+                        </div>
+                        <FadeFields
+                          kind="fade_in"
+                          value={editFades[i]?.fade_in ?? null}
+                          tracks={detail.song_tracks?.[song] ?? []}
+                          disabled={$playbackStore.locked}
+                          idPrefix={`transitions-${editSlotIds[i]}`}
+                          onchange={(value) => setFade(i, "fade_in", value)}
+                        />
+                      </section>
+                      <section
+                        class="transitions-group"
+                        data-testid="transitions-after"
+                      >
+                        <h5>{$t("playlists.afterThisSong")}</h5>
+                        <FadeFields
+                          kind="fade_out"
+                          value={editFades[i]?.fade_out ?? null}
+                          tracks={detail.song_tracks?.[song] ?? []}
+                          disabled={$playbackStore.locked}
+                          idPrefix={`transitions-${editSlotIds[i]}`}
+                          onchange={(value) => setFade(i, "fade_out", value)}
+                        />
+                      </section>
+                      {#if (detail.song_palettes?.[song]?.slots.length ?? 0) > 0 || Object.keys(editEntryPalette[i] ?? {}).length > 0}
+                        <section
+                          class="transitions-group"
+                          data-testid="transitions-palette"
+                        >
+                          <h5>{$t("palette.entry.title")}</h5>
+                          <span class="field-hint"
+                            >{$t("palette.entry.hint")}</span
+                          >
+                          <SlotOverrides
+                            slots={songColors(detail.song_palettes?.[song])}
+                            overrides={editEntryPalette[i] ?? {}}
+                            baseLabel={$t("palette.entry.base")}
+                            idPrefix={`transitions-${editSlotIds[i]}-palette`}
+                            disabled={$playbackStore.locked}
+                            onchange={(value) => setEntryPalette(i, value)}
+                          />
+                        </section>
+                      {/if}
+                    </div>
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -537,6 +865,97 @@
   }
   .panel-header .btn-sm {
     flex-shrink: 0;
+  }
+  .ambient-settings {
+    padding-top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .auto-play {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--nc-fg-3);
+    white-space: nowrap;
+  }
+  .warn-badge {
+    font-family: var(--nc-font-sans);
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 999px;
+    color: var(--nc-amber-fg);
+    border: 1px solid var(--nc-amber-fg);
+    white-space: nowrap;
+  }
+  .palette-strip-wrap {
+    padding-top: 16px;
+  }
+  .auto-play-gap {
+    max-width: 120px;
+  }
+  .song-list li.song-row {
+    flex-wrap: wrap;
+  }
+  .transitions-toggle {
+    background: none;
+    border: 1px solid var(--card-border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 12px;
+    color: var(--nc-fg-3);
+    cursor: pointer;
+    white-space: nowrap;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .transitions-toggle[aria-expanded="true"] {
+    color: var(--nc-fg-1);
+    border-color: var(--nc-cyan-400);
+  }
+  .transitions-panel {
+    flex-basis: 100%;
+    display: grid;
+    /* Stacked: the song list is narrow, and side by side the groups'
+       fields were too small to read. */
+    grid-template-columns: 1fr;
+    gap: 16px;
+    padding: 10px 0 4px 34px;
+    cursor: default;
+  }
+  .transitions-group {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+  }
+  .transitions-group h5 {
+    margin: 0;
+    font-family: var(--nc-font-sans);
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--nc-fg-3);
+  }
+  .entry-ambient {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  /* The timings wrap rather than shrink past reading. */
+  .entry-ambient :global(.field-row-3) {
+    grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  }
+  @media (max-width: 720px) {
+    .transitions-panel {
+      padding-left: 0;
+    }
   }
   .panel-header__actions {
     display: flex;

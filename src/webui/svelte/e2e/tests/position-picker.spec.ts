@@ -18,6 +18,16 @@
 
 import { test, expect, type Locator, type Page } from "@playwright/test";
 import { SONGS } from "../mock-server/test-data";
+import {
+  ConfigService,
+  PlayerService,
+} from "../../src/gen/player/v1/player_pb";
+import { serveSongConfig } from "../support/config-rpc";
+import { listSongsReply } from "../support/library-rpc";
+import { mockRpc } from "../support/rpc";
+
+import { sendWatch } from "../support/watch";
+import { playbackState } from "../support/playback";
 
 const SONG = "Test Song Beta";
 const ENC = encodeURIComponent(SONG);
@@ -53,25 +63,17 @@ async function openWithPlayhead(page: Page, yaml = SONG_YAML): Promise<void> {
   await routes(page, yaml);
   await page.goto(`/?wsId=${wsId}#/songs/${ENC}/sections`);
   await expect(page.locator(".section-timeline-editor")).toBeVisible();
-  const res = await page.request.post("http://127.0.0.1:3111/test/send-ws", {
-    data: {
-      type: "playback",
-      is_playing: false,
+  await sendWatch(
+    page,
+    wsId,
+    playbackState({
       elapsed_ms: 5000,
       song_name: SONG,
       song_duration_ms: 34000,
-      playlist_name: "setlist",
-      playlist_position: 1,
       playlist_songs: [SONG],
-      tracks: [],
       available_playlists: ["setlist"],
-      persisted_playlist_name: "setlist",
-      locked: false,
-      available_sections: [],
-      _wsId: wsId,
-    },
-  });
-  expect((await res.json()).sent).toBe(1);
+    }),
+  );
   await expect(page.locator(".playhead-info__pos")).toHaveText("m3.3");
 }
 
@@ -80,29 +82,19 @@ async function routes(
   yaml = SONG_YAML,
   patchSong?: (song: (typeof SONGS)["songs"][number]) => void,
 ) {
-  await page.route(`**/api/songs/${ENC}`, async (route) => {
-    if (route.request().method() !== "GET") {
-      await route.fulfill({ status: 200, body: "{}" });
-      return;
+  const rpc = await mockRpc(page);
+  serveSongConfig(rpc, SONG, yaml);
+  rpc.unary(ConfigService.method.saveSongConfig, {});
+  const data = structuredClone(SONGS) as typeof SONGS;
+  for (const s of data.songs) {
+    if (s.name === SONG) {
+      s.has_tempo_map = true;
+      s.duration_ms = 34000;
+      s.duration_display = "0:34";
+      patchSong?.(s);
     }
-    await route.fulfill({
-      status: 200,
-      contentType: "text/yaml",
-      body: yaml,
-    });
-  });
-  await page.route("**/api/songs", async (route) => {
-    const data = structuredClone(SONGS) as typeof SONGS;
-    for (const s of data.songs) {
-      if (s.name === SONG) {
-        s.has_tempo_map = true;
-        s.duration_ms = 34000;
-        s.duration_display = "0:34";
-        patchSong?.(s);
-      }
-    }
-    await route.fulfill({ json: data });
-  });
+  }
+  rpc.unary(PlayerService.method.listSongs, listSongsReply(data));
 }
 
 async function open(page: Page) {

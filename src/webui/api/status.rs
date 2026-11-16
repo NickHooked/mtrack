@@ -12,150 +12,26 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use axum::{extract::State, response::IntoResponse, Json};
-use serde_json::json;
+use super::devices::DeviceError;
+use std::sync::Arc;
 
-use super::super::server::WebUiState;
-use crate::build_info;
+use crate::player::{ControllerStatus, Player};
 
-/// GET /api/status — returns build info, hardware status, and controller status.
-pub(super) async fn get_status(State(state): State<WebUiState>) -> impl IntoResponse {
-    let hardware = state.player.hardware_status();
-    let controllers = state.player.controller_statuses();
-    Json(json!({
-        "build": {
-            "version": build_info::VERSION,
-            "git_hash": build_info::GIT_HASH,
-            "build_time": build_info::BUILD_TIME,
-        },
-        "hardware": hardware,
-        "controllers": controllers,
-        "capabilities": {
-            "video_preview": cfg!(feature = "video"),
-        },
-        "locked": state.player.is_locked(),
-    }))
-}
-
-/// POST /api/controllers/restart — restarts all controllers from current config.
+/// Restarts all controllers from the current config and answers their
+/// status.
 ///
-/// Rejected during playback to avoid disrupting active control surfaces.
-pub(super) async fn restart_controllers(State(state): State<WebUiState>) -> impl IntoResponse {
-    if state.player.is_playing().await {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(json!({"error": "Cannot restart controllers during playback"})),
-        )
-            .into_response();
+/// Refused during playback, to avoid disrupting active control surfaces.
+pub(crate) async fn restart_controllers(
+    player: &Arc<Player>,
+) -> Result<Vec<ControllerStatus>, DeviceError> {
+    if player.is_playing().await {
+        return Err(DeviceError::WrongState(
+            "Cannot restart controllers during playback".to_string(),
+        ));
     }
-    match state.player.reload_controllers().await {
-        Ok(()) => {
-            let statuses = state.player.controller_statuses();
-            (
-                axum::http::StatusCode::OK,
-                Json(json!({"status": "restarted", "controllers": statuses})),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("{}", e)})),
-        )
-            .into_response(),
-    }
-}
-
-/// GET /api/lock — returns the current lock state.
-pub(super) async fn get_lock(State(state): State<WebUiState>) -> impl IntoResponse {
-    Json(json!({"locked": state.player.is_locked()}))
-}
-
-/// PUT /api/lock — sets the lock state.
-pub(super) async fn put_lock(
-    State(state): State<WebUiState>,
-    Json(body): Json<LockRequest>,
-) -> impl IntoResponse {
-    state.player.set_locked(body.locked);
-    Json(json!({"locked": state.player.is_locked()}))
-}
-
-#[derive(serde::Deserialize)]
-pub(super) struct LockRequest {
-    locked: bool,
-}
-
-#[cfg(test)]
-mod test {
-    use super::super::super::api;
-    use super::super::test_helpers::*;
-    use axum::body::Body;
-    use http::StatusCode;
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn get_status_returns_build_and_hardware() {
-        let (state, _dir) = test_state();
-        let app = api::router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("GET")
-                    .uri("/status")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-
-        // Build info is present.
-        assert_eq!(
-            parsed["capabilities"]["video_preview"],
-            cfg!(feature = "video")
-        );
-        assert!(parsed["build"]["version"].is_string());
-        assert!(parsed["build"]["git_hash"].is_string());
-        assert!(parsed["build"]["build_time"].is_string());
-
-        // Hardware section is present with all subsystems.
-        assert!(parsed["hardware"]["init_done"].is_boolean());
-        // Profile fields are present (may be null in test state).
-        assert!(!parsed["hardware"]["hostname"].is_object());
-        assert!(!parsed["hardware"]["profile"].is_object());
-        assert!(parsed["hardware"]["audio"]["status"].is_string());
-        assert!(parsed["hardware"]["midi"]["status"].is_string());
-        assert!(parsed["hardware"]["dmx"]["status"].is_string());
-        assert!(parsed["hardware"]["trigger"]["status"].is_string());
-    }
-
-    #[tokio::test]
-    async fn get_status_no_devices_shows_not_connected() {
-        let (state, _dir) = test_state();
-        let app = api::router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("GET")
-                    .uri("/status")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-
-        // Test state has init_done=true and no devices, so all should be not_connected.
-        assert_eq!(parsed["hardware"]["init_done"], true);
-        assert_eq!(parsed["hardware"]["audio"]["status"], "not_connected");
-        assert_eq!(parsed["hardware"]["midi"]["status"], "not_connected");
-        assert_eq!(parsed["hardware"]["dmx"]["status"], "not_connected");
-        assert_eq!(parsed["hardware"]["trigger"]["status"], "not_connected");
-    }
+    player
+        .reload_controllers()
+        .await
+        .map_err(|e| DeviceError::Internal(e.to_string()))?;
+    Ok(player.controller_statuses())
 }

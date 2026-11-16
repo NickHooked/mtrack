@@ -23,7 +23,9 @@ test.describe("Effects and Logs Cards", () => {
     );
   });
 
-  test("effects card shows active effects from WebSocket", async ({ page }) => {
+  test("effects card shows the active effects of the stage stream", async ({
+    page,
+  }) => {
     // Mock server sends FIXTURE_STATE with active_effects: ["color_wash", "strobe_pulse"]
     const effectsList = page.locator(".effects-card__chips .badge");
     await expect(effectsList).toHaveCount(2);
@@ -31,7 +33,7 @@ test.describe("Effects and Logs Cards", () => {
     await expect(effectsList.nth(1)).toContainText("strobe_pulse");
   });
 
-  test("logs card shows log lines from WebSocket", async ({ page }) => {
+  test("logs card shows log lines from the Watch stream", async ({ page }) => {
     // Mock server sends LOG_LINES with 2 log entries
     const logLines = page.locator(".logs-card__line");
     await expect(logLines.first()).toBeVisible();

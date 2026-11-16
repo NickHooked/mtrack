@@ -12,11 +12,12 @@ $ tar xzf mtrack-<version>-<target>.tar.gz
 $ sudo cp mtrack-<version>-<target>/mtrack /usr/local/bin/mtrack
 ```
 
-On Linux, the binary needs `libasound2` and `libudev1` at runtime. These are
+On Linux, the binary needs `libasound2`, `libudev1` and `libdbus-1-3` at runtime
+(the last for the [Bluetooth controller](../interfaces/bluetooth.md)). These are
 present by default on most desktop distros; on a minimal server:
 
 ```
-$ sudo apt install libasound2 libudev1
+$ sudo apt install libasound2 libudev1 libdbus-1-3
 ```
 
 If you use [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), it
@@ -30,24 +31,18 @@ $ cargo binstall mtrack
 
 For a Raspberry Pi, the least work is a pre-built image: Raspberry Pi OS Lite
 with mtrack installed, running on boot, and reachable at
-`http://mtrack.local:8080`. It also carries `avahi` for that name to resolve and
-`olad` for DMX output.
-
+`http://mtrack.local:8080`, with `avahi` for that name and `olad` for DMX.
 Download `mtrack-<version>-raspberrypi-arm64.img.xz` from the
 [latest release](https://github.com/mdwn/mtrack/releases/latest) and flash it
-with [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
+with Raspberry Pi Imager, filling in Imager's customisation dialog: the image
+ships no default username or password, so that dialog is what makes the Pi
+reachable without a keyboard and a monitor.
 
-**Use Imager's customisation dialog.** The image ships no default username or
-password, so the settings you enter there — username, password, wifi and its
-country, ssh keys — are what make the Pi reachable. Skip it and the first boot
-wants a keyboard and a monitor to run the setup wizard.
-
-Your songs live in `/var/lib/mtrack` on the card. To keep them on a USB drive
-instead, edit `/etc/default/mtrack` and regenerate the unit; that file explains
-how inline.
-
-The image is 64-bit, so it needs a Pi 3 or newer. On anything older, or on
-32-bit Raspberry Pi OS, install from source with cargo.
+[Raspberry Pi Image](raspberry-pi.md) walks through the flash, the first boot,
+finding the Pi on the network, loading songs by upload, patching `olad`, and
+updating. mtrack is run and tested on the Pi 4 and Pi 5. The image is 64-bit, so
+it boots on any 64-bit Pi, but older boards have not been measured with real
+shows; on 32-bit Raspberry Pi OS, install from source with cargo.
 
 ## Debian, Ubuntu and Raspberry Pi OS packages
 
@@ -65,12 +60,10 @@ $ sudo apt install ./mtrack_<version>_arm64.deb
 ```
 
 Installing it through `apt` rather than `dpkg -i` matters: it pulls in
-`libasound2` and `libudev1` for you, and offers `ola` — the Open Lighting
-daemon mtrack talks to for DMX output. Add it if you run lights:
-
-```
-$ sudo apt install ola
-```
+`libasound2`, `libudev1` and `libdbus-1-3` for you. It also installs `ola` — the Open Lighting
+daemon mtrack talks to for DMX output — because the package recommends it. If you
+do not run lights, skip it with `--no-install-recommends`; if you skipped it and
+later want lights, `sudo apt install ola` adds it.
 
 The service is enabled and started automatically, with its library at
 `/var/lib/mtrack`. Point it somewhere else — an SD card or USB drive — by
@@ -92,12 +85,12 @@ tells you what it would have written.
 ## From source with cargo
 
 Building from source requires a Rust toolchain plus a few system packages:
-the protobuf compiler and, on Linux, ALSA and udev development headers.
+the protobuf compiler and, on Linux, ALSA, udev and D-Bus development headers.
 
 On Debian/Ubuntu:
 
 ```
-$ sudo apt install libasound2-dev libudev-dev pkg-config libssl-dev protobuf-compiler
+$ sudo apt install libasound2-dev libudev-dev libdbus-1-dev pkg-config libssl-dev protobuf-compiler
 ```
 
 On macOS:
@@ -112,8 +105,7 @@ Then:
 $ cargo install mtrack --locked
 ```
 
-If you want to use `mtrack` on startup, I recommend copying it to
-`/usr/local/bin`:
+To run `mtrack` on startup, copy it to `/usr/local/bin`:
 
 ```
 $ sudo cp ~/.cargo/bin/mtrack /usr/local/bin/mtrack

@@ -20,7 +20,7 @@ use crate::config;
 /// Resolves the config file path from a user-provided path string.
 /// If it's a file or has a YAML extension, use it directly.
 /// Otherwise treat it as a project directory and look for mtrack.yaml inside.
-fn resolve_config_path(path: &str) -> PathBuf {
+pub(super) fn resolve_config_path(path: &str) -> PathBuf {
     let input = Path::new(path);
     if input.is_file() || input.extension().is_some_and(|e| e == "yaml" || e == "yml") {
         input.to_path_buf()
@@ -35,31 +35,94 @@ struct MigrationAction {
     description: String,
 }
 
+/// What a migration writes to a file.
+enum Content {
+    Text(String),
+    /// The content of this file, read when the plan is applied.
+    CopyOf(PathBuf),
+}
+
+/// One file a migration writes.
+struct FileWrite {
+    path: PathBuf,
+    content: Content,
+    /// Made new (`create_new`), as a claimed venue file is: one there by
+    /// then is refused, never written over. Otherwise a file there is
+    /// backed up ([`back_up`]) before anything is written.
+    new: bool,
+}
+
+/// The suffix a backup of a file takes ([`crate::util::kept_names`]):
+/// `<file>.bak`, then `<file>.bak-2`, `-3`… Appended to the whole file
+/// name, so a backup is never taken for a config, profile, playlist or
+/// venue file.
+const BACKUP_SUFFIX: &str = ".bak";
+
+/// The backup [`back_up`] would make of `path` now: its first free name.
+fn next_backup(path: &Path) -> PathBuf {
+    crate::util::kept_names(path, BACKUP_SUFFIX)
+        .map(|(_, backup)| backup)
+        .find(|backup| std::fs::symlink_metadata(backup).is_err())
+        .unwrap_or_else(|| unreachable!("the names run out only with the integers"))
+}
+
+/// Copies `path` to its first free backup name, made new, so no earlier
+/// backup is written over: the one rule for every file a migration
+/// overwrites (#671). Answers the backup.
+fn back_up(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let contents = crate::util::read_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    crate::util::make_first_free(path, BACKUP_SUFFIX, |backup| {
+        crate::util::write_new_file(backup, &contents)
+    })
+    .map(|(_, backup)| backup)
+    .map_err(|e| format!("backing up {}: {e}", path.display()).into())
+}
+
 /// Collected migration results that can be applied or reported.
 struct MigrationPlan {
     actions: Vec<MigrationAction>,
-    files_to_write: Vec<(PathBuf, String)>,
-    files_to_copy: Vec<(PathBuf, PathBuf)>,
+    files_to_write: Vec<FileWrite>,
     dirs_to_create: Vec<PathBuf>,
     files_to_delete: Vec<PathBuf>,
-    config_yaml: Option<String>,
-    config_path: PathBuf,
-    backup_path: PathBuf,
 }
 
 impl MigrationPlan {
-    fn new(config_path: PathBuf) -> Self {
-        let backup_path = config_path.with_extension("yaml.bak");
+    fn new() -> Self {
         Self {
             actions: Vec::new(),
             files_to_write: Vec::new(),
-            files_to_copy: Vec::new(),
             dirs_to_create: Vec::new(),
             files_to_delete: Vec::new(),
-            config_yaml: None,
-            config_path,
-            backup_path,
         }
+    }
+
+    /// Writes `content` to `path`, backing up a file there first, which
+    /// the report says (under `category`).
+    fn overwrite(&mut self, category: &'static str, path: PathBuf, content: Content) {
+        if path.is_file() {
+            self.add_action(
+                category,
+                format!(
+                    "Backup {} → {}",
+                    path.display(),
+                    next_backup(&path).display()
+                ),
+            );
+        }
+        self.files_to_write.push(FileWrite {
+            path,
+            content,
+            new: false,
+        });
+    }
+
+    /// Makes the new file `path`, refused if one is there by then.
+    fn create(&mut self, path: PathBuf, content: String) {
+        self.files_to_write.push(FileWrite {
+            path,
+            content: Content::Text(content),
+            new: true,
+        });
     }
 
     fn add_action(&mut self, category: &'static str, description: String) {
@@ -97,34 +160,119 @@ impl MigrationPlan {
         }
     }
 
+    /// Applies the plan: directories first; then the files made new (the
+    /// venue that takes the inline fixtures), so a failure there leaves
+    /// every file it would have rewritten (the profiles losing those
+    /// fixtures) as it was; then a backup of every file about to be
+    /// overwritten, before any is; then the rewrites, the config last; then
+    /// the deletions. A failure after a folder or file is made or backed up
+    /// names the folders and files made and the backups taken, which are
+    /// left.
     fn apply(&self) -> Result<(), Box<dyn Error>> {
-        // Create directories.
+        let mut folders = Vec::new();
+        let mut made = Vec::new();
+        let mut backups = Vec::new();
+        self.apply_steps(&mut folders, &mut made, &mut backups)
+            .map_err(|e| {
+                let list = |paths: &[PathBuf]| -> String {
+                    let names: Vec<String> =
+                        paths.iter().map(|p| p.display().to_string()).collect();
+                    names.join(", ")
+                };
+                let mut left = Vec::new();
+                if !folders.is_empty() {
+                    left.push(format!("folders made: {}", list(&folders)));
+                }
+                if !made.is_empty() {
+                    left.push(format!("files made: {}", list(&made)));
+                }
+                if !backups.is_empty() {
+                    left.push(format!("backups taken: {}", list(&backups)));
+                }
+                if left.is_empty() {
+                    e
+                } else {
+                    format!("{e} ({})", left.join("; ")).into()
+                }
+            })
+    }
+
+    /// [`MigrationPlan::apply`]'s steps, each folder made (the highest one
+    /// not there before, which holds any made under it) pushed to
+    /// `folders`, each file made to `made` and each backup taken to
+    /// `backups`.
+    fn apply_steps(
+        &self,
+        folders: &mut Vec<PathBuf>,
+        made: &mut Vec<PathBuf>,
+        backups: &mut Vec<PathBuf>,
+    ) -> Result<(), Box<dyn Error>> {
         for dir in &self.dirs_to_create {
-            std::fs::create_dir_all(dir)?;
+            let highest_missing = dir
+                .ancestors()
+                .take_while(|a| !a.as_os_str().is_empty() && !a.exists())
+                .last()
+                .map(Path::to_path_buf);
+            crate::util::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            folders.extend(highest_missing);
         }
 
-        // Write files.
-        for (path, content) in &self.files_to_write {
-            std::fs::write(path, content)?;
+        // The new files, before anything is rewritten.
+        for write in self.files_to_write.iter().filter(|w| w.new) {
+            write.write()?;
+            made.push(write.path.clone());
+        }
+        self.apply_rewrites(backups)
+    }
+
+    /// [`MigrationPlan::apply`] from the backups on, each backup taken
+    /// pushed to `backups`.
+    fn apply_rewrites(&self, backups: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+        let rewrites = || self.files_to_write.iter().filter(|w| !w.new);
+
+        // Back up every file about to be overwritten, before any is.
+        for write in rewrites() {
+            if write.path.is_file() {
+                backups.push(back_up(&write.path)?);
+            }
         }
 
-        // Copy files.
-        for (src, dst) in &self.files_to_copy {
-            std::fs::copy(src, dst)?;
-        }
-
-        // Backup and rewrite config.
-        if let Some(yaml) = &self.config_yaml {
-            std::fs::copy(&self.config_path, &self.backup_path)?;
-            std::fs::write(&self.config_path, yaml)?;
+        // Write files, the config last.
+        for write in rewrites() {
+            write.write()?;
         }
 
         // Delete files (after successful copy).
         for path in &self.files_to_delete {
-            std::fs::remove_file(path)?;
+            std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
         }
 
         Ok(())
+    }
+}
+
+impl FileWrite {
+    /// Writes the file: made new if [`FileWrite::new`], else made or
+    /// rewritten.
+    fn write(&self) -> Result<(), Box<dyn Error>> {
+        let copied;
+        let contents = match &self.content {
+            Content::Text(text) => text.as_bytes(),
+            Content::CopyOf(source) => {
+                copied = crate::util::read_file(source)
+                    .map_err(|e| format!("{}: {e}", source.display()))?;
+                &copied
+            }
+        };
+        let written = if self.new {
+            crate::util::write_new_file(&self.path, contents)
+        } else {
+            crate::util::write_file(&self.path, contents)
+        };
+        written.map_err(|e| {
+            crate::util::write_failure_message(crate::util::WriteTarget::File(&self.path), &e)
+                .into()
+        })
     }
 }
 
@@ -135,23 +283,24 @@ pub fn migrate(path: &str, apply: bool) -> Result<(), Box<dyn Error>> {
         return Err(format!("Config file not found: {}", config_path.display()).into());
     }
 
-    let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let config_dir = crate::util::project_dir_of(&config_path);
 
     // Deserialize raw (before normalize) to inspect inline fields.
     let raw_player = config::Player::deserialize_raw(&config_path)?;
 
     // Now deserialize with normalize to get the canonical form.
-    let mut player = config::Player::deserialize(&config_path)?;
+    // The load refuses retired fields; this one tolerates the one it moves.
+    let mut player = config::Player::deserialize_for_migration(&config_path)?;
 
-    let mut plan = MigrationPlan::new(config_path.clone());
+    let mut plan = MigrationPlan::new();
 
     // Step C runs before A so fixture mutations are applied to profiles before
     // they are serialized and cleared by the profiles migration step.
     // Step C: Inline fixtures → venue file
-    migrate_fixtures(&raw_player, &mut player, &config_dir, &mut plan);
+    migrate_fixtures(&raw_player, &config_path, &config_dir, &mut plan)?;
 
     // Step A: Profiles → profiles_dir
-    migrate_profiles(&raw_player, &mut player, &config_dir, &mut plan);
+    migrate_profiles(&raw_player, &mut player, &config_dir, &mut plan)?;
 
     // Step B: Playlist → playlists_dir
     migrate_playlist(
@@ -172,16 +321,8 @@ pub fn migrate(path: &str, apply: bool) -> Result<(), Box<dyn Error>> {
 
     // Serialize the modified config.
     let yaml = crate::util::to_yaml_string(&player)?;
-    plan.add_action(
-        "Config",
-        format!(
-            "Backup {} → {}",
-            config_path.display(),
-            plan.backup_path.display()
-        ),
-    );
+    plan.overwrite("Config", config_path.clone(), Content::Text(yaml));
     plan.add_action("Config", format!("Rewrite {}", config_path.display()));
-    plan.config_yaml = Some(yaml);
 
     plan.print_report(apply);
 
@@ -198,26 +339,35 @@ fn migrate_profiles(
     player: &mut config::Player,
     config_dir: &Path,
     plan: &mut MigrationPlan,
-) {
+) -> Result<(), Box<dyn Error>> {
     // Skip if profiles_dir is already set and there are no inline profiles.
     if raw.profiles_dir_raw().is_some() {
-        return;
+        return Ok(());
     }
 
     let profiles = match player.inline_profiles() {
         Some(profiles) if !profiles.is_empty() => profiles.to_vec(),
-        _ => return,
+        _ => return Ok(()),
     };
 
     let profiles_dir = config_dir.join("profiles");
     plan.dirs_to_create.push(profiles_dir.clone());
 
     for (i, profile) in profiles.iter().enumerate() {
-        let filename = match profile.hostname() {
-            Some(hostname) => format!("{}.yaml", hostname),
-            None => format!("profile-{}.yaml", i + 1),
+        let stem = match profile.hostname() {
+            Some(hostname) => hostname.to_string(),
+            None => format!("profile-{}", i + 1),
         };
-        let profile_path = profiles_dir.join(&filename);
+        // The file the profiles directory already has for it (a `.yml`
+        // included), else a new `<stem>.yaml`, by the one lookup.
+        let profile_path = config::profile_file(&profiles_dir, &stem)
+            .map_err(|e| format!("profiles/{stem}: {e}"))?
+            .path()
+            .to_path_buf();
+        let filename = profile_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
 
         let hostname_desc = match profile.hostname() {
             Some(h) => format!("hostname: {}", h),
@@ -226,11 +376,11 @@ fn migrate_profiles(
 
         match crate::util::to_yaml_string(profile) {
             Ok(yaml) => {
+                plan.overwrite("Profiles", profile_path, Content::Text(yaml));
                 plan.add_action(
                     "Profiles",
                     format!("Write profiles/{} ({})", filename, hostname_desc),
                 );
-                plan.files_to_write.push((profile_path, yaml));
             }
             Err(e) => {
                 eprintln!("Warning: failed to serialize profile {}: {}", filename, e);
@@ -243,6 +393,7 @@ fn migrate_profiles(
 
     player.set_profiles_dir("profiles/".to_string());
     player.clear_inline_profiles();
+    Ok(())
 }
 
 /// Step B: Migrate legacy playlist to playlists_dir.
@@ -259,32 +410,42 @@ fn migrate_playlist(
     };
 
     // Resolve the playlist file path.
-    let playlist_path = if Path::new(&playlist_value).is_absolute() {
-        PathBuf::from(&playlist_value)
-    } else {
-        let cfg_dir = config_path.parent().unwrap_or(Path::new("."));
-        cfg_dir.join(&playlist_value)
-    };
+    let playlist_path = crate::util::project_dir_of(config_path).join(&playlist_value);
 
     let playlists_dir = config_dir.join("playlists");
 
-    // Get just the filename from the playlist path.
-    let filename = playlist_path
+    // The playlist's name is its file's stem; it goes to the file the
+    // playlists directory has for that name (`set.yml` there takes a
+    // `set.yaml`), else a new `<name>.yaml`, by the loader's lookup.
+    let name = playlist_path
+        .file_stem()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "playlist".to_string());
+    let dest = crate::playlist::playlist_file(&playlists_dir, &name)
+        .map_err(|e| format!("playlists/{name}: {e}"))?
+        .path()
+        .to_path_buf();
+    let filename = dest
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
-        .unwrap_or_else(|| "playlist.yaml".to_string());
-
-    let dest = playlists_dir.join(&filename);
+        .unwrap_or_default();
 
     plan.dirs_to_create.push(playlists_dir);
 
     if playlist_path.exists() {
-        plan.add_action(
-            "Playlists",
-            format!("Copy {} → playlists/{}", playlist_value, filename),
-        );
-        plan.files_to_copy.push((playlist_path.clone(), dest));
-        plan.files_to_delete.push(playlist_path);
+        // Already where it goes: nothing to copy, and nothing to delete.
+        let same = std::fs::canonicalize(&playlist_path)
+            .ok()
+            .zip(std::fs::canonicalize(&dest).ok())
+            .is_some_and(|(a, b)| a == b);
+        if !same {
+            plan.overwrite("Playlists", dest, Content::CopyOf(playlist_path.clone()));
+            plan.add_action(
+                "Playlists",
+                format!("Copy {} → playlists/{}", playlist_value, filename),
+            );
+            plan.files_to_delete.push(playlist_path);
+        }
     } else {
         plan.add_action(
             "Playlists",
@@ -306,42 +467,105 @@ fn migrate_playlist(
     Ok(())
 }
 
-/// Step C: Migrate inline fixtures to a venue file.
+/// Step C: Move the retired inline fixtures (`dmx.lighting.fixtures`) into a
+/// new venue file, `inline_migrated.venue` (or the first free
+/// `inline_migrated_<n>`). They are read from every place a
+/// profile can carry them — the top-level `dmx`, each inline profile, and
+/// each file in `profiles_dir` — since the loader now refuses the field
+/// wherever it is. The field is never written back, so rewriting
+/// `mtrack.yaml` drops it; a profile file that had it is rewritten too.
 fn migrate_fixtures(
     raw: &config::Player,
-    player: &mut config::Player,
+    config_path: &Path,
     config_dir: &Path,
     plan: &mut MigrationPlan,
-) {
-    // Check raw config for inline fixtures (they live in dmx.lighting.fixtures).
-    // Check profiles first (modern config), then fall back to the raw top-level
-    // dmx field (legacy config before normalize moves it into profiles).
-    let fixtures = if let Some(lighting) = raw.lighting_from_profiles() {
-        lighting.inline_fixtures_raw().cloned()
-    } else {
-        raw.dmx_raw()
-            .and_then(|d| d.lighting())
-            .and_then(|l| l.inline_fixtures_raw())
-            .cloned()
+) -> Result<(), Box<dyn Error>> {
+    let mut fixtures: std::collections::BTreeMap<String, String> = Default::default();
+    let mut venues_dir: Option<String> = None;
+    let mut take = |lighting: &config::Lighting| {
+        if let Some(found) = lighting.retired_inline_fixtures() {
+            fixtures.extend(found.iter().map(|(k, v)| (k.clone(), v.clone())));
+            venues_dir.get_or_insert_with(|| lighting.venues_dir().to_string());
+            true
+        } else {
+            false
+        }
     };
+    if let Some(lighting) = raw.dmx_raw().and_then(|d| d.lighting()) {
+        take(lighting);
+    }
+    for profile in raw.inline_profiles().unwrap_or_default() {
+        if let Some(lighting) = profile.dmx().and_then(|d| d.lighting()) {
+            take(lighting);
+        }
+    }
+    // Profile files: each one that carries the field is rewritten without it.
+    if let Some(dir) = raw.resolved_profiles_dir(config_path) {
+        for path in config::list_profile_files(&dir).unwrap_or_default() {
+            let Ok(profile) = crate::util::yaml_source(&path)
+                .and_then(|source| ::config::Config::builder().add_source(source).build())
+                .and_then(|c| c.try_deserialize::<config::Profile>())
+            else {
+                continue;
+            };
+            let Some(lighting) = profile.dmx().and_then(|d| d.lighting()) else {
+                continue;
+            };
+            if !take(lighting) {
+                continue;
+            }
+            match crate::util::to_yaml_string(&profile) {
+                Ok(yaml) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    plan.overwrite("Lighting", path, Content::Text(yaml));
+                    plan.add_action(
+                        "Lighting",
+                        format!("Rewrite profile {name} without its inline fixtures"),
+                    );
+                }
+                Err(e) => eprintln!("Warning: failed to serialize {}: {e}", path.display()),
+            }
+        }
+    }
 
-    let fixtures = match fixtures {
-        Some(f) if !f.is_empty() => f,
-        _ => return,
-    };
+    if fixtures.is_empty() {
+        return Ok(());
+    }
 
-    let venues_dir = config_dir.join("lighting").join("venues");
-    let venue_path = venues_dir.join("inline_migrated.light");
-
+    // The venues directory the engine reads: the configured one, else the
+    // default — no setting is needed for the default.
+    let venues_dir = config_dir
+        .join(venues_dir.unwrap_or_else(|| config::lighting::DEFAULT_VENUES_DIR.to_string()));
+    // A new venue, by the one rule for new venue files: `inline_migrated`,
+    // else the first of `inline_migrated_2`, `_3`… no venue file declares
+    // and whose `<stem>.venue` is free.
+    let (venue_name, venue_path) = (1u32..)
+        .map(|n| match n {
+            1 => "inline_migrated".to_string(),
+            n => format!("inline_migrated_{n}"),
+        })
+        .find_map(|name| {
+            use crate::lighting::files::{claim_new, Kind, Refusal};
+            match claim_new(Kind::Venue, &venues_dir, &name, &[]) {
+                Ok(claim) => Some(Ok((name, claim.path().to_path_buf()))),
+                Err(Refusal::Declared { .. } | Refusal::Taken { .. }) => None,
+                Err(refusal) => Some(Err(refusal)),
+            }
+        })
+        .unwrap_or_else(|| unreachable!("the names run out only with the integers"))?;
+    let shown = venue_path
+        .strip_prefix(config_dir)
+        .unwrap_or(&venue_path)
+        .display()
+        .to_string();
     plan.dirs_to_create.push(venues_dir);
 
-    // Generate venue DSL.
-    let mut lines = vec![format!("venue \"inline_migrated\" {{")];
-    let mut sorted_fixtures: Vec<_> = fixtures.iter().collect();
-    sorted_fixtures.sort_by_key(|(name, _)| name.as_str());
-
-    for (name, type_spec) in &sorted_fixtures {
-        // type_spec is expected to be "Type @ universe:channel"
+    // Generate venue DSL; each value is "Type @ universe:channel".
+    let mut lines = vec![format!("venue \"{venue_name}\" {{")];
+    for (name, type_spec) in &fixtures {
         lines.push(format!("  fixture \"{}\" {}", name, type_spec));
     }
     lines.push("}".to_string());
@@ -349,40 +573,14 @@ fn migrate_fixtures(
 
     plan.add_action(
         "Lighting",
-        format!(
-            "Write lighting/venues/inline_migrated.light ({} fixtures)",
-            fixtures.len()
-        ),
+        format!("Write {shown} ({} fixtures)", fixtures.len()),
     );
-    plan.files_to_write.push((venue_path, venue_content));
-
+    plan.create(venue_path, venue_content);
     plan.add_action(
         "Lighting",
-        "Set directories.venues: lighting/venues".to_string(),
+        "Clear inline fixtures (dmx.lighting.fixtures is retired)".to_string(),
     );
-    plan.add_action("Lighting", "Clear inline fixtures".to_string());
-
-    // Mutate the player config to set venues dir and clear fixtures.
-    // We need to modify the lighting config on profiles (after normalize).
-    if let Some(profiles) = player.profiles_mut() {
-        for profile in profiles.iter_mut() {
-            if let Some(dmx) = profile.dmx_mut() {
-                if let Some(lighting) = dmx.lighting_mut() {
-                    if lighting.directories().and_then(|d| d.venues()).is_none() {
-                        lighting.set_venues_dir("lighting/venues".to_string());
-                    }
-                    lighting.clear_inline_fixtures();
-                }
-            }
-        }
-    }
-    // Also clear on the raw dmx field (which will be serialized if profiles haven't been set up).
-    if let Some(lighting) = player.lighting_mut() {
-        if lighting.directories().and_then(|d| d.venues()).is_none() {
-            lighting.set_venues_dir("lighting/venues".to_string());
-        }
-        lighting.clear_inline_fixtures();
-    }
+    Ok(())
 }
 
 /// Step D: Clear legacy top-level fields (they've already been normalized into profiles).
@@ -512,7 +710,7 @@ profiles:
         migrate(dir.path().to_str().unwrap(), true).unwrap();
 
         // Venue file should exist.
-        let venue_path = dir.path().join("lighting/venues/inline_migrated.light");
+        let venue_path = dir.path().join("lighting/venues/inline_migrated.venue");
         assert!(venue_path.exists());
 
         let venue = std::fs::read_to_string(&venue_path).unwrap();
@@ -657,6 +855,195 @@ profiles:
         // Backup should contain the original config.
         let backup = std::fs::read_to_string(dir.path().join("mtrack.yaml.bak")).unwrap();
         assert_eq!(original, backup);
+    }
+
+    /// #671: a profile file already in the profiles directory is backed up
+    /// before it is overwritten, and one there as `.yml` is the file the
+    /// profile goes to, never a `.yaml` beside it.
+    #[test]
+    fn test_migrate_backs_up_existing_profile_files() {
+        let (dir, _config_path) = setup_migration(
+            r#"
+songs: songs
+profiles:
+  - hostname: pi-a
+    audio:
+      device: device-a
+  - hostname: pi-b
+    audio:
+      device: device-b
+"#,
+            &[
+                ("profiles/pi-a.yaml", "old a\n"),
+                ("profiles/pi-b.yml", "old b\n"),
+            ],
+        );
+
+        migrate(dir.path().to_str().unwrap(), true).unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).ok();
+        assert_eq!(read("profiles/pi-a.yaml.bak").as_deref(), Some("old a\n"));
+        assert!(read("profiles/pi-a.yaml").unwrap().contains("device-a"));
+        assert_eq!(read("profiles/pi-b.yml.bak").as_deref(), Some("old b\n"));
+        assert!(read("profiles/pi-b.yml").unwrap().contains("device-b"));
+        assert_eq!(read("profiles/pi-b.yaml"), None, "no second file for pi-b");
+    }
+
+    /// #671: the legacy playlist goes to the file the playlists directory
+    /// has for its name (`set.yml` takes a `set.yaml`), backed up first.
+    #[test]
+    fn test_migrate_playlist_resolves_and_backs_up_the_existing_file() {
+        let (dir, _config_path) = setup_migration(
+            "songs: songs\nplaylist: set.yaml\n",
+            &[("set.yaml", "- new\n"), ("playlists/set.yml", "- old\n")],
+        );
+
+        migrate(dir.path().to_str().unwrap(), true).unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).ok();
+        assert_eq!(read("playlists/set.yml").as_deref(), Some("- new\n"));
+        assert_eq!(read("playlists/set.yml.bak").as_deref(), Some("- old\n"));
+        assert_eq!(read("playlists/set.yaml"), None, "not beside set.yml");
+        assert_eq!(read("set.yaml"), None);
+    }
+
+    /// A legacy playlist already in the playlists directory stays: nothing
+    /// is copied over it, and it is not deleted.
+    #[test]
+    fn test_migrate_playlist_already_in_place_is_kept() {
+        let (dir, _config_path) = setup_migration(
+            "songs: songs\nplaylist: playlists/set.yaml\n",
+            &[("playlists/set.yaml", "- song1\n")],
+        );
+
+        migrate(dir.path().to_str().unwrap(), true).unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).ok();
+        assert_eq!(read("playlists/set.yaml").as_deref(), Some("- song1\n"));
+        assert_eq!(read("playlists/set.yaml.bak"), None);
+    }
+
+    /// #671: a venue named `inline_migrated` already there, and its file,
+    /// are left alone: the fixtures go to a new venue with a free name.
+    #[test]
+    fn test_migrate_fixtures_take_a_free_venue_name() {
+        let existing = "venue \"inline_migrated\" {\n}\n";
+        let (dir, _config_path) = setup_migration(
+            r#"
+songs: songs
+dmx:
+  universes:
+    - universe: 1
+      name: main
+  lighting:
+    fixtures:
+      par1: "GenericPar @ 1:1"
+"#,
+            &[
+                ("lighting/venues/old.light", existing),
+                (
+                    "lighting/venues/inline_migrated_2.venue",
+                    "venue \"Other\" {\n}\n",
+                ),
+            ],
+        );
+
+        migrate(dir.path().to_str().unwrap(), true).unwrap();
+
+        let venues = dir.path().join("lighting/venues");
+        assert_eq!(
+            std::fs::read_to_string(venues.join("old.light")).unwrap(),
+            existing
+        );
+        let venue = std::fs::read_to_string(venues.join("inline_migrated_3.venue")).unwrap();
+        assert!(
+            venue.starts_with("venue \"inline_migrated_3\" {"),
+            "{venue}"
+        );
+        assert!(
+            venue.contains("fixture \"par1\" GenericPar @ 1:1"),
+            "{venue}"
+        );
+        assert!(!venues.join("inline_migrated.venue").exists());
+    }
+
+    /// A backup never writes over an earlier one.
+    #[test]
+    fn test_migrate_backup_keeps_an_earlier_backup() {
+        let (dir, _config_path) = setup_migration(
+            "songs: songs\nplaylist: set.yaml\n",
+            &[("set.yaml", "- a\n"), ("mtrack.yaml.bak", "earlier\n")],
+        );
+        let original = std::fs::read_to_string(dir.path().join("mtrack.yaml")).unwrap();
+
+        migrate(dir.path().to_str().unwrap(), true).unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(read("mtrack.yaml.bak"), "earlier\n");
+        assert_eq!(read("mtrack.yaml.bak-2"), original);
+    }
+
+    /// The new venue is made before anything is rewritten: one refused
+    /// (a file there by then) leaves every file to be rewritten as it was,
+    /// with no backup taken.
+    #[test]
+    fn a_refused_new_file_leaves_the_rewrites_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("pi.yaml");
+        let venue = dir.path().join("inline_migrated.venue");
+        std::fs::write(&profile, "fixtures: inline\n").unwrap();
+        std::fs::write(&venue, "someone else's\n").unwrap();
+        let mut plan = MigrationPlan::new();
+        plan.overwrite(
+            "Profiles",
+            profile.clone(),
+            Content::Text("stripped\n".into()),
+        );
+        plan.create(venue.clone(), "venue\n".into());
+
+        assert!(plan.apply().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&profile).unwrap(),
+            "fixtures: inline\n"
+        );
+        assert_eq!(std::fs::read_to_string(&venue).unwrap(), "someone else's\n");
+        assert!(!dir.path().join("pi.yaml.bak").exists(), "no backup taken");
+    }
+
+    /// A failure after the venue is made and the backups are taken names
+    /// them, and the highest folder made: `lighting/`, not there before,
+    /// made with `lighting/venues/`.
+    #[test]
+    fn a_failed_rewrite_names_the_files_made_and_backups_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("pi.yaml");
+        std::fs::write(&profile, "old\n").unwrap();
+        let lighting = dir.path().join("lighting");
+        let venues = lighting.join("venues");
+        let venue = venues.join("inline_migrated.venue");
+        let mut plan = MigrationPlan::new();
+        plan.dirs_to_create.push(venues.clone());
+        plan.create(venue.clone(), "venue\n".into());
+        plan.overwrite("Profiles", profile.clone(), Content::Text("new\n".into()));
+        // Copied from a file that is not there: the rewrite fails.
+        plan.overwrite(
+            "Profiles",
+            dir.path().join("other.yaml"),
+            Content::CopyOf(dir.path().join("missing.yaml")),
+        );
+
+        let error = plan.apply().unwrap_err().to_string();
+        let backup = dir.path().join("pi.yaml.bak");
+        assert!(
+            error.contains(&format!(
+                "(folders made: {}; files made: {}; backups taken: {})",
+                lighting.display(),
+                venue.display(),
+                backup.display()
+            )),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old\n");
     }
 
     #[test]
@@ -804,7 +1191,7 @@ dmx:
         migrate(dir.path().to_str().unwrap(), true).unwrap();
 
         // Venue file should be created from legacy dmx fixtures.
-        let venue_path = dir.path().join("lighting/venues/inline_migrated.light");
+        let venue_path = dir.path().join("lighting/venues/inline_migrated.venue");
         assert!(venue_path.exists());
 
         let venue = std::fs::read_to_string(&venue_path).unwrap();
@@ -814,7 +1201,8 @@ dmx:
 
     #[test]
     fn test_migrate_fixtures_existing_venues_dir_preserved() {
-        // If lighting config already has a venues directory set, don't overwrite it.
+        // A lighting config that names its venues directory keeps it, and
+        // the migrated venue goes there, where the engine will read it.
         let (dir, _config_path) = setup_migration(
             r#"
 songs: songs
@@ -838,11 +1226,11 @@ profiles:
 
         migrate(dir.path().to_str().unwrap(), true).unwrap();
 
-        // Venue file should still be written to the default location.
         assert!(dir
             .path()
-            .join("lighting/venues/inline_migrated.light")
+            .join("custom/venues/inline_migrated.venue")
             .exists());
+        assert!(!dir.path().join("lighting/venues").exists());
 
         // The profile file should preserve the existing custom venues dir
         // (profiles are extracted to files, so the venues dir is in the profile).
@@ -934,7 +1322,7 @@ dmx:
         // Venue file created.
         assert!(dir
             .path()
-            .join("lighting/venues/inline_migrated.light")
+            .join("lighting/venues/inline_migrated.venue")
             .exists());
 
         // Config rewritten with directory pointers.
@@ -1185,7 +1573,7 @@ profiles:
         // Venue file created.
         assert!(dir
             .path()
-            .join("lighting/venues/inline_migrated.light")
+            .join("lighting/venues/inline_migrated.venue")
             .exists());
     }
 
@@ -1454,11 +1842,20 @@ profiles:
 
         migrate(dir.path().to_str().unwrap(), true).unwrap();
 
-        // Venue file created.
-        assert!(dir
-            .path()
-            .join("lighting/venues/inline_migrated.light")
-            .exists());
+        // Venue file created, with every profile's fixtures.
+        let venue =
+            std::fs::read_to_string(dir.path().join("lighting/venues/inline_migrated.venue"))
+                .unwrap();
+        assert!(
+            venue.contains("fixture \"par1\" GenericPar @ 1:1"),
+            "{venue}"
+        );
+        assert!(
+            venue.contains("fixture \"mover1\" MovingHead @ 2:1"),
+            "{venue}"
+        );
+        // And the result loads: nothing retired is left behind.
+        crate::config::Player::deserialize(&dir.path().join("mtrack.yaml")).unwrap();
 
         // Both profile files should have fixtures cleared.
         let pi_a = std::fs::read_to_string(dir.path().join("profiles/pi-a.yaml")).unwrap();
@@ -1472,6 +1869,38 @@ profiles:
             !pi_b.contains("MovingHead"),
             "fixtures should be cleared from pi-b profile"
         );
+    }
+
+    #[test]
+    fn test_migrate_moves_inline_fixtures_out_of_profile_files() {
+        // A profile file in profiles_dir that the loader now refuses: migrate
+        // still reads it, moves its fixtures into a venue and rewrites it.
+        let (dir, config_path) = setup_migration(
+            "songs: songs\nprofiles_dir: profiles/\n",
+            &[(
+                "profiles/pi-a.yaml",
+                "hostname: pi-a\naudio:\n  device: device-a\n  track_mappings:\n    drums: [1]\n\
+                 dmx:\n  universes:\n    - universe: 1\n      name: main\n  lighting:\n    \
+                 current_venue: house\n    fixtures:\n      emergency_light: \"Emergency @ 1:500\"\n",
+            )],
+        );
+        assert!(crate::config::Player::deserialize(&config_path).is_err());
+
+        migrate(dir.path().to_str().unwrap(), true).unwrap();
+
+        let venue =
+            std::fs::read_to_string(dir.path().join("lighting/venues/inline_migrated.venue"))
+                .unwrap();
+        assert!(
+            venue.contains("fixture \"emergency_light\" Emergency @ 1:500"),
+            "{venue}"
+        );
+        let profile = std::fs::read_to_string(dir.path().join("profiles/pi-a.yaml")).unwrap();
+        assert!(!profile.contains("emergency_light"), "{profile}");
+        assert!(profile.contains("current_venue: house"), "{profile}");
+        assert!(dir.path().join("profiles/pi-a.yaml.bak").exists());
+        // It loads now.
+        crate::config::Player::deserialize(&config_path).unwrap();
     }
 
     #[test]
@@ -1557,7 +1986,7 @@ profiles:
         migrate(dir.path().to_str().unwrap(), true).unwrap();
 
         let venue =
-            std::fs::read_to_string(dir.path().join("lighting/venues/inline_migrated.light"))
+            std::fs::read_to_string(dir.path().join("lighting/venues/inline_migrated.venue"))
                 .unwrap();
 
         // Verify sorted order: alpha < middle < zebra.

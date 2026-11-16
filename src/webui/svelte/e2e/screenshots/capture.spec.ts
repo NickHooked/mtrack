@@ -14,7 +14,7 @@
 
 // Documentation screenshot generator (mock-server backed).
 //
-// Captures shots that need a controlled WebSocket state — the lock chip,
+// Captures shots that need a controlled Watch state — the lock chip,
 // a fake "now playing" song name, a fixed elapsed time. Mock-server
 // fixtures are deterministic, so these shots stay byte-stable across
 // machines. Run via `npm run screenshots:mock`.
@@ -26,6 +26,22 @@ import { test, expect, type Page } from "@playwright/test";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
+import { sendWatchUnchecked } from "../support/watch";
+import { CONFIG_STORE, SONGS } from "../mock-server/test-data";
+import {
+  ConfigService,
+  LightingService,
+  PlayerService,
+} from "../../src/gen/player/v1/player_pb";
+import { lightShowReply } from "../support/lighting-rpc";
+import {
+  getConfigReply,
+  serveSongConfig,
+  waveformReply,
+} from "../support/config-rpc";
+import { listSongsReply } from "../support/library-rpc";
+import { stubPlaylist } from "../support/playlists";
+import { mockRpc, type RpcMock } from "../support/rpc";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -53,6 +69,8 @@ interface PlaybackState {
   song_duration_ms: number;
   playlist_name: string;
   playlist_position: number;
+  playlist_at_first: boolean;
+  playlist_at_last: boolean;
   playlist_songs: string[];
   tracks: { name: string; output_channels: number[] }[];
   available_playlists: string[];
@@ -75,6 +93,8 @@ const DEFAULT_PLAYBACK: PlaybackState = {
   song_duration_ms: 180000,
   playlist_name: "setlist",
   playlist_position: 0,
+  playlist_at_first: true,
+  playlist_at_last: false,
   playlist_songs: ["Test Song Alpha", "Test Song Beta"],
   tracks: [
     { name: "kick", output_channels: [0, 1] },
@@ -85,16 +105,6 @@ const DEFAULT_PLAYBACK: PlaybackState = {
   persisted_playlist_name: "setlist",
   locked: false,
 };
-
-async function pushWs(
-  page: Page,
-  wsId: string,
-  msg: Record<string, unknown>,
-): Promise<void> {
-  await page.request.post("http://127.0.0.1:3111/test/send-ws", {
-    data: { ...msg, _wsId: wsId },
-  });
-}
 
 /** Capture a section of the topnav so we can show the lock chip in isolation. */
 async function topnavOnly(page: Page, file: string) {
@@ -131,7 +141,7 @@ test("dashboard", async ({ page }) => {
   await page.goto(`/?wsId=${wsId}#/`);
   // Wait for the mock server's initial state burst (last burst at 200ms) to settle.
   await page.waitForTimeout(300);
-  await pushWs(page, wsId, {
+  await sendWatchUnchecked(page, wsId, {
     ...DEFAULT_PLAYBACK,
     is_playing: true,
     elapsed_ms: 78000,
@@ -146,11 +156,58 @@ test("dashboard", async ({ page }) => {
   await page.screenshot({ path: path.join(DOCS_IMAGES, "dashboard.png") });
 });
 
+test("playback-auto-play", async ({ page }) => {
+  // The playback card while a song waits out its playlist entry's auto-play
+  // gap, with ambient light playing between songs.
+  const wsId = freshWsId("auto-play");
+  await page.goto(`/?wsId=${wsId}#/`);
+  await page.waitForTimeout(300);
+  await sendWatchUnchecked(page, wsId, {
+    ...DEFAULT_PLAYBACK,
+    song_name: "Death is a Fine Companion",
+    song_duration_ms: 254000,
+    playlist_position: 1,
+    auto_play: { song: "Death is a Fine Companion", starts_in_ms: 1600 },
+    ambient: { show: "lighting/ambient.light", state: "playing" },
+  });
+  await expect(page.getByTestId("auto-play-countdown")).toBeVisible();
+  await page.waitForTimeout(200);
+  await page
+    .locator(".playback-card")
+    .screenshot({ path: path.join(DOCS_IMAGES, "playback-auto-play.png") });
+});
+
+test("playlist-auto-play", async ({ page }) => {
+  // The playlist editor with an intro that leads into the opener, the
+  // opener after a gap, and the playlist's own ambient show.
+  await stubPlaylist(page, "setlist", {
+    name: "setlist",
+    songs: [
+      "Line Check",
+      "Walk-on Tape",
+      "Death is a Fine Companion",
+      "The Slow One",
+    ],
+    auto_play: [null, true, "2s", null],
+    ambient: { show: "lighting/walk_in.light", fade_in: "6s" },
+    available_songs: ["Encore", "Outro Tape"],
+  });
+  await page.goto("/#/playlists/setlist");
+  await expect(page.getByTestId("playlist-ambient")).toBeVisible();
+  // Open the opener's transitions panel: its gap lives there.
+  await page.getByTestId("transitions-toggle").nth(2).click();
+  await expect(page.getByTestId("auto-play-gap").first()).toBeVisible();
+  await page.waitForTimeout(300);
+  await page
+    .locator(".detail-panel")
+    .screenshot({ path: path.join(DOCS_IMAGES, "playlist-auto-play.png") });
+});
+
 test("nav-unlocked", async ({ page }) => {
   const wsId = freshWsId("unlocked");
   await page.goto(`/?wsId=${wsId}#/`);
   await page.waitForTimeout(300);
-  await pushWs(page, wsId, { ...DEFAULT_PLAYBACK, locked: false });
+  await sendWatchUnchecked(page, wsId, { ...DEFAULT_PLAYBACK, locked: false });
   await expect(page.locator(".topnav")).toBeVisible();
   await page.waitForTimeout(150);
   await topnavOnly(page, "nav-unlocked.png");
@@ -160,7 +217,7 @@ test("nav-locked", async ({ page }) => {
   const wsId = freshWsId("locked");
   await page.goto(`/?wsId=${wsId}#/`);
   await page.waitForTimeout(300);
-  await pushWs(page, wsId, { ...DEFAULT_PLAYBACK, locked: true });
+  await sendWatchUnchecked(page, wsId, { ...DEFAULT_PLAYBACK, locked: true });
   await expect(page.locator(".topnav__lock--locked")).toBeVisible();
   await expect(page.locator(".live-stripe")).toBeVisible();
   await page.waitForTimeout(150);
@@ -171,7 +228,7 @@ test("timeline-playing", async ({ page }) => {
   const wsId = freshWsId("timeline-playing");
   await page.goto(`/?wsId=${wsId}#/songs/Test%20Song%20Alpha/lighting`);
   await page.waitForTimeout(300);
-  await pushWs(page, wsId, {
+  await sendWatchUnchecked(page, wsId, {
     ...DEFAULT_PLAYBACK,
     is_playing: true,
     elapsed_ms: 42000,
@@ -186,7 +243,7 @@ test("timeline-playing", async ({ page }) => {
 test("status-page", async ({ page }) => {
   await page.goto("/#/status");
   await expect(page.locator(".status-page")).toBeVisible();
-  // Wait for the polled /api/status fetch.
+  // Wait for the status the Watch stream opens with.
   await expect(page.locator(".subsystem-row").first()).toBeVisible();
   await page.waitForTimeout(200);
   await page.screenshot({ path: path.join(DOCS_IMAGES, "status-page.png") });
@@ -306,32 +363,26 @@ const STE_WAVEFORM_VIRTUAL = {
   ],
 };
 
-async function steInstallRoutes(page: Page, yaml: string = STE_YAML) {
+async function steInstallRoutes(
+  page: Page,
+  yaml: string = STE_YAML,
+): Promise<RpcMock> {
+  const rpc = await mockRpc(page);
   // The song's raw YAML (the editor parses tempo/pilot/sections from it).
-  await page.route(`**/api/songs/${STE_ENC}`, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "text/yaml",
-      body: yaml,
-    });
-  });
+  serveSongConfig(rpc, STE_SONG, yaml);
   // A fuller waveform so the lanes look like a real song.
-  await page.route(`**/api/songs/${STE_ENC}/waveform`, async (route) => {
-    await route.fulfill({ json: STE_WAVEFORM });
-  });
+  rpc.unary(ConfigService.method.getSongWaveform, waveformReply(STE_WAVEFORM));
   // Trim the reported duration to the authored region so "Fit" fills the width.
-  await page.route("**/api/songs", async (route) => {
-    const resp = await route.fetch();
-    const data = await resp.json();
-    for (const s of data.songs ?? []) {
-      if (s.name === STE_SONG) {
-        s.has_tempo_map = true;
-        s.duration_ms = 34000;
-        s.duration_display = "0:34";
-      }
+  const data = structuredClone(SONGS);
+  for (const s of data.songs) {
+    if (s.name === STE_SONG) {
+      s.has_tempo_map = true;
+      s.duration_ms = 34000;
+      s.duration_display = "0:34";
     }
-    await route.fulfill({ response: resp, json: data });
-  });
+  }
+  rpc.unary(PlayerService.method.listSongs, listSongsReply(data));
+  return rpc;
 }
 
 async function steOpen(page: Page, yaml: string = STE_YAML, wsId?: string) {
@@ -364,7 +415,7 @@ test("section-dialog", async ({ page }) => {
   await steOpen(page, STE_YAML, wsId);
   // With the song in the player the dialog also offers the playhead as a
   // boundary — the other half of authoring off the measure line.
-  await pushWs(page, wsId, {
+  await sendWatchUnchecked(page, wsId, {
     ...DEFAULT_PLAYBACK,
     song_name: STE_SONG,
     song_duration_ms: 34000,
@@ -388,7 +439,7 @@ test("section-dialog", async ({ page }) => {
 test("position-picker-time", async ({ page }) => {
   const wsId = freshWsId("picker-time");
   await steOpen(page, STE_YAML, wsId);
-  await pushWs(page, wsId, {
+  await sendWatchUnchecked(page, wsId, {
     ...DEFAULT_PLAYBACK,
     song_name: STE_SONG,
     song_duration_ms: 34000,
@@ -412,7 +463,7 @@ test("section-preview-transport", async ({ page }) => {
   await steOpen(page, STE_YAML, wsId);
   // Make this song the one in the player, stopped 12s in, so the editor
   // grows its playhead and musical readout.
-  await pushWs(page, wsId, {
+  await sendWatchUnchecked(page, wsId, {
     ...DEFAULT_PLAYBACK,
     song_name: STE_SONG,
     song_duration_ms: 34000,
@@ -433,7 +484,7 @@ test("player-section-chips", async ({ page }) => {
   await page.waitForTimeout(300);
   // Colors ride along on the WS frame, so the player's chips match the
   // timeline rather than being uniformly grey.
-  await pushWs(page, wsId, {
+  await sendWatchUnchecked(page, wsId, {
     ...DEFAULT_PLAYBACK,
     is_playing: true,
     song_name: STE_SONG,
@@ -456,12 +507,13 @@ test("player-section-chips", async ({ page }) => {
 });
 
 test("virtual-track-waveforms", async ({ page }) => {
-  await steInstallRoutes(page, MET_YAML);
+  const rpc = await steInstallRoutes(page, MET_YAML);
   // The click and pilot lanes come from the same waveform payload as the
   // file tracks; they are synthesized rather than read off disk.
-  await page.route(`**/api/songs/${STE_ENC}/waveform`, async (route) => {
-    await route.fulfill({ json: STE_WAVEFORM_VIRTUAL });
-  });
+  rpc.unary(
+    ConfigService.method.getSongWaveform,
+    waveformReply(STE_WAVEFORM_VIRTUAL),
+  );
   await page.goto(`/#/songs/${STE_ENC}/sections`);
   await expect(page.locator(".section-timeline-editor")).toBeVisible();
   await expect(page.locator(".waveform-lane")).toHaveCount(5);
@@ -494,37 +546,26 @@ show "Main" {
 
 /** Test Song Beta with its own tempo map and a light show that has another. */
 async function tempoImportRoutes(page: Page) {
-  await page.route("**/api/songs", async (route) => {
-    if (route.request().method() !== "GET") return route.continue();
-    const res = await route.fetch();
-    const data = await res.json();
-    for (const song of data.songs ?? []) {
-      if (song.name === STE_SONG) {
-        song.has_lighting = true;
-        song.lighting_files = ["show.light"];
-        song.has_tempo_map = true;
-        song.duration_ms = 34000;
-        song.duration_display = "0:34";
-      }
+  const data = structuredClone(SONGS);
+  for (const song of data.songs) {
+    if (song.name === STE_SONG) {
+      song.has_lighting = true;
+      song.lighting_files = ["show.light"];
+      song.has_tempo_map = true;
+      song.duration_ms = 34000;
+      song.duration_display = "0:34";
     }
-    await route.fulfill({ response: res, json: data });
-  });
-  await page.route(`**/api/songs/${STE_ENC}`, async (route) => {
-    if (route.request().method() !== "GET") return route.continue();
-    await route.fulfill({
-      status: 200,
-      contentType: "text/yaml",
-      body: `${STE_YAML}lighting:\n  - file: show.light\n`,
-    });
-  });
-  await page.route("**/api/lighting/show.light", async (route) => {
-    if (route.request().method() !== "GET") return route.continue();
-    await route.fulfill({
-      status: 200,
-      contentType: "text/plain",
-      body: SHOW_WITH_TEMPO,
-    });
-  });
+  }
+  const rpc = await mockRpc(page);
+  rpc.unary(PlayerService.method.listSongs, listSongsReply(data));
+  serveSongConfig(
+    rpc,
+    STE_SONG,
+    `${STE_YAML}lighting:\n  - file: show.light\n`,
+  );
+  rpc.unary(LightingService.method.getLightShow, (req) =>
+    lightShowReply(req.name === "show.light" ? SHOW_WITH_TEMPO : ""),
+  );
 }
 
 test("tempo-import-dialog", async ({ page }) => {
@@ -583,14 +624,11 @@ metronome:
 `;
 
 test("config-metronome", async ({ page }) => {
-  await page.route("**/api/config/store", async (route) => {
-    const resp = await route.fetch();
-    const data = await resp.json();
-    await route.fulfill({
-      response: resp,
-      json: { ...data, yaml: CONFIG_WITH_METRONOME },
-    });
-  });
+  const rpc = await mockRpc(page);
+  rpc.unary(
+    PlayerService.method.getConfig,
+    getConfigReply({ ...CONFIG_STORE, yaml: CONFIG_WITH_METRONOME }),
+  );
   await page.goto("/#/config");
   await expect(page.locator(".list-view")).toBeVisible();
   await expect(page.locator(".metronome-defaults")).toBeVisible();
@@ -724,7 +762,7 @@ test.describe(() => {
     await page.waitForTimeout(300);
     // 4/4 at 120 BPM, one measure of dots: accent / silent / half / normal.
     // Elapsed sits on beat 3, the half accent, so the flash shows its style.
-    await pushWs(page, wsId, {
+    await sendWatchUnchecked(page, wsId, {
       ...DEFAULT_PLAYBACK,
       is_playing: true,
       elapsed_ms: 1000,

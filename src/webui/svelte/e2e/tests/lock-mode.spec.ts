@@ -13,19 +13,12 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { sendWatch } from "../support/watch";
+import { PLAYBACK_STATE } from "../mock-server/test-data";
+import { PlayerService } from "../../src/gen/player/v1/player_pb";
+import { mockRpc } from "../support/rpc";
 
 let lockTestCounter = 0;
-
-// Helper to push a WebSocket message to a specific connection via mock server.
-async function sendWsMessage(
-  page: import("@playwright/test").Page,
-  wsId: string,
-  msg: object,
-) {
-  await page.request.post("http://127.0.0.1:3111/test/send-ws", {
-    data: { ...msg, _wsId: wsId },
-  });
-}
 
 test.describe("Lock Mode", () => {
   test("lock toggle is visible on dashboard", async ({ page }) => {
@@ -36,23 +29,18 @@ test.describe("Lock Mode", () => {
 
   test("lock toggle calls API when clicked", async ({ page }) => {
     await page.goto("/#/");
-    let lockCalled = false;
-    await page.route("**/api/lock", async (route) => {
-      if (route.request().method() === "PUT") {
-        lockCalled = true;
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ locked: true }),
-        });
-      } else {
-        await route.continue();
-      }
-    });
+    const rpc = await mockRpc(page);
+    rpc.unary(PlayerService.method.setLock, { locked: true });
 
     const lockToggle = page.locator(".topnav__lock");
+    // Locked until the first playback event: wait for it, or the click
+    // would be an unlock, which asks first.
+    await expect(lockToggle).not.toHaveClass(/topnav__lock--locked/);
     await lockToggle.click();
-    expect(lockCalled).toBe(true);
+    await expect
+      .poll(() => rpc.calls(PlayerService.method.setLock).length)
+      .toBe(1);
+    expect(rpc.calls(PlayerService.method.setLock)[0].locked).toBe(true);
   });
 
   test("unlocked state does not have locked class", async ({ page }) => {
@@ -70,15 +58,17 @@ test.describe("Lock Mode", () => {
       page.getByRole("heading", { name: "Hardware Profiles" }),
     ).toBeVisible();
 
-    // Lock the player via WebSocket
-    await sendWsMessage(page, wsId, {
-      type: "playback",
+    // Lock the player via the Watch stream
+    await sendWatch(page, wsId, {
+      ...PLAYBACK_STATE,
       is_playing: false,
       elapsed_ms: 0,
       song_name: "Test Song Alpha",
       song_duration_ms: 180000,
       playlist_name: "setlist",
       playlist_position: 0,
+      playlist_at_first: true,
+      playlist_at_last: false,
       playlist_songs: ["Test Song Alpha", "Test Song Beta"],
       tracks: [],
       available_playlists: ["all_songs", "setlist"],
@@ -105,14 +95,16 @@ test.describe("Lock Mode", () => {
     );
 
     // Send unlocked first so we can dirty the playlist, then lock it.
-    await sendWsMessage(page, wsId, {
-      type: "playback",
+    await sendWatch(page, wsId, {
+      ...PLAYBACK_STATE,
       is_playing: false,
       elapsed_ms: 0,
       song_name: "Test Song Alpha",
       song_duration_ms: 180000,
       playlist_name: "setlist",
       playlist_position: 0,
+      playlist_at_first: true,
+      playlist_at_last: false,
       playlist_songs: ["Test Song Alpha", "Test Song Beta"],
       tracks: [],
       available_playlists: ["all_songs", "setlist"],
@@ -130,14 +122,16 @@ test.describe("Lock Mode", () => {
     await addBtn.click();
 
     // Now lock — the Save button should immediately become disabled.
-    await sendWsMessage(page, wsId, {
-      type: "playback",
+    await sendWatch(page, wsId, {
+      ...PLAYBACK_STATE,
       is_playing: false,
       elapsed_ms: 0,
       song_name: "Test Song Alpha",
       song_duration_ms: 180000,
       playlist_name: "setlist",
       playlist_position: 0,
+      playlist_at_first: true,
+      playlist_at_last: false,
       playlist_songs: ["Test Song Alpha", "Test Song Beta"],
       tracks: [],
       available_playlists: ["all_songs", "setlist"],
@@ -152,14 +146,16 @@ test.describe("Lock Mode", () => {
   test("LIVE-locked stripe surfaces when locked", async ({ page }) => {
     const wsId = `lock-stripe-${++lockTestCounter}-${Date.now()}`;
     await page.goto(`/?wsId=${wsId}#/`);
-    await sendWsMessage(page, wsId, {
-      type: "playback",
+    await sendWatch(page, wsId, {
+      ...PLAYBACK_STATE,
       is_playing: false,
       elapsed_ms: 0,
       song_name: "Test Song Alpha",
       song_duration_ms: 180000,
       playlist_name: "setlist",
       playlist_position: 0,
+      playlist_at_first: true,
+      playlist_at_last: false,
       playlist_songs: ["Test Song Alpha", "Test Song Beta"],
       tracks: [],
       available_playlists: ["all_songs", "setlist"],

@@ -18,6 +18,11 @@
 # runs the areas it can, and reports the ones it cannot. A machine with only
 # audio, or only MIDI, is a normal run rather than a failure.
 #
+# The build step also builds the web UI where npm is installed. Where it is not
+# (the test rig), build it elsewhere with `make build-ui` and copy
+# src/webui/svelte/dist here, .build-stamp included; a UI that does not match
+# this tree's sources is reported above and below the results.
+#
 # USAGE-BEGIN
 # Usage:
 #   ./scripts/hardware-test.sh                  # everything available
@@ -92,6 +97,39 @@ done
 
 cd "$PROJECT_ROOT" || { echo "Cannot enter $PROJECT_ROOT" >&2; exit 1; }
 
+# The player serves the web UI from src/webui/svelte/dist, which cargo does not
+# build. On the test rig it was two months old at a bless on 2026-09-28: the
+# Stage 3D page answered "Not Found", and nothing in the report said so. Build
+# it where npm exists (make skips it when the sources are unchanged), and
+# wherever the stamp make leaves does not match the sources, say so loudly at
+# both ends of the report. The checks do not drive the UI, so this warns
+# rather than fails: the UI simply is not what this run vetted.
+SVELTE_DIR="$PROJECT_ROOT/src/webui/svelte"
+# The Makefile's own FRONTEND_HASH, asked of make rather than copied here: a
+# copy fell behind when the hash took in the rules crate (#650), and from then
+# on every run warned, a fresh UI included.
+ui_hash() {
+    # shellcheck disable=SC2016 # $(FRONTEND_HASH) is make's to expand, not the shell's
+    make -s --no-print-directory -C "$PROJECT_ROOT" \
+        --eval 'print-frontend-hash: ; @echo $(FRONTEND_HASH)' print-frontend-hash 2>/dev/null
+}
+if [[ "$SKIP_BUILD" != "true" ]] && command -v npm >/dev/null 2>&1; then
+    echo "=== Building the web UI ==="
+    if ! make -C "$PROJECT_ROOT" build-ui; then
+        echo "Web UI build failed." >&2
+        exit 1
+    fi
+    echo
+fi
+UI_WARNING=""
+if [[ "$LIST_ONLY" != "true" && "$(cat "$SVELTE_DIR/dist/.build-stamp" 2>/dev/null)" != "$(ui_hash)" ]]; then
+    UI_WARNING="WARNING: the web UI the player serves ($SVELTE_DIR/dist) was not built
+from this tree's sources, or its provenance is unknown (no .build-stamp). This run
+vetted the player, not its web UI. On a machine with npm, run 'make build-ui' and
+copy src/webui/svelte/dist, .build-stamp included, into this checkout."
+    printf '%s\n\n' "$UI_WARNING" >&2
+fi
+
 if [[ "$SKIP_BUILD" != "true" ]]; then
     echo "=== Building mtrack and the harness ==="
     # The harness runs the real binary, so both must be current.
@@ -147,8 +185,12 @@ if [[ "$LIST_ONLY" == "true" ]]; then
     exec "$HARNESS" --list "${ARGS[@]}"
 fi
 
+# Not exec'd, so a stale web UI is repeated under the report, where it is read.
 if [[ "$SELF_TEST" == "true" ]]; then
-    exec "$HARNESS" --self-test "${ARGS[@]}"
+    "$HARNESS" --self-test "${ARGS[@]}"
+else
+    "$HARNESS" "${ARGS[@]}"
 fi
-
-exec "$HARNESS" "${ARGS[@]}"
+status=$?
+[[ -n "$UI_WARNING" ]] && printf '\n%s\n' "$UI_WARNING" >&2
+exit "$status"

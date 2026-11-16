@@ -8,6 +8,14 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { parse } from "yaml";
 import { SONGS } from "../mock-server/test-data";
 
+import {
+  ConfigService,
+  PlayerService,
+} from "../../src/gen/player/v1/player_pb";
+import { getSongConfigReply, listSongFilesReply } from "../support/config-rpc";
+import { listSongsReply } from "../support/library-rpc";
+import { mockRpc } from "../support/rpc";
+
 const SONG = "Test Song Alpha";
 const ENC = encodeURIComponent(SONG);
 const INITIAL_YAML = `name: ${SONG}
@@ -40,37 +48,27 @@ async function installStatefulSongRoutes(
 ) {
   let yaml = initialYaml;
   const writes: string[] = [];
-  const encodedSong = encodeURIComponent(songName);
+  const rpc = await mockRpc(page);
+  rpc.unary(ConfigService.method.getSongConfig, () => getSongConfigReply(yaml));
+  rpc.unary(ConfigService.method.saveSongConfig, (req) => {
+    yaml = req.yaml;
+    writes.push(yaml);
+    return {};
+  });
+  const songs = structuredClone(SONGS);
+  if (!songs.songs.some((song) => song.name === songName)) {
+    songs.songs.push({ ...songs.songs[0], name: songName });
+  }
+  rpc.unary(PlayerService.method.listSongs, listSongsReply(songs));
+  rpc.unary(
+    ConfigService.method.listSongFiles,
+    listSongFilesReply([
+      { name: "opening.mp4", type: "other" },
+      { name: "camera-b.mp4", type: "other" },
+    ]),
+  );
 
-  await page.route(`**/api/songs/${encodedSong}`, async (route) => {
-    const request = route.request();
-    if (request.method() === "PUT") {
-      yaml = request.postData() ?? "";
-      writes.push(yaml);
-      await route.fulfill({ status: 200, json: { status: "updated" } });
-      return;
-    }
-    await route.fulfill({ status: 200, contentType: "text/yaml", body: yaml });
-  });
-  await page.route("**/api/songs", async (route) => {
-    const songs = structuredClone(SONGS);
-    if (!songs.songs.some((song) => song.name === songName)) {
-      songs.songs.push({ ...songs.songs[0], name: songName });
-    }
-    await route.fulfill({ json: songs });
-  });
-  await page.route(`**/api/songs/${encodedSong}/files`, async (route) => {
-    await route.fulfill({
-      json: {
-        files: [
-          { name: "opening.mp4", type: "other" },
-          { name: "camera-b.mp4", type: "other" },
-        ],
-      },
-    });
-  });
-
-  return { writes, currentYaml: () => yaml };
+  return { rpc, writes, currentYaml: () => yaml };
 }
 
 async function openVideo(page: Page, yaml = INITIAL_YAML, songName = SONG) {
@@ -407,23 +405,8 @@ video:
   test("clearly disables preview when the server capability is unavailable", async ({
     page,
   }) => {
-    await page.route("**/api/status", async (route) => {
-      await route.fulfill({
-        json: {
-          build: { version: "test", git_hash: "test", build_time: "test" },
-          hardware: {
-            init_done: true,
-            hostname: "test",
-            profile: "test",
-            audio: { status: "connected", name: "test" },
-            midi: { status: "not_connected", name: null },
-            dmx: { status: "not_connected", name: null },
-            trigger: { status: "not_connected", name: null },
-          },
-          controllers: [],
-          capabilities: { video_preview: false },
-        },
-      });
+    await page.route("**/api/video/capabilities", async (route) => {
+      await route.fulfill({ json: { video_preview: false } });
     });
     await openVideo(page);
     await expect(page.getByTestId("video-preview-unavailable")).toContainText(
@@ -521,22 +504,15 @@ video:
   }) => {
     const nextSong = "Preview Switch Target";
     const nextEnc = encodeURIComponent(nextSong);
-    await installStatefulSongRoutes(page);
-    await page.route(`**/api/songs/${nextEnc}`, async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "text/yaml",
-        body: INITIAL_YAML.replace(`name: ${SONG}`, `name: ${nextSong}`),
-      });
-    });
-    await page.route(`**/api/songs/${nextEnc}/files`, async (route) => {
-      await route.fulfill({ json: { files: [] } });
-    });
-    await page.route("**/api/songs", async (route) => {
-      const songs = structuredClone(SONGS);
-      songs.songs.push({ ...songs.songs[0], name: nextSong });
-      await route.fulfill({ json: songs });
-    });
+    const { rpc } = await installStatefulSongRoutes(page);
+    rpc.unary(ConfigService.method.getSongConfig, (req) =>
+      getSongConfigReply(
+        INITIAL_YAML.replace(`name: ${SONG}`, `name: ${req.name}`),
+      ),
+    );
+    const songs = structuredClone(SONGS);
+    songs.songs.push({ ...songs.songs[0], name: nextSong });
+    rpc.unary(PlayerService.method.listSongs, listSongsReply(songs));
 
     const sockets: string[] = [];
     let firstSocketClosed = false;

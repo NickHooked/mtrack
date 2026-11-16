@@ -28,9 +28,139 @@ use tracing::debug;
 // Thread-local scratch buffers for process_into_output.
 // BATCH_READ_SCRATCH: 8192 samples covers 512 frames * 16 channels; resized if needed.
 // SOURCES_SCRATCH: reuses the Vec across callbacks to avoid per-callback heap allocation.
+// FINISHED_SCRATCH: the ids of the sources a callback finds finished, reused
+// the same way.
 thread_local! {
     static BATCH_READ_SCRATCH: RefCell<Vec<f32>> = RefCell::new(vec![0.0; 8192]);
     static SOURCES_SCRATCH: RefCell<Vec<Arc<Mutex<ActiveSource>>>> = const { RefCell::new(Vec::new()) };
+    static FINISHED_SCRATCH: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Something the audio callback has to say about a source, logged off the
+/// callback by the mixer's log thread: the callback only queues it.
+#[derive(Debug)]
+enum MixerEvent {
+    /// Found finished, or cancelled with no fade-out to see out.
+    Skipped { source_id: u64, finished: bool },
+    /// Its scheduled cut reached.
+    CancelReached {
+        source_id: u64,
+        cancel_sample: u64,
+        current_sample: u64,
+    },
+    /// Its fade-out envelope completed.
+    FadedOut { source_id: u64 },
+    /// It read short and is exhausted.
+    Exhausted { source_id: u64 },
+    /// A read error dropped it mid-playback.
+    ReadError {
+        source_id: u64,
+        error: crate::audio::sample_source::error::SampleSourceError,
+    },
+    /// The finished sources removed after a callback, and how many there were
+    /// before.
+    Removed { count: usize, before: usize },
+}
+
+impl MixerEvent {
+    fn log(self) {
+        match self {
+            MixerEvent::Skipped {
+                source_id,
+                finished,
+            } => debug!(
+                source_id,
+                reason = if finished {
+                    "already_finished"
+                } else {
+                    "cancel_handle_cancelled"
+                },
+                "mixer: source marked finished (skip)"
+            ),
+            MixerEvent::CancelReached {
+                source_id,
+                cancel_sample,
+                current_sample,
+            } => debug!(
+                source_id,
+                cancel_sample,
+                current_sample,
+                "mixer: source marked finished (cancel_at_sample reached)"
+            ),
+            MixerEvent::FadedOut { source_id } => debug!(
+                source_id,
+                "mixer: source marked finished (fade-out envelope completed)"
+            ),
+            MixerEvent::Exhausted { source_id } => debug!(
+                source_id,
+                "mixer: source marked finished (read_frames returned fewer frames)"
+            ),
+            // A read error drops just this source while the mix keeps going --
+            // worth a warning, not just a debug line.
+            MixerEvent::ReadError { source_id, error } => tracing::warn!(
+                source_id,
+                "mixer: source dropped mid-playback (read_frames error): {}",
+                error
+            ),
+            MixerEvent::Removed { count, before } => debug!(
+                count,
+                remaining_before = before,
+                "mixer: removing finished sources"
+            ),
+        }
+    }
+}
+
+/// The audio callback's side of the mixer's log: a bounded lock-free queue the
+/// callback pushes to without waiting, and a count of what did not fit.
+#[derive(Clone)]
+struct MixerLog {
+    tx: crossbeam_channel::Sender<MixerEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// How many events the mixer's log queue holds before the callback drops them.
+const MIXER_LOG_QUEUE: usize = 1024;
+
+/// How often the mixer's log thread drains its queue. It polls rather than
+/// blocking on the queue, so the callback never has a sleeping reader to wake.
+const MIXER_LOG_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+impl MixerLog {
+    /// A log queue, and the thread that logs what the callback queues. The
+    /// thread ends once every mixer sharing the queue is gone.
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::bounded::<MixerEvent>(MIXER_LOG_QUEUE);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let log_dropped = dropped.clone();
+        let _ = std::thread::Builder::new()
+            .name("mtrack-mixer-log".into())
+            .spawn(move || loop {
+                loop {
+                    match rx.try_recv() {
+                        Ok(event) => event.log(),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+                    }
+                }
+                let dropped = log_dropped.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    tracing::warn!(dropped, "mixer: log events dropped (queue full)");
+                }
+                std::thread::sleep(MIXER_LOG_POLL);
+            });
+        MixerLog { tx, dropped }
+    }
+
+    /// Queues `event`, if debug logging is on for the mixer (a read error is
+    /// queued whatever the level), without waiting.
+    fn send(&self, event: MixerEvent) {
+        let wanted = matches!(event, MixerEvent::ReadError { .. })
+            || tracing::enabled!(tracing::Level::DEBUG);
+        if wanted && self.tx.try_send(event).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A source that has been through `prepare_source` and can be inserted by the
@@ -51,6 +181,8 @@ pub struct AudioMixer {
     /// Shared per-output-track gains. Read once per callback (no per-sample
     /// atomics); `None` until installed at hardware init (e.g. mock devices).
     track_gains: Arc<RwLock<Option<Arc<TrackGains>>>>,
+    /// Where the audio callback queues what it has to say, for logging off it.
+    log: MixerLog,
     /// Performance monitoring (test only)
     #[cfg(test)]
     frame_count: Arc<AtomicUsize>,
@@ -124,6 +256,12 @@ pub struct ActiveSource {
     /// Used for crossfading during loop transitions and song-to-song transitions.
     /// When a fade-out envelope completes (end_gain = 0), the source is auto-finished.
     pub gain_envelope: Option<Arc<crate::audio::crossfade::GainEnvelope>>,
+    /// A loop break's (or a stop's) fade-out, anchored to the mixer's
+    /// samples, over the source's own envelope: the two multiply, so
+    /// whatever the playback had under way -- a pass crossing over, a
+    /// section's switch about to be made -- goes on as it would have,
+    /// faded. Auto-finishes the source as a fade-out envelope does.
+    pub break_envelope: Option<Arc<crate::audio::crossfade::GainEnvelope>>,
 }
 
 impl AudioMixer {
@@ -135,6 +273,7 @@ impl AudioMixer {
             sample_rate,
             sample_counter: Arc::new(AtomicU64::new(0)),
             track_gains: Arc::new(RwLock::new(None)),
+            log: MixerLog::new(),
             #[cfg(test)]
             frame_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -259,7 +398,11 @@ impl AudioMixer {
     /// O(N * M) overall. This is fine for typical counts (< 32 sources) but would
     /// need a HashSet if source counts ever grow significantly.
     pub fn remove_sources(&self, source_ids: &[u64]) {
-        let mut sources = self.active_sources.write();
+        Self::retain_unlisted(&mut self.active_sources.write(), source_ids);
+    }
+
+    /// Keeps the sources whose ids `source_ids` does not list.
+    fn retain_unlisted(sources: &mut Vec<Arc<Mutex<ActiveSource>>>, source_ids: &[u64]) {
         sources.retain(|source| {
             let source_guard = source.lock();
             !source_ids.contains(&source_guard.id)
@@ -284,6 +427,178 @@ impl AudioMixer {
         }
     }
 
+    /// Fades out every source of the playback `playback` cancels over
+    /// `fade_samples` on `curve`, or `cut_samples` for a source whose tracks
+    /// `cut` picks (it is given each source's channel labels). The fade
+    /// runs over each source's own envelope: a pass crossing over carries
+    /// on crossing, and a source scheduled to start (the next pass, a
+    /// section's next time round) starts as it would have, under the fade,
+    /// so the audio makes the jumps the playback has already committed.
+    /// Other playbacks' sources, triggered samples and notifications among
+    /// them, are left alone. Returns the ids now fading.
+    pub fn fade_out_playback(
+        &self,
+        playback: &crate::playsync::CancelHandle,
+        fade_samples: u64,
+        curve: crate::audio::crossfade::CrossfadeCurve,
+        cut_samples: u64,
+        cut: impl Fn(&[Vec<String>]) -> bool,
+    ) -> Vec<u64> {
+        self.fade_out_matching(
+            |source| source.cancel_handle.same_as(playback),
+            fade_samples,
+            curve,
+            cut_samples,
+            cut,
+        )
+    }
+
+    /// Fades out the sources `ids` names over `samples`, each from the gain
+    /// it has now, as [`AudioMixer::fade_out_playback`] does.
+    pub fn fade_out_sources(&self, ids: &[u64], samples: u64) {
+        self.fade_out_matching(
+            |source| ids.contains(&source.id),
+            samples,
+            crate::audio::crossfade::CrossfadeCurve::Linear,
+            samples,
+            |_| false,
+        );
+    }
+
+    /// Where `envelope` has got to at mixer sample `now`: one anchored to a
+    /// sample by that sample, one that runs as the source renders by its
+    /// position.
+    fn envelope_gain(envelope: Option<&crate::audio::crossfade::GainEnvelope>, now: u64) -> f32 {
+        match envelope {
+            None => 1.0,
+            Some(env) => match env.start_at_sample() {
+                Some(start) if now < start => env.start_gain(),
+                Some(start) => env.gain_at(now - start),
+                None if env.is_finished() => env.end_gain(),
+                None => env.gain_at(env.position()),
+            },
+        }
+    }
+
+    fn fade_out_matching(
+        &self,
+        select: impl Fn(&ActiveSource) -> bool,
+        fade_samples: u64,
+        fade_curve: crate::audio::crossfade::CrossfadeCurve,
+        cut_samples: u64,
+        cut: impl Fn(&[Vec<String>]) -> bool,
+    ) -> Vec<u64> {
+        use crate::audio::crossfade::{CrossfadeCurve, GainEnvelope};
+        let now = self.current_sample();
+        let sources = self.active_sources.read();
+        let mut fading = Vec::new();
+        for source_arc in sources.iter() {
+            let mut source = source_arc.lock();
+            if !select(&source) {
+                continue;
+            }
+            // One that would start only once the fade is over never does.
+            let (samples, curve) = if cut(source.source.channel_mappings()) {
+                (cut_samples, CrossfadeCurve::Linear)
+            } else {
+                (fade_samples, fade_curve)
+            };
+            if source
+                .start_at_sample
+                .is_some_and(|start| start >= now.saturating_add(samples))
+            {
+                source.is_finished.store(true, Ordering::Relaxed);
+                continue;
+            }
+            // From where an earlier break fade has got to, if one is under
+            // way: a cut of a fade carries on down, never back up.
+            let from = Self::envelope_gain(source.break_envelope.as_deref(), now);
+            source.break_envelope = Some(Arc::new(
+                GainEnvelope::new(from, 0.0, samples, curve).with_start_sample(now),
+            ));
+            fading.push(source.id);
+        }
+        fading
+    }
+
+    /// Cuts every source of the playback `playback` cancels at mixer sample
+    /// `at`, over `samples`: a section's next time round taking over. Each
+    /// follows its own envelope up to `at` -- a pass part way through
+    /// crossing over carries on crossing -- and fades from there, ending at
+    /// `at + samples`, or sooner if it was to end sooner anyway. Other
+    /// playbacks' sources, and those `spare` names, are left alone. Returns
+    /// the ids cut.
+    pub fn cut_playback_at(
+        &self,
+        playback: &crate::playsync::CancelHandle,
+        at: u64,
+        samples: u64,
+        spare: &[u64],
+    ) -> Vec<u64> {
+        use crate::audio::crossfade::GainEnvelope;
+        let now = self.current_sample();
+        let sources = self.active_sources.read();
+        let mut cut = Vec::new();
+        for source_arc in sources.iter() {
+            let mut source = source_arc.lock();
+            if !source.cancel_handle.same_as(playback) || spare.contains(&source.id) {
+                continue;
+            }
+            // Its own envelope's gain at a mixer sample to come: one that
+            // runs as the source renders gets as far as the mixer does, from
+            // when the source starts.
+            let starts = source.start_at_sample.unwrap_or(now).max(now);
+            let own = |t: u64| match source.gain_envelope.as_deref() {
+                Some(env) if env.start_at_sample().is_none() && !env.is_finished() => {
+                    env.gain_at(env.position() + t.saturating_sub(starts))
+                }
+                env => Self::envelope_gain(env, t),
+            };
+            // Its own envelope until the cut, followed in short steps, then
+            // down from where that leaves it.
+            // From now, or from `at` if that has passed already (a cut
+            // scheduled late), so the fade and the cancel end together.
+            let base = now.min(at);
+            let step = u64::from(self.sample_rate / 500).max(1);
+            let span = at - base;
+            let mut knots: Vec<(u64, f32)> = (0..span)
+                .step_by(step as usize)
+                .map(|offset| (offset, own(base + offset)))
+                .collect();
+            knots.push((span, own(at)));
+            knots.push((span + samples.max(1), 0.0));
+            source.gain_envelope = Some(Arc::new(
+                GainEnvelope::piecewise(knots.into()).with_start_sample(base),
+            ));
+            if let Some(cancel_at) = &source.cancel_at_sample {
+                let end = at + samples;
+                let _ = cancel_at.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (current == 0 || current > end).then_some(end)
+                });
+            }
+            cut.push(source.id);
+        }
+        cut
+    }
+
+    /// Replaces the break fades of the sources `ids` names that `keep`
+    /// picks (it is given each source's channel labels), each with its own
+    /// copy of `envelope`.
+    pub fn replace_break_envelopes(
+        &self,
+        ids: &[u64],
+        envelope: &crate::audio::crossfade::GainEnvelope,
+        keep: impl Fn(&[Vec<String>]) -> bool,
+    ) {
+        let sources = self.active_sources.read();
+        for source_arc in sources.iter() {
+            let mut source = source_arc.lock();
+            if ids.contains(&source.id) && keep(source.source.channel_mappings()) {
+                source.break_envelope = Some(Arc::new(envelope.fresh()));
+            }
+        }
+    }
+
     /// Sets a gain envelope on all active sources matching the given IDs.
     /// Each source gets its own envelope instance so they don't share the
     /// atomic position counter (which would cause the fade to advance
@@ -297,16 +612,7 @@ impl AudioMixer {
         for source_arc in sources.iter() {
             let mut source = source_arc.lock();
             if source_ids.contains(&source.id) {
-                let mut own = crate::audio::crossfade::GainEnvelope::new(
-                    envelope.start_gain(),
-                    envelope.end_gain(),
-                    envelope.duration_samples(),
-                    envelope.curve(),
-                );
-                if let Some(s) = envelope.start_at_sample() {
-                    own = own.with_start_sample(s);
-                }
-                source.gain_envelope = Some(Arc::new(own));
+                source.gain_envelope = Some(Arc::new(envelope.fresh()));
             }
         }
     }
@@ -465,7 +771,9 @@ impl AudioMixer {
             sources_to_process.extend(sources.iter().cloned());
         }
 
-        let mut finished_source_ids: Vec<u64> = Vec::new();
+        let mut finished_source_ids =
+            FINISHED_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+        finished_source_ids.clear();
 
         // Snapshot the shared track gains once per callback. Individual gain
         // targets are read once per source below — never per sample.
@@ -478,23 +786,18 @@ impl AudioMixer {
             // Sources with an active fade-out envelope should continue playing
             // until the fade completes, even if cancelled. This allows crossfade
             // transitions to complete smoothly when breaking out of a loop.
-            let has_active_fade_out = active_source
-                .gain_envelope
-                .as_ref()
-                .is_some_and(|env| env.end_gain() == 0.0 && !env.is_finished());
+            let has_active_fade_out = [&active_source.gain_envelope, &active_source.break_envelope]
+                .into_iter()
+                .flatten()
+                .any(|env| env.end_gain() == 0.0 && !env.is_finished());
 
             if active_source.is_finished.load(Ordering::Relaxed)
                 || (active_source.cancel_handle.is_cancelled() && !has_active_fade_out)
             {
-                debug!(
-                    source_id = active_source.id,
-                    reason = if active_source.is_finished.load(Ordering::Relaxed) {
-                        "already_finished"
-                    } else {
-                        "cancel_handle_cancelled"
-                    },
-                    "mixer: source marked finished (skip)"
-                );
+                self.log.send(MixerEvent::Skipped {
+                    source_id: active_source.id,
+                    finished: active_source.is_finished.load(Ordering::Relaxed),
+                });
                 finished_source_ids.push(active_source.id);
                 continue;
             }
@@ -503,12 +806,11 @@ impl AudioMixer {
             if let Some(ref cancel_at) = active_source.cancel_at_sample {
                 let cancel_sample = cancel_at.load(Ordering::Relaxed);
                 if cancel_sample > 0 && current_sample >= cancel_sample {
-                    debug!(
-                        source_id = active_source.id,
+                    self.log.send(MixerEvent::CancelReached {
+                        source_id: active_source.id,
                         cancel_sample,
                         current_sample,
-                        "mixer: source marked finished (cancel_at_sample reached)"
-                    );
+                    });
                     active_source.is_finished.store(true, Ordering::Relaxed);
                     finished_source_ids.push(active_source.id);
                     continue;
@@ -601,8 +903,13 @@ impl AudioMixer {
                         // envelope, or an already-finished one that sits at its
                         // end gain).
                         let envelope = active_source.gain_envelope.clone();
-                        let fade_active = envelope.as_ref().is_some_and(|env| !env.is_finished());
-                        let constant_gain = envelope.as_ref().map_or(1.0, |env| env.end_gain());
+                        let break_envelope = active_source.break_envelope.clone();
+                        let fade_active = [&envelope, &break_envelope]
+                            .into_iter()
+                            .flatten()
+                            .any(|env| !env.is_finished());
+                        let constant_gain = envelope.as_ref().map_or(1.0, |env| env.end_gain())
+                            * break_envelope.as_ref().map_or(1.0, |env| env.end_gain());
 
                         // Track gain ramping is rare (only the batches right
                         // after a gain change); everything else takes the
@@ -650,9 +957,19 @@ impl AudioMixer {
                                     // global sample to a position; for a render-driven
                                     // one it simply steps the position. Either way the
                                     // ramp tracks the actual audio sample-for-sample.
-                                    let env = envelope.as_ref().expect("fade_active implies Some");
                                     let global = current_sample + (start_frame + frame_idx) as u64;
-                                    env.advance_at(global, 1)
+                                    let at = |env: &Option<
+                                        Arc<crate::audio::crossfade::GainEnvelope>,
+                                    >| {
+                                        env.as_ref().map_or(1.0, |env| {
+                                            if env.is_finished() {
+                                                env.end_gain()
+                                            } else {
+                                                env.advance_at(global, 1)
+                                            }
+                                        })
+                                    };
+                                    at(&envelope) * at(&break_envelope)
                                 } else {
                                     constant_gain
                                 };
@@ -688,44 +1005,42 @@ impl AudioMixer {
                         // full batch lands on the target (snapped exactly on
                         // the next callback by the |delta| < 1e-6 fast path).
                         for i in 1..active_source.gain.cur.len() {
-                            let advanced =
-                                active_source.gain.cur[i] + active_source.gain.inc[i] * frames_got as f32;
+                            let advanced = active_source.gain.cur[i]
+                                + active_source.gain.inc[i] * frames_got as f32;
                             active_source.gain.cur[i] = advanced;
                         }
 
                         // Auto-finish sources whose fade-out envelope has completed.
-                        if let Some(ref env) = active_source.gain_envelope {
-                            if env.is_finished() && env.end_gain() == 0.0 {
-                                debug!(
-                                    source_id = active_source.id,
-                                    "mixer: source marked finished (fade-out envelope completed)"
-                                );
-                                active_source.is_finished.store(true, Ordering::Relaxed);
-                                finished_source_ids.push(active_source.id);
-                            }
+                        let faded_out =
+                            [&active_source.gain_envelope, &active_source.break_envelope]
+                                .into_iter()
+                                .flatten()
+                                .any(|env| env.is_finished() && env.end_gain() == 0.0);
+                        if faded_out {
+                            self.log.send(MixerEvent::FadedOut {
+                                source_id: active_source.id,
+                            });
+                            active_source.is_finished.store(true, Ordering::Relaxed);
+                            finished_source_ids.push(active_source.id);
                         }
 
                         if frames_got < frames_needed {
                             // Buffered sources report false during transient underruns;
                             // unbuffered sources return None → treated as EOF.
                             if active_source.source.is_exhausted().unwrap_or(true) {
-                                debug!(
-                                    source_id = active_source.id,
-                                    "mixer: source marked finished (read_frames returned fewer frames)"
-                                );
+                                self.log.send(MixerEvent::Exhausted {
+                                    source_id: active_source.id,
+                                });
                                 active_source.is_finished.store(true, Ordering::Relaxed);
                                 finished_source_ids.push(active_source.id);
                             }
                         }
                     }
-                    Err(e) => {
-                        // A read error drops just this source while the mix
-                        // keeps going — worth a warning, not just a debug line.
-                        tracing::warn!(
-                            source_id = active_source.id,
-                            "mixer: source dropped mid-playback (read_frames error): {}",
-                            e
-                        );
+                    Err(error) => {
+                        self.log.send(MixerEvent::ReadError {
+                            source_id: active_source.id,
+                            error,
+                        });
                         active_source.is_finished.store(true, Ordering::Relaxed);
                         finished_source_ids.push(active_source.id);
                     }
@@ -737,20 +1052,28 @@ impl AudioMixer {
         self.sample_counter
             .fetch_add(num_frames as u64, Ordering::Relaxed);
 
-        // Clean up finished sources inline - we're the only accessor in direct callback mode
+        // Clean up finished sources inline, unless another thread has the
+        // sources locked: the callback does not wait for it. They are marked
+        // finished (or their playback cancelled), so the next callback finds
+        // them again and removes them then.
         if !finished_source_ids.is_empty() {
-            debug!(
-                source_ids = ?finished_source_ids,
-                remaining_before = self.active_sources.read().len(),
-                "mixer: removing finished sources"
-            );
-            self.remove_sources(&finished_source_ids);
+            if let Some(mut sources) = self.active_sources.try_write() {
+                let before = sources.len();
+                Self::retain_unlisted(&mut sources, &finished_source_ids);
+                self.log.send(MixerEvent::Removed {
+                    count: before - sources.len(),
+                    before,
+                });
+            }
         }
 
-        // Put back the scratch Vec for reuse (drop Arc refs first)
+        // Put back the scratch Vecs for reuse (drop Arc refs first)
         sources_to_process.clear();
         SOURCES_SCRATCH.with(|cell| {
             *cell.borrow_mut() = sources_to_process;
+        });
+        FINISHED_SCRATCH.with(|cell| {
+            *cell.borrow_mut() = finished_source_ids;
         });
     }
 
@@ -778,41 +1101,9 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    /// Helper function to create a test source using MemorySampleSource wrapped in ChannelMappedSource
-    fn create_test_source(
-        samples: Vec<f32>,
-        channel_count: u16,
-        mappings: Vec<Vec<String>>,
-    ) -> Box<dyn ChannelMappedSampleSource> {
-        let memory_source =
-            crate::audio::sample_source::MemorySampleSource::new(samples, channel_count, 44100);
-        Box::new(crate::audio::sample_source::ChannelMappedSource::new(
-            Box::new(memory_source),
-            mappings,
-            channel_count,
-        ))
-    }
-
-    /// Helper to build an ActiveSource with common defaults.
-    fn make_active_source(
-        id: u64,
-        source: Box<dyn ChannelMappedSampleSource>,
-        track_mappings: HashMap<String, Vec<u16>>,
-    ) -> ActiveSource {
-        ActiveSource {
-            id,
-            source,
-            track_mappings,
-            channel_mappings: Vec::new(),
-            cached_source_channel_count: 0,
-            is_finished: Arc::new(AtomicBool::new(false)),
-            cancel_handle: CancelHandle::new(),
-            start_at_sample: None,
-            cancel_at_sample: None,
-            gain: Default::default(),
-            gain_envelope: None,
-        }
-    }
+    use crate::testutil::mixer::{
+        active_source_uncached as make_active_source, memory_source as create_test_source,
+    };
 
     #[test]
     fn test_basic_mixing() {
@@ -1097,6 +1388,258 @@ mod tests {
 
         // Source should have been marked finished and cleaned up.
         assert_eq!(mixer.active_sources.read().len(), 0);
+    }
+
+    #[test]
+    fn fade_out_playback_fades_one_playback_from_where_each_source_is() {
+        use crate::audio::crossfade::{CrossfadeCurve, GainEnvelope};
+        let mixer = AudioMixer::new(1, 48_000);
+        let mut tm = HashMap::new();
+        tm.insert("pad".to_string(), vec![1]);
+        tm.insert("click".to_string(), vec![1]);
+        let playback = CancelHandle::new();
+        let source = |id, track: &str, value: f32| {
+            let mut s = make_active_source(
+                id,
+                create_test_source(vec![value; 4_000], 1, vec![vec![track.to_string()]]),
+                tm.clone(),
+            );
+            s.cancel_handle = playback.clone();
+            s
+        };
+
+        // A pad at full gain; a second, half way through fading in; a click;
+        // one not yet started; and a triggered sample of its own playback.
+        mixer.add_source(source(1, "pad", 1.0));
+        let mut fading_in = source(2, "pad", 1.0);
+        fading_in.gain_envelope =
+            Some(Arc::new(GainEnvelope::fade_in(400, CrossfadeCurve::Linear)));
+        mixer.add_source(fading_in);
+        mixer.add_source(source(3, "click", 1.0));
+        let mut pending = source(4, "pad", 1.0);
+        pending.start_at_sample = Some(600);
+        mixer.add_source(pending);
+        let mut late = source(6, "pad", 1.0);
+        late.start_at_sample = Some(10_000);
+        mixer.add_source(late);
+        let mut other = make_active_source(
+            5,
+            create_test_source(vec![1.0; 4_000], 1, vec![vec!["pad".to_string()]]),
+            tm.clone(),
+        );
+        other.cancel_handle = CancelHandle::new();
+        mixer.add_source(other);
+
+        let mut out = vec![0.0f32; 200];
+        mixer.process_into_output(&mut out, 200);
+
+        let fading =
+            mixer.fade_out_playback(&playback, 1_000, CrossfadeCurve::EqualPower, 10, |labels| {
+                labels.iter().flatten().all(|l| l == "click")
+            });
+        assert_eq!(fading, vec![1, 2, 3, 4]);
+        let envelopes = |id: u64| {
+            let sources = mixer.active_sources.read();
+            let s = sources.iter().find(|s| s.lock().id == id).unwrap().clone();
+            let s = s.lock();
+            let of = |e: &Option<Arc<GainEnvelope>>| {
+                e.as_ref().map(|e| (e.start_gain(), e.duration_samples()))
+            };
+            (of(&s.gain_envelope), of(&s.break_envelope))
+        };
+        assert_eq!(envelopes(1), (None, Some((1.0, 1_000))), "full gain fades");
+        assert_eq!(
+            envelopes(2),
+            (Some((0.0, 400)), Some((1.0, 1_000))),
+            "half way in carries on in, under the fade"
+        );
+        assert_eq!(envelopes(3).1, Some((1.0, 10)), "the click cuts");
+        assert_eq!(
+            envelopes(4).1,
+            Some((1.0, 1_000)),
+            "the pending source starts as scheduled, under the fade"
+        );
+        assert_eq!(
+            envelopes(5),
+            (None, None),
+            "another playback's source is left alone"
+        );
+        let late_finished = {
+            let sources = mixer.active_sources.read();
+            let s = sources.iter().find(|s| s.lock().id == 6).unwrap().clone();
+            let finished = s.lock().is_finished.load(Ordering::Relaxed);
+            finished
+        };
+        assert!(
+            late_finished,
+            "one starting only after the fade never starts"
+        );
+
+        // A second fade -- a stop cutting the first -- carries on down from
+        // where the first has got to, never back up.
+        let mut out = vec![0.0f32; 500];
+        mixer.process_into_output(&mut out, 500);
+        mixer.fade_out_playback(&playback, 10, CrossfadeCurve::Linear, 10, |_| false);
+        let (from, _) = envelopes(1).1.unwrap();
+        let (expected, _) = CrossfadeCurve::EqualPower.gains(0.5);
+        assert!((from - expected).abs() < 0.01, "{from} vs {expected}");
+    }
+
+    /// Renders `frames` of a mono mixer, a buffer at a time.
+    fn render_mono(mixer: &AudioMixer, frames: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(frames);
+        let mut left = frames;
+        while left > 0 {
+            let n = left.min(64);
+            let mut buf = vec![0.0f32; n];
+            mixer.process_into_output(&mut buf, n);
+            out.extend(buf);
+            left -= n;
+        }
+        out
+    }
+
+    #[test]
+    fn a_break_lets_a_scheduled_section_switch_happen_under_its_fade() {
+        use crate::audio::crossfade::{CrossfadeCurve, GainEnvelope};
+        let mixer = AudioMixer::new(1, 48_000);
+        let mut tm = HashMap::new();
+        tm.insert("t".to_string(), vec![1]);
+        let playback = CancelHandle::new();
+        let source = |id, value: f32| {
+            let mut s = make_active_source(
+                id,
+                create_test_source(vec![value; 8_000], 1, vec![vec!["t".to_string()]]),
+                tm.clone(),
+            );
+            s.cancel_handle = playback.clone();
+            s
+        };
+        // A section's switch scheduled at 1_000: the pass playing out fades
+        // over 10 samples from there and is cut; the next time round, at
+        // half the level to tell them apart, comes in.
+        let switch = 1_000u64;
+        let mut outgoing = source(1, 1.0);
+        outgoing.gain_envelope = Some(Arc::new(
+            GainEnvelope::fade_out(10, CrossfadeCurve::Linear).with_start_sample(switch),
+        ));
+        outgoing.cancel_at_sample = Some(Arc::new(AtomicU64::new(switch + 10)));
+        mixer.add_source(outgoing);
+        let mut incoming = source(2, 0.5);
+        incoming.start_at_sample = Some(switch);
+        incoming.gain_envelope = Some(Arc::new(GainEnvelope::fade_in(10, CrossfadeCurve::Linear)));
+        mixer.add_source(incoming);
+
+        let mut out = render_mono(&mixer, 192);
+        let now = mixer.current_sample();
+        mixer.fade_out_playback(&playback, 4_000, CrossfadeCurve::Linear, 10, |_| false);
+        out.extend(render_mono(&mixer, 4_500));
+
+        let fade = |at: usize| 1.0 - (at as f32 - now as f32) / 4_000.0;
+        // Before the switch the pass playing out fades; after it the next
+        // time round plays on, under the same fade, to its end.
+        for at in [500usize, 990] {
+            assert!((out[at] - fade(at)).abs() < 0.01, "{at}: {}", out[at]);
+        }
+        for at in [1_020usize, 2_000, 4_000] {
+            assert!((out[at] - 0.5 * fade(at)).abs() < 0.01, "{at}: {}", out[at]);
+        }
+        // No step: the switch keeps its own short crossfade.
+        for at in now as usize..out.len() - 1 {
+            assert!(
+                (out[at + 1] - out[at]).abs() < 0.06,
+                "step at {at}: {} to {}",
+                out[at],
+                out[at + 1]
+            );
+        }
+        assert!(out[now as usize + 4_010..].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn a_section_cut_follows_a_fade_under_way_to_the_cut() {
+        use crate::audio::crossfade::{CrossfadeCurve, GainEnvelope};
+        let mixer = AudioMixer::new(1, 48_000);
+        let mut tm = HashMap::new();
+        tm.insert("t".to_string(), vec![1]);
+        let playback = CancelHandle::new();
+        let mut fading_in = make_active_source(
+            1,
+            create_test_source(vec![1.0; 8_000], 1, vec![vec!["t".to_string()]]),
+            tm.clone(),
+        );
+        fading_in.cancel_handle = playback.clone();
+        fading_in.cancel_at_sample = Some(Arc::new(AtomicU64::new(0)));
+        fading_in.gain_envelope = Some(Arc::new(GainEnvelope::fade_in(
+            2_000,
+            CrossfadeCurve::Linear,
+        )));
+        mixer.add_source(fading_in);
+        let mut out = render_mono(&mixer, 512);
+        let now = mixer.current_sample() as usize;
+        let at = now + 960;
+        mixer.cut_playback_at(&playback, at as u64, 10, &[]);
+        out.extend(render_mono(&mixer, 2_000));
+        // It goes on fading in, not held where the cut found it, right up to
+        // the cut; then it is gone.
+        for t in [now + 200, now + 600, at - 5] {
+            let expected = t as f32 / 2_000.0;
+            assert!(
+                (out[t] - expected).abs() < 0.02,
+                "{t}: {} vs {expected}",
+                out[t]
+            );
+        }
+        assert!(out[at + 20..].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn a_break_mid_crossover_lets_the_outgoing_pass_finish_crossing() {
+        use crate::audio::crossfade::{CrossfadeCurve, GainEnvelope};
+        let mixer = AudioMixer::new(1, 48_000);
+        let mut tm = HashMap::new();
+        tm.insert("t".to_string(), vec![1]);
+        let playback = CancelHandle::new();
+        let source = |id| {
+            let mut s = make_active_source(
+                id,
+                create_test_source(vec![1.0; 12_000], 1, vec![vec!["t".to_string()]]),
+                tm.clone(),
+            );
+            s.cancel_handle = playback.clone();
+            s
+        };
+        // Two passes crossing over 2_000 samples from 0: the outgoing is cut
+        // where its fade ends.
+        let mut outgoing = source(1);
+        outgoing.gain_envelope = Some(Arc::new(
+            GainEnvelope::fade_out(2_000, CrossfadeCurve::EqualPower).with_start_sample(0),
+        ));
+        outgoing.cancel_at_sample = Some(Arc::new(AtomicU64::new(2_000)));
+        mixer.add_source(outgoing);
+        let mut incoming = source(2);
+        incoming.gain_envelope = Some(Arc::new(
+            GainEnvelope::fade_in(2_000, CrossfadeCurve::EqualPower).with_start_sample(0),
+        ));
+        mixer.add_source(incoming);
+
+        let mut out = render_mono(&mixer, 512);
+        mixer.fade_out_playback(&playback, 8_000, CrossfadeCurve::Linear, 10, |_| false);
+        out.extend(render_mono(&mixer, 9_000));
+
+        // The crossing goes on under the fade, the outgoing pass all the way
+        // down by its cut: no step there, or anywhere.
+        for at in 0..out.len() - 1 {
+            assert!(
+                (out[at + 1] - out[at]).abs() < 0.01,
+                "step at {at}: {} to {}",
+                out[at],
+                out[at + 1]
+            );
+        }
+        // Past the crossing, the incoming pass alone, faded.
+        let fade = |at: usize| 1.0 - (at as f32 - 512.0) / 8_000.0;
+        assert!((out[4_000] - fade(4_000)).abs() < 0.01, "{}", out[4_000]);
     }
 
     #[test]
@@ -2119,6 +2662,32 @@ mod tests {
             for i in 0..8 {
                 assert_eq!(output[i * 2], 0.5, "frame {i} should have audio");
             }
+        }
+
+        /// A callback that finds the sources locked by another thread does
+        /// not wait to remove the finished ones: it leaves them, silent, for
+        /// the next callback to remove.
+        #[test]
+        fn process_into_output_leaves_removal_to_the_next_callback_when_locked() {
+            let mixer = AudioMixer::new(2, 44100);
+            let source = create_test_source(vec![0.5; 100], 1, vec![vec!["t".to_string()]]);
+            let mut mappings = HashMap::new();
+            mappings.insert("t".to_string(), vec![1]);
+            let active = make_active_source(1, source, mappings);
+            active.cancel_handle.cancel();
+            mixer.add_source(active);
+
+            let sources = mixer.get_active_sources();
+            let mut output = vec![0.0f32; 8 * 2];
+            {
+                let _reader = sources.read();
+                mixer.process_into_output(&mut output, 8);
+            }
+            assert!(output.iter().all(|&s| s == 0.0));
+            assert_eq!(sources.read().len(), 1, "removed under another's lock");
+            mixer.process_into_output(&mut output, 8);
+            assert!(output.iter().all(|&s| s == 0.0));
+            assert!(sources.read().is_empty(), "left for the next callback");
         }
     }
 

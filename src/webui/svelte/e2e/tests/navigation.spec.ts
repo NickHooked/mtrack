@@ -30,6 +30,7 @@ test.describe("Navigation", () => {
   test("shows all nav links", async () => {
     await expect(nav.dashboardLink).toBeVisible();
     await expect(nav.configLink).toBeVisible();
+    await expect(nav.lightingLink).toBeVisible();
     await expect(nav.songsLink).toBeVisible();
     await expect(nav.playlistsLink).toBeVisible();
     await expect(nav.statusLink).toBeVisible();
@@ -45,6 +46,9 @@ test.describe("Navigation", () => {
 
     await nav.playlistsLink.click();
     await expect(nav.activeLink()).toHaveAttribute("href", "#/playlists");
+
+    await nav.lightingLink.click();
+    await expect(nav.activeLink()).toHaveAttribute("href", "#/lighting");
 
     await nav.configLink.click();
     await expect(nav.activeLink()).toHaveAttribute("href", "#/config");
@@ -65,6 +69,9 @@ test.describe("Navigation", () => {
     await nav.playlistsLink.click();
     await expect(page).toHaveTitle(/Playlists - mtrack/);
 
+    await nav.lightingLink.click();
+    await expect(page).toHaveTitle(/Lighting - mtrack/);
+
     await nav.configLink.click();
     await expect(page).toHaveTitle(/Config - mtrack/);
 
@@ -77,9 +84,9 @@ test.describe("Navigation", () => {
     await expect(page.getByText("Not Found")).toBeVisible();
   });
 
-  test("WebSocket status indicator shows connected", async () => {
+  test("Watch stream status indicator shows connected", async () => {
     await expect(nav.statusIndicator).toBeVisible();
-    // The "off" modifier is absent when the WebSocket is connected.
+    // The "off" modifier is absent when the Watch stream is connected.
     await expect(nav.statusIndicator).not.toHaveClass(/topnav__conn--off/);
   });
 
@@ -87,7 +94,7 @@ test.describe("Navigation", () => {
     await expect(nav.lockToggle).toBeVisible();
   });
 
-  test("now-playing shows song name from WebSocket", async () => {
+  test("now-playing shows song name from the Watch stream", async () => {
     await expect(nav.nowPlayingSong).toBeVisible();
     await expect(nav.nowPlayingSong).toHaveText("Test Song Alpha");
   });

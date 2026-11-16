@@ -13,29 +13,34 @@
      *
      * -->
 <script lang="ts">
-  /* eslint-disable @typescript-eslint/no-explicit-any */
+  import type { ProfileDraft } from "../../lib/api/config";
+
+  import type {
+    AudioDeviceInfo,
+    MidiDeviceInfo,
+  } from "../../gen/rules/mtrack_rules";
   import { t } from "svelte-i18n";
   import { get } from "svelte/store";
   import { showConfirm } from "../../lib/dialog.svelte";
-  import type { AudioDeviceInfo, MidiDeviceInfo } from "../../lib/api/config";
   import Tooltip from "./Tooltip.svelte";
   import AudioSection from "./AudioSection.svelte";
   import MidiSection from "./MidiSection.svelte";
   import DmxSection from "./DmxSection.svelte";
   import TriggerSection from "./TriggerSection.svelte";
   import ControllersSection from "./ControllersSection.svelte";
-  import LightingSection from "./LightingSection.svelte";
   import NotificationsSection from "./NotificationsSection.svelte";
   import type { NotifBrowseTarget } from "./NotificationsSection.svelte";
   import StatusEventsSection from "./StatusEventsSection.svelte";
 
   interface Props {
-    profile: any;
+    profile: ProfileDraft;
     audioDevices: AudioDeviceInfo[];
     midiDevices: MidiDeviceInfo[];
     trackNames: string[];
     sampleNames: string[];
     initialSection?: string;
+    /** The profile's name in Lighting URLs; absent for an unsaved draft. */
+    profileName?: string;
     onrefreshDevices: () => void;
     onchange: () => void;
     onsectionchange?: (section: string) => void;
@@ -52,6 +57,7 @@
     trackNames,
     sampleNames,
     initialSection,
+    profileName,
     onrefreshDevices,
     onchange,
     onsectionchange,
@@ -82,9 +88,8 @@
   }
   let activeTab = $state<TabKey>(getInitialTab());
 
-  function isEnabled(key: string): boolean {
-    if (key === "lighting") return profile.dmx != null;
-    return profile[key] != null;
+  function isEnabled(key: TabKey): boolean {
+    return (key === "lighting" ? profile.dmx : profile[key]) != null;
   }
 
   function toggleSection(section: string, enabled: boolean) {
@@ -103,13 +108,16 @@
           playing_events: [],
         };
     } else {
-      if (section === "audio") delete profile.audio;
-      else if (section === "midi") delete profile.midi;
-      else if (section === "lighting") delete profile.dmx;
-      else if (section === "trigger") delete profile.trigger;
-      else if (section === "controllers") delete profile.controllers;
-      else if (section === "notifications") delete profile.notifications;
-      else if (section === "status_events") delete profile.status_events;
+      // An explicit null, not a deleted key: the server keeps a section a
+      // save leaves out (so a partial save cannot wipe it), and removes one
+      // sent as null.
+      if (section === "audio") profile.audio = null;
+      else if (section === "midi") profile.midi = null;
+      else if (section === "lighting") profile.dmx = null;
+      else if (section === "trigger") profile.trigger = null;
+      else if (section === "controllers") profile.controllers = null;
+      else if (section === "notifications") profile.notifications = null;
+      else if (section === "status_events") profile.status_events = null;
     }
     onchange();
   }
@@ -177,7 +185,8 @@
         if (v) {
           profile.hostname = v;
         } else {
-          delete profile.hostname;
+          // null, not deleted: a key a save leaves out is kept as it was.
+          profile.hostname = null;
         }
         onchange();
       }}
@@ -290,8 +299,29 @@
       <div class="panel-body">
         <DmxSection bind:dmx={profile.dmx} {onchange} />
 
-        <div class="lighting-subsection">
-          <LightingSection bind:lighting={profile.dmx.lighting} {onchange} />
+        <div class="lighting-subsection" data-testid="lighting-summary">
+          <h4 class="summary-title">{$t("profile.lightingSummary.title")}</h4>
+          <dl class="summary-list">
+            <div>
+              <dt>{$t("profile.lightingSummary.venue")}</dt>
+              <dd>
+                {profile.dmx.lighting?.current_venue ??
+                  $t("profile.lightingSummary.noVenue")}
+              </dd>
+            </div>
+            <div>
+              <dt>{$t("profile.lightingSummary.groups")}</dt>
+              <dd>{Object.keys(profile.dmx.lighting?.groups ?? {}).length}</dd>
+            </div>
+          </dl>
+          <p class="field-hint">{$t("profile.lightingSummary.hint")}</p>
+          {#if profileName}
+            <a
+              class="btn btn-sm"
+              href={`#/lighting/groups?profile=${encodeURIComponent(profileName)}`}
+              >{$t("profile.lightingSummary.edit")}</a
+            >
+          {/if}
         </div>
       </div>
     {:else if activeTab === "trigger" && profile.trigger}
@@ -448,6 +478,32 @@
     margin-top: 20px;
     padding-top: 16px;
     border-top: 1px solid var(--border);
+  }
+  .summary-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .summary-list {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .summary-list dt {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+  .summary-list dd {
+    margin: 0;
+    font-size: 14px;
+  }
+  .lighting-subsection .btn {
+    margin-top: 8px;
+    display: inline-block;
   }
   .panel-footer {
     display: flex;

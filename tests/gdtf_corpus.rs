@@ -27,29 +27,12 @@
 //! half-import. Warnings are printed for eyeballing, not asserted — they
 //! are manufacturer-file facts, not code facts.
 
+mod common;
+
 use mtrack::lighting::gdtf;
 
 fn corpus_files() -> Vec<std::path::PathBuf> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/gdtf-corpus");
-    assert!(
-        dir.is_dir(),
-        "no corpus at {}: create it and drop .gdtf files in (see module docs)",
-        dir.display()
-    );
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .expect("readable corpus dir")
-        .filter_map(|entry| {
-            let path = entry.expect("dir entry").path();
-            (path.extension().is_some_and(|e| e == "gdtf")).then_some(path)
-        })
-        .collect();
-    files.sort();
-    assert!(
-        !files.is_empty(),
-        "corpus dir {} holds no .gdtf files",
-        dir.display()
-    );
-    files
+    common::corpus_files("gdtf-corpus", "gdtf", common::Listing::NonEmpty)
 }
 
 /// The PixelBrick proof, against the real manufacturer file: distilling
@@ -80,6 +63,13 @@ fn pixelbrick_rgbs_matches_the_hand_written_definition() {
     assert_eq!(ft.footprint(), 4);
     // The three numbers hand-transcribed from the manual, recovered from
     // the manufacturer's own file.
+    // The effect mode references a template four times; its summary must
+    // reserve the expanded footprint, not the template's raw offsets.
+    let effect = gdtf::mode_summaries(&description)
+        .into_iter()
+        .find(|s| s.name == "16: Effect Mode RGB")
+        .expect("the PB15 has the effect mode");
+    assert_eq!(effect.footprint, 21);
     assert_eq!(ft.strobe_dmx_offset(), Some(7));
     assert_eq!(ft.min_strobe_frequency(), Some(0.4));
     assert_eq!(ft.max_strobe_frequency(), Some(25.0));

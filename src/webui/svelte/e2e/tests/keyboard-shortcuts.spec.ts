@@ -13,46 +13,32 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { stubPlayerService } from "../support/grpc";
 
 test.describe("Keyboard Shortcuts", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/#/");
-    // Wait for WebSocket to deliver playback state
+    // Wait for the Watch stream to deliver playback state
     await expect(page.locator(".playback-card__title")).toContainText(
       "Test Song Alpha",
     );
   });
 
   test("space bar triggers play via gRPC", async ({ page }) => {
-    await page.route("**/player.v1.PlayerService/**", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "content-type": "application/grpc-web+proto",
-          "grpc-status": "0",
-        },
-        body: Buffer.alloc(0),
-      });
-    });
+    await stubPlayerService(page);
 
-    const requestPromise = page.waitForRequest((req) =>
-      req.url().includes("player.v1.PlayerService"),
+    const requestPromise = page.waitForRequest(
+      (req) =>
+        req.url().includes("player.v1.PlayerService") &&
+        // The stage stream is open on the page; a call is the other.
+        !req.url().endsWith("/WatchStage"),
     );
     await page.keyboard.press("Space");
     await requestPromise;
   });
 
   test("right arrow triggers next via gRPC", async ({ page }) => {
-    await page.route("**/player.v1.PlayerService/**", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "content-type": "application/grpc-web+proto",
-          "grpc-status": "0",
-        },
-        body: Buffer.alloc(0),
-      });
-    });
+    await stubPlayerService(page);
 
     const requestPromise = page.waitForRequest((req) =>
       req.url().includes("Next"),
@@ -62,16 +48,7 @@ test.describe("Keyboard Shortcuts", () => {
   });
 
   test("left arrow triggers previous via gRPC", async ({ page }) => {
-    await page.route("**/player.v1.PlayerService/**", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "content-type": "application/grpc-web+proto",
-          "grpc-status": "0",
-        },
-        body: Buffer.alloc(0),
-      });
-    });
+    await stubPlayerService(page);
 
     const requestPromise = page.waitForRequest((req) =>
       req.url().includes("Previous"),
@@ -82,16 +59,10 @@ test.describe("Keyboard Shortcuts", () => {
 
   test("space bar does not trigger when typing in input", async ({ page }) => {
     let grpcCalled = false;
-    await page.route("**/player.v1.PlayerService/**", async (route) => {
-      grpcCalled = true;
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "content-type": "application/grpc-web+proto",
-          "grpc-status": "0",
-        },
-        body: Buffer.alloc(0),
-      });
+    await stubPlayerService(page, {
+      onCall: () => {
+        grpcCalled = true;
+      },
     });
 
     // Even on the dashboard, focusing an input should suppress shortcuts
@@ -128,16 +99,10 @@ test.describe("Keyboard Shortcuts", () => {
 
   test("shortcuts do not trigger on non-dashboard pages", async ({ page }) => {
     let grpcCalled = false;
-    await page.route("**/player.v1.PlayerService/**", async (route) => {
-      grpcCalled = true;
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "content-type": "application/grpc-web+proto",
-          "grpc-status": "0",
-        },
-        body: Buffer.alloc(0),
-      });
+    await stubPlayerService(page, {
+      onCall: () => {
+        grpcCalled = true;
+      },
     });
 
     // Navigate to config page and press space

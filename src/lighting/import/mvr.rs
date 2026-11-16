@@ -18,8 +18,11 @@
 //! GDTF and mode. It is not the whole venue: tags, focus names and the
 //! stage origin are the band's, so the import seeds a file rather than
 //! resolving one at runtime (venue-exchange design §4.2, §6). Every
-//! embedded GDTF the patch references is imported as a referential
-//! `.fixture` on the way, through the same path `import-gdtf` takes.
+//! embedded GDTF the patch references goes into the library on the way,
+//! through the same placement `import-gdtf` uses — one fixture type per
+//! archive, not per mode (design §21; an archive already there with the
+//! same bytes is simply used) — and every seeded fixture line states its
+//! own mode.
 //!
 //! Two entry points share one planner: [`inspect_mvr`] resolves everything
 //! and writes nothing, so the CLI's bare form and the MCP tool can show
@@ -35,18 +38,44 @@
 //! patched fixture is never silently dropped: one whose GDTF is missing or
 //! whose mode cannot be matched becomes a `TODO` comment in the venue
 //! file, with everything the MVR knew about it.
+//!
+//! A merge is a **textual patch** of the venue file (see
+//! [`crate::lighting::venue_patch`]), so its comments, `# TODO` lines and
+//! header survive. Fields the venue's owner edited by hand — a moved
+//! fixture, a corrected rotation, a re-patched address or mode, a nudged focus
+//! point — are listed in the plan (`overwrites`) rather than replaced
+//! silently, and [`MvrKeep`] names the ones to keep. A field counts as
+//! hand-edited when the venue differs from the new MVR *and* from what the
+//! previous MVR would have written; when there is no previous MVR to tell
+//! by, or (for the fixture type) the type cannot be traced, any difference
+//! counts.
 
+use crate::lighting::mvr_types::TypeKey;
+pub use crate::lighting::mvr_types::{
+    HandEdit, MvrImport, MvrKeep, MvrPlan, PlannedFixture, PlannedFixtureType, PlannedFocusPoint,
+    RemovedFixture,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-
-use super::{create_dir, fixture_filename_stem, gdtf_definition, import_gdtf_bytes, write};
+use super::{
+    create_dir, place_in_library, record_to_write, LibraryCopies, LibraryEntry, RecordWrite,
+};
 use crate::lighting::gdtf;
+use crate::lighting::library::library_file;
 use crate::lighting::mvr::{self, MvrFixture, Scene};
-use crate::lighting::parser::{parse_fixture_types, parse_venues};
-use crate::lighting::types::{fmt_vec3, Fixture, Vec3, Venue};
+use crate::lighting::parser::parse_venues;
+use crate::lighting::types::{fmt_vec3, Fixture, Vec3, Venue, VenueSource};
+use crate::lighting::venue_patch::{patch_venue_with, PatchNotes};
+
+impl MvrKeep {
+    fn keeps(&self, fixture: &str, field: &str) -> bool {
+        self.fixtures
+            .get(fixture)
+            .is_some_and(|fields| fields.iter().any(|f| f == field))
+    }
+}
 
 /// The choices an MVR import takes from the user.
 #[derive(Clone, Debug)]
@@ -61,6 +90,9 @@ pub struct MvrImportOptions {
     pub fixture_types_dir: String,
     /// Venues directory, relative to the project.
     pub venues_dir: String,
+    /// Hand edits a merge keeps rather than overwrites. Empty means every
+    /// field takes the MVR's value.
+    pub keep: MvrKeep,
 }
 
 impl Default for MvrImportOptions {
@@ -68,137 +100,45 @@ impl Default for MvrImportOptions {
         MvrImportOptions {
             name: None,
             origin_mm: None,
-            fixture_types_dir: "lighting/fixture_types".to_string(),
-            venues_dir: "lighting/venues".to_string(),
+            keep: MvrKeep::default(),
+            fixture_types_dir: crate::config::lighting::DEFAULT_FIXTURE_TYPES_DIR.to_string(),
+            venues_dir: crate::config::lighting::DEFAULT_VENUES_DIR.to_string(),
         }
     }
-}
-
-/// Everything an import would do, resolved but not written.
-#[derive(Debug, Serialize)]
-pub struct MvrPlan {
-    /// The venue's name.
-    pub venue_name: String,
-    /// The venue file, project-relative.
-    pub venue_file: String,
-    /// Where the MVR lands, project-relative.
-    pub archive: String,
-    /// Whether an MVR-seeded venue of this name already exists and is being
-    /// merged rather than created.
-    pub merge: bool,
-    /// The stage origin in MVR space, meters.
-    pub origin: Vec3,
-    /// The fixture types the patch references.
-    pub fixture_types: Vec<PlannedFixtureType>,
-    /// The patched fixtures, in the order the venue file will list them.
-    pub fixtures: Vec<PlannedFixture>,
-    /// Fixtures the venue itself removed since the last import (present in
-    /// the previous MVR, absent from this one). Dropped, with their tags.
-    pub removed_fixtures: Vec<RemovedFixture>,
-    /// Fixtures in the existing venue the MVR never knew about — hand
-    /// additions, kept as they are.
-    pub kept_fixtures: Vec<String>,
-    /// The scene's focus points.
-    pub focus_points: Vec<PlannedFocusPoint>,
-    /// Focus points the previous MVR had that this one does not. Dropped.
-    pub removed_focus_points: Vec<String>,
-    /// Focus points of the existing venue the MVR never knew about. Kept.
-    pub kept_focus_points: Vec<String>,
-    /// Scenery objects in the scene (trusses, decks, screens), which the
-    /// 3D view draws from the MVR's meshes.
-    pub scenery_objects: usize,
-    /// Scenery meshes in formats the 3D view does not draw (`.3ds`).
-    pub scenery_meshes_undrawn: usize,
-    /// What was skipped, approximated or guessed.
-    pub warnings: Vec<String>,
-}
-
-/// A fixture type the patch references.
-#[derive(Debug, Serialize)]
-pub struct PlannedFixtureType {
-    /// The fixture type's name.
-    pub name: String,
-    /// The GDTF archive, project-relative.
-    pub archive: String,
-    /// The matched mode, as the GDTF spells it.
-    pub mode: String,
-    /// Whether a `.fixture` of this name already points at this archive
-    /// and mode (so nothing is written for it).
-    pub existing: bool,
-    /// The `.fixture` file, project-relative.
-    pub fixture_file: String,
-}
-
-/// A patched fixture as the venue file will state it.
-#[derive(Debug, Serialize)]
-pub struct PlannedFixture {
-    /// The fixture's name.
-    pub name: String,
-    /// The MVR layer it sits on.
-    pub layer: String,
-    /// The resolved fixture type; `None` when the fixture is a TODO.
-    pub fixture_type: Option<String>,
-    /// Universe and address; `None` when the MVR patched nothing.
-    pub patch: Option<(u16, u16)>,
-    /// Stage position, meters.
-    pub position: Option<Vec3>,
-    /// Mounting rotation, degrees.
-    pub rotation: Option<Vec3>,
-    /// Tags — empty on a fresh seed, the venue's own on a merge.
-    pub tags: Vec<String>,
-    /// Why this fixture could not be resolved, when it could not.
-    pub todo: Option<String>,
-    /// On a merge, what changed against the existing venue.
-    pub change: Option<String>,
-}
-
-/// A fixture the venue removed, with the tags that go with it.
-#[derive(Debug, Serialize)]
-pub struct RemovedFixture {
-    pub name: String,
-    pub tags: Vec<String>,
-}
-
-/// A focus point as the venue file will state it.
-#[derive(Debug, Serialize)]
-pub struct PlannedFocusPoint {
-    pub name: String,
-    /// Stage position, meters.
-    pub point: Vec3,
-    /// On a merge, what changed against the existing venue.
-    pub change: Option<String>,
-}
-
-/// What an import did.
-#[derive(Debug, Serialize)]
-pub struct MvrImport {
-    /// The plan that was carried out.
-    #[serde(flatten)]
-    pub plan: MvrPlan,
-    /// Every file written, project-relative.
-    pub written: Vec<String>,
-    /// GDTF distillation warnings per newly imported fixture type.
-    pub distillation_warnings: BTreeMap<String, Vec<String>>,
 }
 
 /// A plan plus the bytes it needs to carry out.
 struct Planned {
     plan: MvrPlan,
-    /// Embedded GDTFs to place in the library: (project-relative path,
-    /// bare file name, bytes, fixture type name, mode).
+    /// Embedded GDTFs to place in the library (a new archive, a record
+    /// pinning a name).
     gdtf_writes: Vec<GdtfWrite>,
-    /// Whether the MVR itself needs writing (new, or changed on re-import).
-    write_archive: bool,
+    /// Distillation warnings per type, for the modes the venue uses.
+    distillation_warnings: BTreeMap<String, Vec<String>>,
+    /// What becomes of the MVR itself in the library.
+    archive: Archive,
     /// The venue file's text.
     venue_text: String,
-    venue_path: PathBuf,
+    /// Where it goes, by the venue save's rule.
+    venue_write: crate::lighting::writes::Plan,
 }
 
 struct GdtfWrite {
-    file_name: String,
+    entry: LibraryEntry,
     bytes: Vec<u8>,
-    type_name: String,
-    mode: String,
+    /// The record pinning its name, if one does.
+    record: Option<RecordWrite>,
+}
+
+/// The library's copy of the MVR on an import.
+enum Archive {
+    /// The same bytes are there.
+    Unchanged,
+    /// No copy yet: a new library file, which stands like a GDTF's.
+    New,
+    /// A revision of the copy there, `previous`: the baseline the venue
+    /// merges against, so it is written with the venue, all or nothing.
+    Revision { previous: Vec<u8> },
 }
 
 /// Resolves an MVR against a project and reports what an import would do,
@@ -242,37 +182,48 @@ pub fn import_mvr_bytes(
     project: &Path,
 ) -> Result<MvrImport, Box<dyn Error>> {
     let planned = plan(bytes, archive_file_name, options, project)?;
-    let mut written = Vec::new();
-    let mut distillation_warnings = BTreeMap::new();
 
-    let library_dir = project.join("lighting/library");
-    create_dir(&library_dir)?;
-    if planned.write_archive {
-        write(&library_dir.join(archive_file_name), bytes)?;
-        written.push(planned.plan.archive.clone());
+    // Everything that needs no library copy first, so a failure before the
+    // copies has written nothing.
+    for record in planned.gdtf_writes.iter().filter_map(|w| w.record.as_ref()) {
+        record.create_dir()?;
     }
+    create_dir(planned.venue_write.write.path().parent().unwrap_or(project))?;
 
-    // Each new fixture type goes through the GDTF importer proper, so it
-    // lands exactly as `import-gdtf` would have put it and is proven to
-    // load through the player's own expansion path.
+    // The new library copies (a new MVR, each new embedded GDTF) stand
+    // whatever follows, as an import's library always has. A revised MVR,
+    // the records and the venue are written together, all or nothing.
+    let mut copies = LibraryCopies::default();
+    if let Archive::New = planned.archive {
+        copies.write(project, archive_file_name, bytes)?;
+    }
     for gdtf_write in &planned.gdtf_writes {
-        let report = import_gdtf_bytes(
-            &gdtf_write.bytes,
-            &gdtf_write.file_name,
-            &gdtf_write.mode,
-            Some(&gdtf_write.type_name),
-            project,
-            &options.fixture_types_dir,
-        )?;
-        if !report.replaced_archive {
-            written.push(report.archive.clone());
-        }
-        written.push(report.fixture_file.clone());
-        distillation_warnings.insert(gdtf_write.type_name.clone(), report.warnings);
+        copies.write_entry(project, &gdtf_write.entry, &gdtf_write.bytes)?;
     }
+    let distillation_warnings = planned.distillation_warnings;
 
-    create_dir(planned.venue_path.parent().unwrap_or(project))?;
-    write(&planned.venue_path, planned.venue_text.as_bytes())?;
+    let mut written = copies.written.clone();
+    let (archive_path, archive_rel) = library_file(project, archive_file_name);
+    crate::lighting::writes::Changes::all_or_nothing_keeping(copies.written, |changes| {
+        if let Archive::Revision { previous } = &planned.archive {
+            changes.rewrite(&archive_path, bytes, previous, archive_rel.clone())?;
+        }
+        for record in planned.gdtf_writes.iter().filter_map(|w| w.record.as_ref()) {
+            record.create(changes)?;
+        }
+        changes.plan(&planned.venue_write, &planned.venue_text)?;
+        changes.retire(&planned.venue_write)
+    })?;
+    if let Archive::Revision { .. } = planned.archive {
+        written.push(archive_rel);
+    }
+    written.extend(
+        planned
+            .gdtf_writes
+            .iter()
+            .filter_map(|w| w.record.as_ref())
+            .map(|record| record.shown.clone()),
+    );
     written.push(planned.plan.venue_file.clone());
 
     Ok(MvrImport {
@@ -291,13 +242,6 @@ fn read_archive(mvr_path: &Path) -> Result<(Vec<u8>, String), Box<dyn Error>> {
         .to_string_lossy()
         .into_owned();
     Ok((bytes, file_name))
-}
-
-/// The key a fixture type is unique by: which embedded archive, which mode.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct TypeKey {
-    entry: String,
-    mode: String,
 }
 
 /// An embedded GDTF, parsed once however many fixtures reference it.
@@ -371,24 +315,13 @@ fn plan(
         )
         .into());
     }
-    let library_rel = format!("lighting/library/{archive_file_name}");
-    let library_path = project.join(&library_rel);
+    let (library_path, library_rel) = library_file(project, archive_file_name);
 
     // --- The existing venue, if this is a re-import.
-    let existing = find_existing_venue(project, &options.venues_dir, &venue_name)?;
-    let (venue_path, venue_file) = match &existing {
-        Some((path, _)) => (path.clone(), relative_display(project, path)),
-        None => {
-            let file = format!(
-                "{}/{}.venue",
-                options.venues_dir.trim_end_matches('/'),
-                fixture_filename_stem(&venue_name)
-            );
-            (project.join(&file), file)
-        }
-    };
+    let (venue_write, existing) = venue_file_for(project, &options.venues_dir, &venue_name)?;
+    let venue_file = relative_display(project, venue_write.write.path());
     let existing_venue = match &existing {
-        Some((path, venue)) => {
+        Some((path, venue, _)) => {
             let Some(source) = venue.source() else {
                 return Err(format!(
                     "{} holds a hand-written venue \"{venue_name}\" (no `imported from \
@@ -413,13 +346,13 @@ fn plan(
     };
 
     // --- The library copy of the MVR: new, unchanged, or a revision.
-    let mut write_archive = true;
+    let mut archive = Archive::New;
     let mut previous_scene: Option<Scene> = None;
     if library_path.exists() {
-        let previous = std::fs::read(&library_path)
+        let previous = crate::util::read_file(&library_path)
             .map_err(|e| format!("cannot read existing {}: {e}", library_path.display()))?;
         if previous == bytes {
-            write_archive = false;
+            archive = Archive::Unchanged;
         } else if existing_venue.is_none() {
             return Err(format!(
                 "{library_rel} already exists with different content and no venue \
@@ -434,6 +367,9 @@ fn plan(
                 "the previous {library_rel} does not parse ({e}); fixtures missing from \
                  the new MVR are kept rather than dropped"
             )),
+        }
+        if !matches!(archive, Archive::Unchanged) {
+            archive = Archive::Revision { previous };
         }
     }
 
@@ -465,7 +401,7 @@ fn plan(
         if !embedded.contains_key(&entry) {
             let gdtf_bytes = mvr::read_gdtf_entry(bytes, &entry)?;
             let description = gdtf::parse_archive(&gdtf_bytes).map_err(|e| e.to_string());
-            let mut file_name = entry.rsplit('/').next().unwrap_or(&entry).to_string();
+            let mut file_name = mvr::entry_basename(&entry).to_string();
             if !file_name.to_ascii_lowercase().ends_with(".gdtf") {
                 file_name.push_str(".gdtf");
             }
@@ -494,6 +430,17 @@ fn plan(
             continue;
         };
         match gdtf::match_mode(description, requested) {
+            // The mode lands in a quoted DSL string, which has no escapes.
+            Ok(matched) if matched.name.chars().any(|c| c == '"' || c.is_control()) => resolved
+                .push((
+                    index,
+                    None,
+                    Some(format!(
+                        "mode {:?} contains a quote or control character, which a venue file \
+                         cannot write",
+                        matched.name
+                    )),
+                )),
             Ok(matched) => {
                 if matched.normalized {
                     let note = format!(
@@ -517,86 +464,118 @@ fn plan(
         }
     }
 
-    // --- Fixture type names: the GDTF's own, disambiguated only on collision.
+    // --- Fixture type names: one type per embedded GDTF (the type is the
+    // whole archive, design §21), named after the GDTF's own name and
+    // disambiguated only on collision.
     let mut keys: Vec<TypeKey> = resolved.iter().filter_map(|(_, k, _)| k.clone()).collect();
     keys.sort();
     keys.dedup();
-    let type_names = name_fixture_types(&keys, &embedded, &mut warnings)?;
+    let mut type_entries: Vec<String> = keys.iter().map(|k| k.entry.clone()).collect();
+    type_entries.dedup();
 
     // A mode that matched by name can still refuse to distill (pixel and
     // matrix modes). That is a TODO for its fixtures, found now rather than
-    // by the GDTF importer halfway through the writes.
+    // by the loader, for a mode a fixture line names.
+    let mut entry_warnings: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for key in &keys {
         let Ok(description) = &embedded[&key.entry].description else {
             continue;
         };
-        if let Err(e) = gdtf::distill(description, &key.mode, &type_names[key]) {
-            let reason = format!("mode \"{}\" does not distill: {e}", key.mode);
-            for (_, resolved_key, todo) in &mut resolved {
-                if resolved_key.as_ref() == Some(key) {
-                    *resolved_key = None;
-                    *todo = Some(reason.clone());
+        match gdtf::distill(description, &key.mode, &key.entry) {
+            Ok(distilled) => {
+                let notes = entry_warnings.entry(key.entry.clone()).or_default();
+                for warning in distilled.warnings {
+                    notes.push(format!("{}: {warning}", key.mode));
+                }
+            }
+            Err(e) => {
+                let reason = format!("mode \"{}\" does not distill: {e}", key.mode);
+                for (_, resolved_key, todo) in &mut resolved {
+                    if resolved_key.as_ref() == Some(key) {
+                        *resolved_key = None;
+                        *todo = Some(reason.clone());
+                    }
                 }
             }
         }
     }
-    keys.retain(|key| resolved.iter().any(|(_, k, _)| k.as_ref() == Some(key)));
+    type_entries.retain(|entry| {
+        resolved
+            .iter()
+            .any(|(_, k, _)| k.as_ref().is_some_and(|k| &k.entry == entry))
+    });
 
+    // --- One fixture type per embedded GDTF (design §22): the archive in the
+    // library is the fixture. One already there (the same bytes) is the
+    // fixture it already is; a new one is named from its GDTF, and a name
+    // another fixture has is pinned with a record as `Name (stem)`.
+    let fixture_dir = project.join(&options.fixture_types_dir);
+    let mut batch = super::Batch::default();
+    let mut type_names: HashMap<String, String> = HashMap::new();
     let mut fixture_types = Vec::new();
     let mut gdtf_writes = Vec::new();
-    for key in &keys {
-        let type_name = &type_names[key];
-        let item = &embedded[&key.entry];
-        let archive = format!("lighting/library/{}", item.file_name);
-        let fixture_file = format!(
-            "{}/{}.fixture",
-            options.fixture_types_dir.trim_end_matches('/'),
-            fixture_filename_stem(type_name)
-        );
-        let existing =
-            existing_fixture_type(project, &fixture_file, type_name, &archive, &key.mode)?;
-        // Same rule as import-gdtf, reused .fixture or not: a same-named
-        // library archive with different bytes would silently re-source
-        // every fixture type that points at it.
-        let library = project.join(&archive);
-        if library.exists() && std::fs::read(&library)? != item.bytes {
-            return Err(format!(
-                "{archive} already exists with different content — other fixture types \
-                 may reference it; remove it deliberately or rename the entry in the MVR"
-            )
-            .into());
-        }
-        if !existing {
-            // The definition the GDTF importer will write must parse back
-            // and distill *now*, or the write loop could refuse halfway
-            // through the batch — the one thing the plan exists to prevent.
-            if let Ok(description) = &item.description {
-                let definition =
-                    gdtf_definition(type_name, &archive, &key.mode, &item.file_name, description);
-                let parsed = parse_fixture_types(&definition).map_err(|e| {
-                    format!("the .fixture for \"{type_name}\" would not parse back: {e}")
-                })?;
-                let pinned = parsed
-                    .get(type_name)
-                    .and_then(|t| t.source().map(|s| s.mode.clone()))
-                    .ok_or_else(|| format!("the .fixture for \"{type_name}\" lost its type"))?;
-                gdtf::distill(description, &pinned, type_name)
-                    .map_err(|e| format!("the .fixture for \"{type_name}\" would not load: {e}"))?;
+    let mut distillation_warnings = BTreeMap::new();
+    for entry in &type_entries {
+        let item = &embedded[entry];
+        let Ok(description) = &item.description else {
+            continue;
+        };
+        let placed = place_in_library(
+            project,
+            &fixture_dir,
+            &item.file_name,
+            &item.bytes,
+            description,
+            None,
+            &mut batch,
+        )
+        .map_err(|e| -> Box<dyn Error> {
+            match e.downcast::<crate::lighting::files::Refusal>() {
+                Ok(refusal) => Box::new(super::RecordRefused {
+                    gdtf: item.file_name.clone(),
+                    types_dir: options.fixture_types_dir.clone(),
+                    refusal: *refusal,
+                }),
+                Err(other) => other,
             }
+        })?;
+        let mut modes: Vec<String> = resolved
+            .iter()
+            .filter_map(|(_, k, _)| k.as_ref())
+            .filter(|k| &k.entry == entry)
+            .map(|k| k.mode.clone())
+            .collect();
+        modes.sort();
+        modes.dedup();
+        if let Some(from) = &placed.renamed_from {
+            warnings.push(format!(
+                "another fixture is already called \"{from}\"; {} is \"{}\"",
+                item.file_name, placed.name
+            ));
+        }
+        if let Some(notes) = entry_warnings.remove(entry) {
+            if !notes.is_empty() {
+                distillation_warnings.insert(placed.name.clone(), notes);
+            }
+        }
+        type_names.insert(entry.clone(), placed.name.clone());
+        fixture_types.push(PlannedFixtureType {
+            name: placed.name.clone(),
+            archive: placed.archive.clone(),
+            modes,
+            existing: placed.existing && placed.record.is_none(),
+            fixture_file: placed.record.clone(),
+        });
+        if !placed.existing || placed.record.is_some() {
+            // The record's text from the GDTF parsed above, written by the
+            // import with the venue.
+            let record = record_to_write(project, &placed, description)?;
             gdtf_writes.push(GdtfWrite {
-                file_name: item.file_name.clone(),
+                entry: placed,
                 bytes: item.bytes.clone(),
-                type_name: type_name.clone(),
-                mode: key.mode.clone(),
+                record,
             });
         }
-        fixture_types.push(PlannedFixtureType {
-            name: type_name.clone(),
-            archive,
-            mode: key.mode.clone(),
-            existing,
-            fixture_file,
-        });
     }
 
     // --- Fixtures, in stage coordinates. A merge without an explicit origin
@@ -620,36 +599,11 @@ fn plan(
         origin_mm[1] / 1000.0,
         origin_mm[2] / 1000.0,
     ];
-    // Consoles name fixtures by type ("Robe Spiider" forty times) and tell
-    // them apart by fixture ID; a name that repeats takes its ID.
-    let mut name_counts: HashMap<String, usize> = HashMap::new();
-    for fixture in &scene.fixtures {
-        *name_counts
-            .entry(fixture.name.trim().to_string())
-            .or_default() += 1;
-    }
-    let mut seen_names: HashMap<String, usize> = HashMap::new();
+    let mut namer = Namer::new(&scene);
     let mut fixtures = Vec::new();
-    let mut numbered = 0usize;
-    let mut ordinal_named: Vec<String> = Vec::new();
     for (index, key, todo) in &resolved {
         let source = &scene.fixtures[*index];
-        let base = source.name.trim();
-        let repeated = name_counts.get(base).is_some_and(|c| *c > 1);
-        let candidate = match (&source.fixture_id, repeated) {
-            (Some(id), true) if !base.is_empty() => {
-                numbered += 1;
-                format!("{base} {}", id.trim())
-            }
-            _ => base.to_string(),
-        };
-        let name = unique_name(
-            &candidate,
-            *index,
-            &mut seen_names,
-            &mut ordinal_named,
-            &mut warnings,
-        );
+        let name = namer.name(source, *index, &mut warnings);
         let (position, rotation) = geometry(source, &origin_mm, &mut warnings);
         let patch = source.addresses.first().copied();
         if source.addresses.len() > 1 {
@@ -663,18 +617,27 @@ fn plan(
         if todo.is_none() && patch.is_none() {
             todo = Some("no DMX address".to_string());
         }
+        let fixture_type = key.as_ref().map(|k| type_names[&k.entry].clone());
+        // Every line names its mode: a GDTF fixture has no default.
+        let mode = key.as_ref().map(|key| key.mode.clone());
         fixtures.push(PlannedFixture {
             name,
             layer: source.layer.clone(),
-            fixture_type: key.as_ref().map(|k| type_names[k].clone()),
+            fixture_type,
+            mode,
+            gdtf: key.clone(),
             patch,
             position,
             rotation,
+            beam_angle: None,
             tags: Vec::new(),
             todo,
             change: None,
+            overwrites: Vec::new(),
+            kept_edits: Vec::new(),
         });
     }
+    let (numbered, ordinal_named) = (namer.numbered, namer.ordinal_named);
     if numbered > 0 {
         warnings.push(format!(
             "{numbered} fixtures shared a name with another; each took its console fixture \
@@ -720,6 +683,8 @@ fn plan(
             name,
             point: to_stage(&matrix.o, &origin_mm),
             change: None,
+            overwrites: Vec::new(),
+            kept_edit: false,
         });
     }
 
@@ -738,11 +703,86 @@ fn plan(
                 fmt_vec3(&origin_m)
             ));
         }
+        // What the previous import would have written, to tell a hand edit
+        // from a change the MVR itself made.
+        let previous_origin_mm = existing
+            .source()
+            .map(|s| {
+                [
+                    s.origin[0] * 1000.0,
+                    s.origin[1] * 1000.0,
+                    s.origin[2] * 1000.0,
+                ]
+            })
+            .unwrap_or([0.0; 3]);
+        let prior: Option<HashMap<String, Prior>> = previous_scene.as_ref().map(|prev| {
+            let mut namer = Namer::new(prev);
+            let mut scratch = Vec::new();
+            prev.fixtures
+                .iter()
+                .enumerate()
+                .map(|(index, f)| {
+                    let name = namer.name(f, index, &mut scratch);
+                    let (position, rotation) = geometry(f, &previous_origin_mm, &mut scratch);
+                    let patch = f.addresses.first().copied();
+                    (
+                        name,
+                        Prior {
+                            position,
+                            rotation,
+                            patch,
+                            mode: f.gdtf_mode.clone(),
+                        },
+                    )
+                })
+                .collect()
+        });
+        let prior_focus: Option<HashMap<String, Vec3>> = previous_scene.as_ref().map(|prev| {
+            let mut scratch = Vec::new();
+            prev.focus_points
+                .iter()
+                .filter_map(|f| {
+                    let matrix = f.matrix?;
+                    (!f.name.trim().is_empty()).then(|| {
+                        (
+                            dsl_safe(&f.name, &mut scratch),
+                            to_stage(&matrix.o, &previous_origin_mm),
+                        )
+                    })
+                })
+                .collect()
+        });
         for planned in &mut fixtures {
             match existing.fixtures().get(&planned.name) {
                 Some(theirs) => {
+                    let prior = prior.as_ref().and_then(|p| p.get(&planned.name));
+                    let modes = compare_modes(theirs, planned, prior, &embedded);
                     planned.tags = theirs.tags().to_vec();
-                    planned.change = Some(describe_change(theirs, planned));
+                    planned.beam_angle = theirs.beam_angle();
+                    planned.change = Some(describe_change(theirs, planned, modes.as_ref()));
+                    let edits = hand_edits(theirs, planned, prior, modes.as_ref());
+                    for edit in edits {
+                        if options.keep.keeps(&planned.name, &edit.field) {
+                            match edit.field.as_str() {
+                                "position" => planned.position = theirs.position(),
+                                "rotation" => planned.rotation = theirs.rotation(),
+                                "patch" => {
+                                    planned.patch =
+                                        Some((theirs.universe(), theirs.start_channel()))
+                                }
+                                "mode" => planned.mode = theirs.mode().map(str::to_string),
+                                // The type and its mode go together: a mode
+                                // is only a mode of its own type.
+                                _ => {
+                                    planned.fixture_type = Some(theirs.fixture_type().to_string());
+                                    planned.mode = theirs.mode().map(str::to_string);
+                                }
+                            }
+                            planned.kept_edits.push(edit.field);
+                        } else {
+                            planned.overwrites.push(edit);
+                        }
+                    }
                 }
                 None => planned.change = Some("added".to_string()),
             }
@@ -774,7 +814,26 @@ fn plan(
         for planned in &mut focus_points {
             planned.change = Some(match existing.focus_points().get(&planned.name) {
                 Some(point) if close(point, &planned.point) => "unchanged".to_string(),
-                Some(point) => format!("moved from {}", fmt_vec3(point)),
+                Some(point) => {
+                    let hand_moved = prior_focus
+                        .as_ref()
+                        .and_then(|p| p.get(&planned.name))
+                        .is_none_or(|previous| !close(point, previous));
+                    let change = format!("moved from {}", fmt_vec3(point));
+                    if hand_moved {
+                        if options.keep.focus_points.contains(&planned.name) {
+                            planned.kept_edit = true;
+                            planned.point = *point;
+                        } else {
+                            planned.overwrites.push(HandEdit {
+                                field: "position".to_string(),
+                                mine: fmt_vec3(point),
+                                mvr: fmt_vec3(&planned.point),
+                            });
+                        }
+                    }
+                    change
+                }
                 // A focus point the band renamed still sits where the
                 // console put it; don't bring the console's name back.
                 None if existing
@@ -801,7 +860,7 @@ fn plan(
         }
     }
 
-    let plan = MvrPlan {
+    let mut plan = MvrPlan {
         venue_name: venue_name.clone(),
         venue_file,
         archive: library_rel.clone(),
@@ -818,7 +877,19 @@ fn plan(
         scenery_meshes_undrawn,
         warnings,
     };
-    let venue_text = render_venue(&plan, archive_file_name, &kept, &kept_focus);
+    let mut venue_text = render_venue(&plan, archive_file_name, &kept, &kept_focus);
+    if let Some((_, _, content)) = &existing {
+        // A merge patches the file in place, so comments, TODO lines and
+        // the header survive. A file the patcher cannot handle safely is
+        // regenerated, and the plan says so.
+        match patch_existing(content, &plan, &kept, &kept_focus) {
+            Ok(text) => venue_text = text,
+            Err(reason) => plan.warnings.push(format!(
+                "could not patch the venue file in place ({reason}); it was regenerated, so \
+                 its comments are not kept"
+            )),
+        }
+    }
     // Prove the venue parses back, and to the same shape, before anything
     // is written: the loader's check, made while a refusal is still free.
     let parsed = parse_venues(&venue_text).map_err(|e| {
@@ -838,176 +909,124 @@ fn plan(
     Ok(Planned {
         plan,
         gdtf_writes,
-        write_archive,
+        distillation_warnings,
+        archive,
         venue_text,
-        venue_path,
+        venue_write,
     })
 }
 
-/// Finds a venue file of this name in the venues directory: `.venue` first,
-/// then the v1 `.light`. The file must hold the named venue.
-fn find_existing_venue(
+/// A venue an import may not write, by the venue save's rule: its file is
+/// not its alone, or a new name's file is taken. Its own type, so a caller
+/// can tell it from a bad archive (the web API answers it with 409).
+#[derive(Debug)]
+pub struct VenueRefused {
+    pub venue: String,
+    pub refused: crate::lighting::writes::Refused,
+}
+
+impl std::fmt::Display for VenueRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot import venue \"{}\": {}",
+            self.venue, self.refused
+        )
+    }
+}
+
+impl Error for VenueRefused {}
+
+/// The venue's file, by the venue save's rule ([`crate::lighting::writes`]),
+/// and, on a re-import, the venue as the loader read it, from which file,
+/// and that file's text. A new name is claimed at `<venues dir>/<stem>.venue`;
+/// a venue whose file is its alone is merged there (a `.light` moves to its
+/// `.venue`, which provenance needs); anything else is refused, with the file
+/// and why.
+#[allow(clippy::type_complexity)]
+fn venue_file_for(
     project: &Path,
     venues_dir: &str,
     venue_name: &str,
-) -> Result<Option<(PathBuf, Venue)>, Box<dyn Error>> {
-    let stem = fixture_filename_stem(venue_name);
-    for extension in ["venue", "light"] {
-        let path = project.join(venues_dir).join(format!("{stem}.{extension}"));
-        if !path.exists() {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let mut venues = parse_venues(&content)
-            .map_err(|e| format!("{} does not parse: {e}", path.display()))?;
-        return match venues.remove(venue_name) {
-            Some(venue) => Ok(Some((path, venue))),
-            None => Err(format!(
-                "{} exists but does not define a venue named \"{venue_name}\" (it holds: {}); \
-                 import under a different --name",
-                path.display(),
-                venues
-                    .keys()
-                    .map(|k| format!("\"{k}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-            .into()),
-        };
-    }
-    Ok(None)
+) -> Result<
+    (
+        crate::lighting::writes::Plan,
+        Option<(PathBuf, Venue, Result<String, String>)>,
+    ),
+    Box<dyn Error>,
+> {
+    let dir = project.join(venues_dir);
+    let venues = crate::lighting::project_files::venues(&dir);
+    let save = crate::lighting::writes::Save {
+        kind: crate::lighting::files::Kind::Venue,
+        dir: &dir,
+        record: &venues.record,
+        library: &[],
+        name: venue_name,
+        from: None,
+        // An imported venue states its MVR, which only a `.venue` holds.
+        needs_new_format: true,
+    };
+    let plan = save.plan().map_err(|refused| VenueRefused {
+        venue: venue_name.to_string(),
+        refused,
+    })?;
+    let existing = match (&plan.current, venues.get(venue_name)) {
+        (Some(bytes), Some(declared)) => Some((
+            declared.file.clone(),
+            declared.item.clone(),
+            String::from_utf8(bytes.clone()).map_err(|e| e.to_string()),
+        )),
+        _ => None,
+    };
+    Ok((plan, existing))
 }
 
-/// Whether a `.fixture` of this name already pins this archive and mode.
-/// A file of the same name pointing elsewhere is a collision, refused.
-fn existing_fixture_type(
-    project: &Path,
-    fixture_file: &str,
-    type_name: &str,
-    archive: &str,
-    mode: &str,
-) -> Result<bool, Box<dyn Error>> {
-    let path = project.join(fixture_file);
-    if !path.exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let types = parse_fixture_types(&content)
-        .map_err(|e| format!("{} does not parse: {e}", path.display()))?;
-    let Some(existing) = types.get(type_name) else {
-        return Err(format!(
-            "{fixture_file} exists but does not define \"{type_name}\"; remove or rename it"
-        )
-        .into());
-    };
-    match existing.source() {
-        Some(source) if source.path == archive && source.mode == mode => Ok(true),
-        Some(source) => Err(format!(
-            "{fixture_file} already defines \"{type_name}\" from {} mode \"{}\", but this MVR \
-             patches it from {archive} mode \"{mode}\"; rename one of them",
-            source.path, source.mode
-        )
-        .into()),
-        None => Err(format!(
-            "{fixture_file} already defines \"{type_name}\" natively; the MVR's GDTF-sourced \
-             type of the same name would shadow it — rename one of them"
-        )
-        .into()),
-    }
+/// Names a scene's fixtures the way the venue file will state them. Consoles
+/// name fixtures by type ("Robe Spiider" forty times) and tell them apart by
+/// fixture ID; a name that repeats takes its ID.
+struct Namer {
+    counts: HashMap<String, usize>,
+    seen: HashMap<String, usize>,
+    /// Fixtures that took their console fixture ID.
+    numbered: usize,
+    /// Names that needed an ordinal.
+    ordinal_named: Vec<String>,
 }
 
-/// Names each (archive, mode) after its GDTF's fixture name, adding the
-/// mode — and the archive stem, if that is not enough — only where two
-/// keys would otherwise collide. Collision means the same name *or* the
-/// same `.fixture` file stem: "Astera-PB15" and "Astera_PB15" are different
-/// names on the same file, and the second write would have refused after
-/// the first landed.
-fn name_fixture_types(
-    keys: &[TypeKey],
-    embedded: &HashMap<String, Embedded>,
-    warnings: &mut Vec<String>,
-) -> Result<HashMap<TypeKey, String>, Box<dyn Error>> {
-    let base = |key: &TypeKey, warnings: &mut Vec<String>| -> String {
-        match &embedded[&key.entry].description {
-            Ok(description) => dsl_safe(&description.name, warnings),
-            Err(_) => dsl_safe(&key.entry, warnings),
-        }
-    };
-    let mut names: HashMap<TypeKey, String> = HashMap::new();
-    for key in keys {
-        let name = base(key, warnings);
-        names.insert(key.clone(), name);
-    }
-    for round in 0..2 {
+impl Namer {
+    fn new(scene: &Scene) -> Namer {
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for name in names.values() {
-            *counts.entry(fixture_filename_stem(name)).or_default() += 1;
+        for fixture in &scene.fixtures {
+            *counts.entry(fixture.name.trim().to_string()).or_default() += 1;
         }
-        let mut colliding: Vec<TypeKey> = names
-            .iter()
-            .filter(|(_, name)| counts[&fixture_filename_stem(name)] > 1)
-            .map(|(key, _)| key.clone())
-            .collect();
-        colliding.sort();
-        if colliding.is_empty() {
-            break;
-        }
-        for key in colliding {
-            let stem = embedded[&key.entry]
-                .file_name
-                .trim_end_matches(".gdtf")
-                .to_string();
-            let mut scratch = Vec::new();
-            let name = if round == 0 {
-                format!("{} ({})", base(&key, &mut scratch), key.mode)
-            } else {
-                format!("{} ({}, {})", base(&key, &mut scratch), stem, key.mode)
-            };
-            names.insert(key, name);
+        Namer {
+            counts,
+            seen: HashMap::new(),
+            numbered: 0,
+            ordinal_named: Vec::new(),
         }
     }
-    // Names that still stem alike after the archive stem is in ("Astera-PB15"
-    // vs "Astera_PB15") get an ordinal, in key order, so both land.
-    let mut by_stem: HashMap<String, Vec<TypeKey>> = HashMap::new();
-    for key in keys {
-        by_stem
-            .entry(fixture_filename_stem(&names[key]))
-            .or_default()
-            .push(key.clone());
-    }
-    for (_, mut clashing) in by_stem.into_iter().filter(|(_, keys)| keys.len() > 1) {
-        clashing.sort();
-        for (ordinal, key) in clashing.into_iter().enumerate().skip(1) {
-            let name = format!("{} #{}", names[&key], ordinal + 1);
-            warnings.push(format!(
-                "fixture type \"{}\" would share a file with another; written as \"{name}\"",
-                names[&key]
-            ));
-            names.insert(key, name);
-        }
-    }
-    let mut by_stem: HashMap<String, Vec<&String>> = HashMap::new();
-    for name in names.values() {
-        by_stem
-            .entry(fixture_filename_stem(name))
-            .or_default()
-            .push(name);
-    }
-    if let Some((stem, clashing)) = by_stem.iter().find(|(_, names)| names.len() > 1) {
-        return Err(format!(
-            "fixture types {} would all be written to {stem}.fixture; rename the embedded \
-             GDTF entries so their names differ by more than punctuation",
-            clashing
-                .iter()
-                .map(|n| format!("\"{n}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
+
+    /// The name of `fixture`, the `index`th of its scene; call in order.
+    fn name(&mut self, fixture: &MvrFixture, index: usize, warnings: &mut Vec<String>) -> String {
+        let base = fixture.name.trim();
+        let repeated = self.counts.get(base).is_some_and(|c| *c > 1);
+        let candidate = match (&fixture.fixture_id, repeated) {
+            (Some(id), true) if !base.is_empty() => {
+                self.numbered += 1;
+                format!("{base} {}", id.trim())
+            }
+            _ => base.to_string(),
+        };
+        unique_name(
+            &candidate,
+            index,
+            &mut self.seen,
+            &mut self.ordinal_named,
+            warnings,
         )
-        .into());
     }
-    Ok(names)
 }
 
 /// A fixture name unique within the venue: the MVR's, made unique on
@@ -1076,7 +1095,7 @@ fn geometry(
 }
 
 /// MVR millimeters, re-origined, to stage meters.
-fn to_stage(mm: &Vec3, origin_mm: &Vec3) -> Vec3 {
+pub(crate) fn to_stage(mm: &Vec3, origin_mm: &Vec3) -> Vec3 {
     [
         (mm[0] - origin_mm[0]) / 1000.0,
         (mm[1] - origin_mm[1]) / 1000.0,
@@ -1089,11 +1108,73 @@ fn close(a: &Vec3, b: &Vec3) -> bool {
     (0..3).all(|i| (a[i] - b[i]).abs() < 0.01)
 }
 
-fn describe_change(theirs: &Fixture, planned: &PlannedFixture) -> String {
+/// A merged fixture's mode in the venue and in the MVR, as the GDTF spells
+/// them, for a fixture whose type the MVR does not change.
+struct ModeFacts {
+    /// The venue's: the line's mode. `None` when the line names none (a
+    /// load error the merge corrects).
+    mine: Option<String>,
+    /// The new MVR's.
+    mvr: String,
+    /// The previous MVR's, when there is a previous MVR that patched it.
+    prior: Option<String>,
+}
+
+/// The mode facts for a fixture the venue and the MVR both have, when they
+/// agree on its type (a type change is its own edit, and a mode is only a
+/// mode of its type). Every spelling is matched against the GDTF, so a
+/// trimmed or re-cased name is the same mode.
+fn compare_modes(
+    theirs: &Fixture,
+    planned: &PlannedFixture,
+    prior: Option<&Prior>,
+    embedded: &HashMap<String, Embedded>,
+) -> Option<ModeFacts> {
+    let key = planned.gdtf.as_ref()?;
+    let type_name = planned.fixture_type.as_ref()?;
+    if type_name != theirs.fixture_type() {
+        return None;
+    }
+    let canonical = |written: &str| match &embedded[&key.entry].description {
+        Ok(description) => gdtf::match_mode(description, written)
+            .map(|m| m.name)
+            .unwrap_or_else(|_| written.to_string()),
+        Err(_) => written.to_string(),
+    };
+    let mine = theirs.mode().map(canonical);
+    Some(ModeFacts {
+        mine,
+        mvr: key.mode.clone(),
+        prior: prior.and_then(|p| p.mode.as_deref()).map(canonical),
+    })
+}
+
+/// A mode for a message: the name, or that there is none.
+fn mode_text(mode: Option<&str>) -> String {
+    match mode {
+        Some(mode) => format!("\"{mode}\""),
+        None => "no mode".to_string(),
+    }
+}
+
+fn describe_change(
+    theirs: &Fixture,
+    planned: &PlannedFixture,
+    modes: Option<&ModeFacts>,
+) -> String {
     let mut changes = Vec::new();
     if let Some(fixture_type) = &planned.fixture_type {
         if fixture_type != theirs.fixture_type() {
             changes.push(format!("type {} → {fixture_type}", theirs.fixture_type()));
+        }
+    }
+    if let Some(modes) = modes {
+        if modes.mine.as_deref() != Some(modes.mvr.as_str()) {
+            changes.push(format!(
+                "mode {} → \"{}\"",
+                mode_text(modes.mine.as_deref()),
+                modes.mvr
+            ));
         }
     }
     if let Some((universe, address)) = planned.patch {
@@ -1130,6 +1211,214 @@ fn relative_display(project: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// What the previous MVR put on a fixture, as the previous import stated it.
+struct Prior {
+    position: Option<Vec3>,
+    rotation: Option<Vec3>,
+    patch: Option<(u16, u16)>,
+    /// The `GDTFMode` as the previous MVR wrote it (unmatched).
+    mode: Option<String>,
+}
+
+/// The fields of `theirs` (the venue's fixture) that a merge would replace
+/// with the MVR's value although the venue's owner edited them: the venue
+/// differs from the new MVR and from what the previous MVR said. Without a
+/// previous value to compare (`prior` is `None`) any difference is a hand
+/// edit; so is any type difference, since the previous type name is not
+/// recoverable from the previous MVR without re-resolving its GDTFs.
+fn hand_edits(
+    theirs: &Fixture,
+    planned: &PlannedFixture,
+    prior: Option<&Prior>,
+    modes: Option<&ModeFacts>,
+) -> Vec<HandEdit> {
+    let mut edits = Vec::new();
+    // Treated the way the patch is: a mode the venue's owner changed is
+    // listed, and kept only when asked.
+    if let Some(modes) = modes {
+        if modes.mine.as_deref() != Some(modes.mvr.as_str())
+            && (prior.is_none() || modes.prior != modes.mine)
+        {
+            edits.push(HandEdit {
+                field: "mode".to_string(),
+                mine: mode_text(modes.mine.as_deref()),
+                mvr: mode_text(Some(&modes.mvr)),
+            });
+        }
+    }
+    if let (Some(mine), Some(mvr)) = (theirs.position(), planned.position) {
+        if !close(&mine, &mvr)
+            && prior
+                .and_then(|p| p.position)
+                .is_none_or(|previous| !close(&mine, &previous))
+        {
+            edits.push(HandEdit {
+                field: "position".to_string(),
+                mine: fmt_vec3(&mine),
+                mvr: fmt_vec3(&mvr),
+            });
+        }
+    }
+    if let (Some(mine), Some(mvr)) = (theirs.rotation(), planned.rotation) {
+        if !close(&mine, &mvr)
+            && prior
+                .and_then(|p| p.rotation)
+                .is_none_or(|previous| !close(&mine, &previous))
+        {
+            edits.push(HandEdit {
+                field: "rotation".to_string(),
+                mine: fmt_vec3(&mine),
+                mvr: fmt_vec3(&mvr),
+            });
+        }
+    }
+    if let Some(mvr) = planned.patch {
+        let mine = (theirs.universe(), theirs.start_channel());
+        if mine != mvr
+            && prior
+                .and_then(|p| p.patch)
+                .is_none_or(|previous| previous != mine)
+        {
+            edits.push(HandEdit {
+                field: "patch".to_string(),
+                mine: format!("{}:{}", mine.0, mine.1),
+                mvr: format!("{}:{}", mvr.0, mvr.1),
+            });
+        }
+    }
+    if let Some(mvr) = &planned.fixture_type {
+        if mvr != theirs.fixture_type() {
+            edits.push(HandEdit {
+                field: "type".to_string(),
+                mine: theirs.fixture_type().to_string(),
+                mvr: mvr.clone(),
+            });
+        }
+    }
+    edits
+}
+
+/// `# layer "..."` for a fixture on an MVR layer.
+fn layer_comment(planned: &PlannedFixture) -> Option<String> {
+    if planned.layer.is_empty() {
+        return None;
+    }
+    let layer: String = planned
+        .layer
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    Some(format!("# layer \"{layer}\""))
+}
+
+/// The `# TODO fixture ...` line for a fixture the import could not resolve.
+fn todo_line(planned: &PlannedFixture) -> String {
+    let reason = planned
+        .todo
+        .clone()
+        .unwrap_or_else(|| "unresolved".to_string());
+    let patch = planned
+        .patch
+        .map(|(u, a)| format!(" @ {u}:{a}"))
+        .unwrap_or_default();
+    let position = planned
+        .position
+        .map(|p| format!(" position {}", fmt_vec3(&p)))
+        .unwrap_or_default();
+    let layer = layer_comment(planned)
+        .map(|c| format!("  {c}"))
+        .unwrap_or_default();
+    format!(
+        "  # TODO fixture \"{}\"{patch}{position}: {reason}{layer}",
+        planned.name
+    )
+}
+
+/// The venue the plan describes, as the parser would hold it.
+fn desired_venue(plan: &MvrPlan, kept: &[Fixture], kept_focus: &BTreeMap<String, Vec3>) -> Venue {
+    let mut fixtures = HashMap::new();
+    for planned in &plan.fixtures {
+        if let (Some(fixture_type), Some((universe, address)), None) =
+            (&planned.fixture_type, planned.patch, &planned.todo)
+        {
+            fixtures.insert(
+                planned.name.clone(),
+                Fixture::new(
+                    planned.name.clone(),
+                    fixture_type.clone(),
+                    universe,
+                    address,
+                    planned.tags.clone(),
+                )
+                .with_mode(planned.mode.clone())
+                .with_position(planned.position)
+                .with_rotation(planned.rotation)
+                .with_beam_angle(planned.beam_angle),
+            );
+        }
+    }
+    for fixture in kept {
+        fixtures.insert(fixture.name().to_string(), fixture.clone());
+    }
+    let mut focus = kept_focus.clone();
+    for planned in &plan.focus_points {
+        focus.insert(planned.name.clone(), planned.point);
+    }
+    Venue::new(plan.venue_name.clone(), fixtures)
+        .with_focus_points(focus)
+        .with_source(Some(VenueSource {
+            mvr: plan.archive.clone(),
+            origin: plan.origin,
+        }))
+}
+
+/// A merge as a textual patch of the existing venue file: comments, the
+/// header and `# TODO` lines the import did not write survive, an unchanged
+/// TODO line stays where it is, and one whose fixture resolved (or changed)
+/// is replaced.
+fn patch_existing(
+    content: &Result<String, String>,
+    plan: &MvrPlan,
+    kept: &[Fixture],
+    kept_focus: &BTreeMap<String, Vec3>,
+) -> Result<String, String> {
+    let content = content.as_ref().map_err(Clone::clone)?;
+    let desired = desired_venue(plan, kept, kept_focus);
+    let by_name: HashMap<&str, &PlannedFixture> =
+        plan.fixtures.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut notes = PatchNotes::default();
+    let mut present: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut stripped = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let stale = trimmed
+            .strip_prefix("# TODO fixture \"")
+            .and_then(|rest| rest.split('"').next())
+            .and_then(|name| by_name.get_key_value(name))
+            .map(|(name, planned)| {
+                let current = planned.todo.is_some() && todo_line(planned).trim() == trimmed;
+                if current {
+                    present.insert(name);
+                }
+                !current
+            })
+            .unwrap_or(false);
+        if !stale {
+            stripped.push_str(line);
+        }
+    }
+    for planned in &plan.fixtures {
+        if planned.todo.is_some() {
+            if !present.contains(planned.name.as_str()) {
+                notes.trailing_lines.push(todo_line(planned));
+            }
+        } else if let Some(comment) = layer_comment(planned) {
+            notes.fixture_comments.insert(planned.name.clone(), comment);
+        }
+    }
+    patch_venue_with(&stripped, &plan.venue_name, &desired, &notes)
+}
+
 /// The venue file's text: a header for the reader, the provenance line,
 /// one fixture per line with its MVR layer as a trailing comment, TODOs
 /// for what could not be resolved, the focus points.
@@ -1161,16 +1450,9 @@ fn render_venue(
             planned.patch.map(|p| p.1).unwrap_or(u16::MAX),
             planned.name.clone(),
         );
-        let layer = if planned.layer.is_empty() {
-            String::new()
-        } else {
-            let layer: String = planned
-                .layer
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            format!("  # layer \"{layer}\"")
-        };
+        let layer = layer_comment(planned)
+            .map(|c| format!("  {c}"))
+            .unwrap_or_default();
         let line = match (&planned.fixture_type, planned.patch, &planned.todo) {
             (Some(fixture_type), Some((universe, address)), None) => {
                 let fixture = Fixture::new(
@@ -1180,29 +1462,13 @@ fn render_venue(
                     address,
                     planned.tags.clone(),
                 )
+                .with_mode(planned.mode.clone())
                 .with_position(planned.position)
-                .with_rotation(planned.rotation);
+                .with_rotation(planned.rotation)
+                .with_beam_angle(planned.beam_angle);
                 format!("  {fixture}{layer}\n")
             }
-            _ => {
-                let reason = planned
-                    .todo
-                    .clone()
-                    .unwrap_or_else(|| "unresolved".to_string());
-                let patch = planned
-                    .patch
-                    .map(|(u, a)| format!(" @ {u}:{a}"))
-                    .unwrap_or_default();
-                let position = planned
-                    .position
-                    .map(|p| format!(" position {}", fmt_vec3(&p)))
-                    .unwrap_or_default();
-                format!(
-                    "  # TODO fixture \"{}\"{patch}{position}: {reason}{}\n",
-                    planned.name,
-                    layer.trim_end()
-                )
-            }
+            _ => format!("{}\n", todo_line(planned)),
         };
         lines.push((key, line));
     }
@@ -1242,7 +1508,7 @@ mod tests {
     use crate::lighting::mvr::SYNTHETIC_SCENE;
 
     fn gdtf_bytes() -> Vec<u8> {
-        build_zip(&[("description.xml", SYNTHETIC_DESCRIPTION.as_bytes())])
+        crate::testutil::lighting::synthetic_gdtf()
     }
 
     /// An MVR embedding the synthetic PB15 and patching a few of them.
@@ -1324,9 +1590,12 @@ mod tests {
             vec![
                 "lighting/library/kellys.mvr",
                 "lighting/library/Astera_PB15.gdtf",
-                "lighting/fixture_types/synth_brick.fixture",
                 "lighting/venues/kellys.venue",
             ]
+        );
+        assert!(
+            !dir.path().join("lighting/fixture_types").exists(),
+            "the archive is the fixture type; nothing is pinned"
         );
         let venue_text =
             std::fs::read_to_string(dir.path().join("lighting/venues/kellys.venue")).unwrap();
@@ -1338,7 +1607,7 @@ mod tests {
         );
         assert!(
             venue_text.contains(
-                "  fixture \"Brick 1\" \"Synth Brick\" @ 1:1 position (-2, 7, 4.2) rotation (0, 0, 0)  # layer \"Front Truss\"\n"
+                "  fixture \"Brick 1\" \"Synth Brick\" mode \"8: RGBS\" @ 1:1 position (-2, 7, 4.2) rotation (0, 0, 0)  # layer \"Front Truss\"\n"
             ),
             "{venue_text}"
         );
@@ -1350,8 +1619,7 @@ mod tests {
         // It loads through the real loader, fixture types expanding via the cache.
         let mut system = crate::lighting::system::LightingSystem::new();
         let config = crate::config::lighting::Lighting::new(
-            None,
-            None,
+            Some("kellys".to_string()),
             None,
             Some(crate::config::lighting::Directories::new(
                 Some("lighting/fixture_types".to_string()),
@@ -1366,8 +1634,11 @@ mod tests {
         assert_eq!(venue.fixtures().len(), 2);
         assert_eq!(venue.focus_points().len(), 1);
         assert!(system
-            .fixture_types_iter()
+            .gdtf_types_iter()
             .any(|(name, _)| name == "Synth Brick"));
+        system
+            .get_current_venue_fixtures()
+            .expect("every fixture resolves in its own mode");
     }
 
     #[test]
@@ -1417,13 +1688,11 @@ mod tests {
             ("Astera_PB15.gdtf", gdtf.as_slice()),
         ]);
         let report = import_mvr_bytes(&bytes, "kellys.mvr", &options(), dir.path()).unwrap();
-        assert_eq!(report.plan.fixture_types[0].mode, "8: RGBS ");
-        let written =
-            std::fs::read_to_string(dir.path().join(&report.plan.fixture_types[0].fixture_file))
-                .unwrap();
+        assert_eq!(report.plan.fixtures[0].mode.as_deref(), Some("8: RGBS "));
+        let written = venue_text(dir.path());
         assert!(written.contains("mode \"8: RGBS \""), "{written}");
-        let again = parse_fixture_types(&written).unwrap();
-        assert_eq!(again["Synth Brick"].source().unwrap().mode, "8: RGBS ");
+        let again = parse_venues(&written).unwrap();
+        assert_eq!(again["kellys"].fixtures()["B"].mode(), Some("8: RGBS "));
     }
 
     #[test]
@@ -1432,7 +1701,7 @@ mod tests {
         let fixtures = brick("B", "1.1", 0.0).replace("8: RGBS", "8 rgbs");
         let bytes = mvr_bytes(&scene_with(&fixtures, ""));
         let plan = inspect_mvr_bytes(&bytes, "k.mvr", &options(), dir.path()).unwrap();
-        assert_eq!(plan.fixture_types[0].mode, "8: RGBS");
+        assert_eq!(plan.fixtures[0].mode.as_deref(), Some("8: RGBS"));
         assert!(
             plan.warnings
                 .iter()
@@ -1557,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn a_native_fixture_type_of_the_same_name_is_a_collision() {
+    fn a_name_a_hand_written_type_has_pins_the_newcomer_with_its_stem() {
         let dir = project();
         let types = dir.path().join("lighting/fixture_types");
         std::fs::create_dir_all(&types).unwrap();
@@ -1566,19 +1835,234 @@ mod tests {
             "fixture_type \"Synth Brick\" {\n  channels: 3\n  channel_map: {\"red\": 1, \"green\": 2, \"blue\": 3}\n}\n",
         )
         .unwrap();
-        // Same stem, but the importer checks the .fixture path; a .light
-        // twin is invisible to it, so this one succeeds — the collision
-        // the importer can see is a .fixture pointing elsewhere.
+        let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+        let report = import_mvr_bytes(&bytes, "k.mvr", &options(), dir.path()).unwrap();
+        let planned = &report.plan.fixture_types[0];
+        assert_eq!(planned.name, "Synth Brick (Astera_PB15)");
+        let record = planned.fixture_file.as_deref().expect("the name is pinned");
+        let text = std::fs::read_to_string(dir.path().join(record)).unwrap();
+        assert!(
+            text.contains("fixture_type \"Synth Brick (Astera_PB15)\""),
+            "{text}"
+        );
+        assert!(
+            venue_text(dir.path())
+                .contains("fixture \"B\" \"Synth Brick (Astera_PB15)\" mode \"8: RGBS\" @ 1:1"),
+            "{}",
+            venue_text(dir.path())
+        );
+    }
+
+    /// A hand-written "Synth Brick", so every embedded synthetic GDTF is
+    /// pinned as `Synth Brick (<its file stem>)`.
+    fn with_hand_written_synth_brick(dir: &Path) -> PathBuf {
+        let types = dir.join("lighting/fixture_types");
+        std::fs::create_dir_all(&types).unwrap();
         std::fs::write(
-            types.join("synth_brick.fixture"),
-            "fixture_type \"Synth Brick\"\n  from gdtf(\"lighting/library/other.gdtf\", mode \"8: RGBS\")\n{\n}\n",
+            types.join("synth_brick.light"),
+            "fixture_type \"Synth Brick\" {\n  channels: 1\n  channel_map: {\"dimmer\": 1}\n}\n",
         )
         .unwrap();
+        types
+    }
+
+    /// Every file under `dir`, relative.
+    fn all_files(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = crate::lighting::project_files::files_under(
+            dir,
+            &["light", "fixture", "venue", "gdtf", "mvr"],
+        )
+        .iter()
+        .map(|p| crate::lighting::project_files::display_in(dir, p))
+        .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn an_embedded_gdtf_whose_record_file_is_taken_refuses_with_what_to_do() {
+        let dir = project();
+        let types = with_hand_written_synth_brick(dir.path());
+        std::fs::write(
+            types.join("synth_brick_astera_pb15.fixture"),
+            "fixture_type \"Other\" {\n  channels: 1\n  channel_map: {\"dimmer\": 1}\n}\n",
+        )
+        .unwrap();
+        let before = all_files(dir.path());
         let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+
+        let err = import_mvr_bytes(&bytes, "k.mvr", &options(), dir.path()).unwrap_err();
+
+        assert!(err.downcast_ref::<super::super::RecordRefused>().is_some());
+        assert_eq!(
+            err.to_string(),
+            "lighting/fixture_types/synth_brick_astera_pb15.fixture holds \"Other\"; rename or \
+             move that file, or import Astera_PB15.gdtf on its own first under a name of your \
+             own (`mtrack import-gdtf --name <name>`, or the Fixtures page)"
+        );
+        assert_eq!(all_files(dir.path()), before, "nothing written, no _2");
+    }
+
+    #[test]
+    fn a_venue_write_failing_takes_its_records_back_and_keeps_the_library_copies() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = project();
+        let types = with_hand_written_synth_brick(dir.path());
+        let venues = dir.path().join("lighting/venues");
+        std::fs::create_dir_all(&venues).unwrap();
+        std::fs::set_permissions(&venues, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(venues.join(".probe"), "").is_ok() {
+            return; // running as root: a locked directory locks nothing
+        }
+        let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+
         let err = import_mvr_bytes(&bytes, "k.mvr", &options(), dir.path())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("rename one of them"), "{err}");
+        std::fs::set_permissions(&venues, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(err.contains("kellys.venue"), "{err}");
+        assert!(
+            err.ends_with(
+                "; only the library copies lighting/library/k.mvr and \
+                 lighting/library/Astera_PB15.gdtf were saved"
+            ),
+            "{err}"
+        );
+        assert!(
+            !types.join("synth_brick_astera_pb15.fixture").exists(),
+            "the record goes with the venue"
+        );
+        assert!(dir.path().join("lighting/library/k.mvr").is_file());
+        assert!(dir
+            .path()
+            .join("lighting/library/Astera_PB15.gdtf")
+            .is_file());
+        assert_eq!(all_files(&venues), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_revised_mvr_is_put_back_with_its_venue_and_the_retry_merges_against_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = project();
+        let rev1 = mvr_bytes(&scene_with(
+            &format!("{}\n{}", brick("B", "1.1", 0.0), brick("C", "1.5", 1000.0)),
+            "",
+        ));
+        import_mvr_bytes(&rev1, "kellys.mvr", &options(), dir.path()).unwrap();
+        let archive = dir.path().join("lighting/library/kellys.mvr");
+        let venues = dir.path().join("lighting/venues");
+        let venue_before = std::fs::read_to_string(venues.join("kellys.venue")).unwrap();
+
+        // Revision 2 drops C; its venue cannot be written.
+        let rev2 = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+        std::fs::set_permissions(&venues, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(venues.join(".probe"), "").is_ok() {
+            std::fs::set_permissions(&venues, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root
+        }
+        let err = import_mvr_bytes(&rev2, "kellys.mvr", &options(), dir.path())
+            .unwrap_err()
+            .to_string();
+        std::fs::set_permissions(&venues, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(err.ends_with("; nothing was saved"), "{err}");
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            rev1,
+            "the baseline is back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(venues.join("kellys.venue")).unwrap(),
+            venue_before
+        );
+
+        // The retry merges against revision 1: C goes, B is no hand edit.
+        let report = import_mvr_bytes(&rev2, "kellys.mvr", &options(), dir.path()).unwrap();
+        let plan = &report.plan;
+        assert!(plan.merge);
+        assert_eq!(
+            plan.removed_fixtures
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["C"]
+        );
+        let b = plan.fixtures.iter().find(|f| f.name == "B").unwrap();
+        assert_eq!(b.change.as_deref(), Some("unchanged"));
+        assert!(b.overwrites.is_empty(), "{:?}", b.overwrites);
+        assert_eq!(std::fs::read(&archive).unwrap(), rev2);
+    }
+
+    #[test]
+    fn three_embedded_gdtfs_whose_records_fold_to_one_file_are_refused_at_plan_time() {
+        let dir = project();
+        with_hand_written_synth_brick(dir.path());
+        // Three archives of one fixture name whose file stems differ only in
+        // case and separators: "Synth Brick (X_1)", "(x 1)" and "(x_1)" all
+        // want `synth_brick_x_1.fixture`.
+        let names = ["X_1.gdtf", "x 1.gdtf", "x_1.gdtf"];
+        let fixtures: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| {
+                format!(
+                    r#"<Fixture name="B{i}"><Matrix>{{1,0,0}}{{0,1,0}}{{0,0,1}}{{0,3500,4200}}</Matrix>
+<GDTFSpec>{spec}</GDTFSpec><GDTFMode>8: RGBS</GDTFMode>
+<Addresses><Address break="0">1.{}</Address></Addresses></Fixture>"#,
+                    1 + i * 10
+                )
+            })
+            .collect();
+        let scene = scene_with(&fixtures.join("\n"), "");
+        let archives: Vec<Vec<u8>> = (0..names.len())
+            .map(|i| {
+                crate::testutil::lighting::synthetic_gdtf_of(
+                    &SYNTHETIC_DESCRIPTION
+                        .replace("mtrack synthetic", &format!("mtrack synthetic {i}")),
+                )
+            })
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> =
+            vec![("GeneralSceneDescription.xml", scene.as_bytes())];
+        for (name, bytes) in names.iter().zip(&archives) {
+            entries.push((name, bytes.as_slice()));
+        }
+        let bytes = build_zip(&entries);
+        let before = all_files(dir.path());
+
+        let err = inspect_mvr_bytes(&bytes, "k.mvr", &options(), dir.path()).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "lighting/fixture_types/synth_brick_x_1.fixture would also be the record of \
+             \"Synth Brick (X_1)\", another GDTF in this MVR; import x 1.gdtf on its own first \
+             under a name of your own (`mtrack import-gdtf --name <name>`, or the Fixtures page)"
+        );
+        let err = import_mvr_bytes(&bytes, "k.mvr", &options(), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("synth_brick_x_1.fixture"), "{err}");
+        assert_eq!(all_files(dir.path()), before, "nothing is written");
+    }
+
+    #[test]
+    fn an_archive_already_in_the_library_is_used_not_copied() {
+        let dir = project();
+        let library = dir.path().join("lighting/library");
+        std::fs::create_dir_all(&library).unwrap();
+        // Imported on its own earlier, under the name its maker gave it.
+        std::fs::write(library.join("pb15.gdtf"), gdtf_bytes()).unwrap();
+        let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+        let report = import_mvr_bytes(&bytes, "k.mvr", &options(), dir.path()).unwrap();
+        let planned = &report.plan.fixture_types[0];
+        assert!(planned.existing);
+        assert_eq!(planned.name, "Synth Brick");
+        assert_eq!(planned.archive, "lighting/library/pb15.gdtf");
+        assert_eq!(planned.fixture_file, None);
+        assert!(!library.join("Astera_PB15.gdtf").exists(), "no second copy");
+        assert_eq!(
+            report.written,
+            ["lighting/library/k.mvr", "lighting/venues/kellys.venue"]
+        );
     }
 
     #[test]
@@ -1632,7 +2116,7 @@ mod tests {
         let dir = project();
         let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
         import_mvr_bytes(&bytes, "kellys.mvr", &options(), dir.path()).unwrap();
-        // The library archive changes underneath the .fixture that pins it.
+        // The library archive changes underneath the venue that uses it.
         std::fs::write(
             dir.path().join("lighting/library/Astera_PB15.gdtf"),
             b"not the same bytes",
@@ -1641,7 +2125,10 @@ mod tests {
         let err = inspect_mvr_bytes(&bytes, "kellys.mvr", &options(), dir.path())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("different content"), "{err}");
+        assert!(
+            err.contains("a different GDTF called \"Astera_PB15.gdtf\""),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1666,7 +2153,7 @@ mod tests {
             .plan
             .fixture_types
             .iter()
-            .map(|t| t.fixture_file.as_str())
+            .map(|t| t.archive.as_str())
             .collect();
         assert_eq!(files.len(), 2);
         assert_ne!(files[0], files[1], "{files:?}");
@@ -1755,6 +2242,372 @@ mod tests {
         assert_eq!(plan.fixtures[0].change.as_deref(), Some("unchanged"));
     }
 
+    /// Seeds "kellys" from two bricks (and a fixture with no such mode) and
+    /// hand-edits the venue file: a header, comments, a moved Brick 1, a
+    /// re-patched and re-typed Brick 2 and a nudged focus point.
+    fn seeded_and_hand_edited(dir: &Path) -> PathBuf {
+        let lost = r#"<Fixture name="Lost"><GDTFSpec>Astera_PB15.gdtf</GDTFSpec><GDTFMode>99: Nope</GDTFMode>
+<Addresses><Address break="0">1.30</Address></Addresses></Fixture>"#;
+        let first = mvr_bytes(&scene_with(
+            &format!(
+                "{}\n{}\n{lost}",
+                brick("Brick 1", "1.1", -2000.0),
+                brick("Brick 2", "1.5", 2000.0)
+            ),
+            r#"<FocusPoint name="Drummer"><Matrix>{1,0,0}{0,1,0}{0,0,1}{0,6300,1400}</Matrix></FocusPoint>"#,
+        ));
+        import_mvr_bytes(&first, "kellys.mvr", &options(), dir).unwrap();
+        let path = dir.join("lighting/venues/kellys.venue");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let venue = &parse_venues(&text).unwrap()["kellys"];
+        let old_position = fmt_vec3(&venue.fixtures()["Brick 1"].position().unwrap());
+        let edited = format!("# HOUSE NOTE: hung by Sam.\n{text}")
+            .replace(
+                &format!("position {old_position}"),
+                "position (-1.5, 7, 4.2) # moved after the rig check",
+            )
+            .replace("@ 1:5", "@ 1:105")
+            .replace(
+                "focus \"Drummer\" (0, 9.8, 1.4)",
+                "focus \"Drummer\" (0.4, 9.8, 1.4)",
+            )
+            .replace(
+                "venue \"kellys\" {\n",
+                "venue \"kellys\" {\n  # keep this comment\n",
+            );
+        assert_ne!(edited, text);
+        std::fs::write(&path, edited).unwrap();
+        path
+    }
+
+    /// The same rig again — a re-export that changed nothing the venue's
+    /// owner did not also change.
+    fn unchanged_mvr() -> Vec<u8> {
+        let lost = r#"<Fixture name="Lost"><GDTFSpec>Astera_PB15.gdtf</GDTFSpec><GDTFMode>99: Nope</GDTFMode>
+<Addresses><Address break="0">1.30</Address></Addresses></Fixture>"#;
+        // A different file (a note in the scene), so the library copy is
+        // treated as a revision of the same rig.
+        mvr_bytes(&scene_with(
+            &format!(
+                "{}\n{}\n{lost}\n<!-- revised -->",
+                brick("Brick 1", "1.1", -2000.0),
+                brick("Brick 2", "1.5", 2000.0)
+            ),
+            r#"<FocusPoint name="Drummer"><Matrix>{1,0,0}{0,1,0}{0,0,1}{0,6300,1400}</Matrix></FocusPoint>"#,
+        ))
+    }
+
+    #[test]
+    fn a_merge_keeps_the_files_comments_todos_and_header() {
+        let dir = project();
+        let path = seeded_and_hand_edited(dir.path());
+        import_mvr_bytes(&unchanged_mvr(), "kellys.mvr", &options(), dir.path()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# HOUSE NOTE: hung by Sam.\n"), "{text}");
+        assert!(text.contains("  # keep this comment\n"), "{text}");
+        assert!(text.contains("# moved after the rig check"), "{text}");
+        assert!(text.contains("# layer \"Front Truss\""), "{text}");
+        assert!(
+            text.contains("# TODO fixture \"Lost\" @ 1:30"),
+            "the TODO for a fixture with no mode stays: {text}"
+        );
+        assert_eq!(text.matches("# TODO fixture \"Lost\"").count(), 1, "{text}");
+        assert!(parse_venues(&text).is_ok());
+    }
+
+    #[test]
+    fn a_merge_lists_hand_edits_and_overwrites_them_without_keep() {
+        let dir = project();
+        let path = seeded_and_hand_edited(dir.path());
+        let plan =
+            inspect_mvr_bytes(&unchanged_mvr(), "kellys.mvr", &options(), dir.path()).unwrap();
+        let brick1 = plan.fixtures.iter().find(|f| f.name == "Brick 1").unwrap();
+        assert_eq!(
+            brick1
+                .overwrites
+                .iter()
+                .map(|e| e.field.as_str())
+                .collect::<Vec<_>>(),
+            ["position"],
+            "{brick1:?}"
+        );
+        assert_eq!(brick1.overwrites[0].mine, "(-1.5, 7, 4.2)");
+        let brick2 = plan.fixtures.iter().find(|f| f.name == "Brick 2").unwrap();
+        assert_eq!(
+            brick2
+                .overwrites
+                .iter()
+                .map(|e| (e.field.as_str(), e.mine.as_str(), e.mvr.as_str()))
+                .collect::<Vec<_>>(),
+            [("patch", "1:105", "1:5")]
+        );
+        let focus = plan
+            .focus_points
+            .iter()
+            .find(|f| f.name == "Drummer")
+            .unwrap();
+        assert_eq!(focus.overwrites.len(), 1, "{focus:?}");
+        assert_eq!(focus.overwrites[0].mine, "(0.4, 9.8, 1.4)");
+        // Planning wrote nothing.
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("position (-1.5, 7, 4.2)"));
+
+        // Without a keep list the MVR's values win.
+        import_mvr_bytes(&unchanged_mvr(), "kellys.mvr", &options(), dir.path()).unwrap();
+        let venue = &parse_venues(&std::fs::read_to_string(&path).unwrap()).unwrap()["kellys"];
+        assert_eq!(
+            venue.fixtures()["Brick 1"].position(),
+            Some([-2.0, 7.0, 4.2])
+        );
+        assert_eq!(venue.fixtures()["Brick 2"].start_channel(), 5);
+        assert_eq!(venue.focus_points()["Drummer"], [0.0, 9.8, 1.4]);
+    }
+
+    #[test]
+    fn a_reimport_keeps_a_fixtures_beam_angle_without_being_asked() {
+        let dir = project();
+        let path = seeded_and_hand_edited(dir.path());
+        // The MVR has no beam angle, so a first import left none.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("beam_angle"), "{text}");
+        std::fs::write(&path, text.replace("@ 1:105", "@ 1:105 beam_angle 60")).unwrap();
+
+        let plan =
+            inspect_mvr_bytes(&unchanged_mvr(), "kellys.mvr", &options(), dir.path()).unwrap();
+        for f in &plan.fixtures {
+            assert!(
+                f.overwrites.iter().all(|e| e.field != "beam_angle"),
+                "beam_angle is never a hand edit to choose: {f:?}"
+            );
+        }
+        // Not kept by name, and Brick 2's patch is overwritten: the angle stays.
+        import_mvr_bytes(&unchanged_mvr(), "kellys.mvr", &options(), dir.path()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let venue = &parse_venues(&text).unwrap()["kellys"];
+        assert_eq!(venue.fixtures()["Brick 2"].start_channel(), 5);
+        assert_eq!(venue.fixtures()["Brick 2"].beam_angle(), Some(60.0));
+        assert_eq!(venue.fixtures()["Brick 1"].beam_angle(), None);
+    }
+
+    #[test]
+    fn a_merge_keeps_the_hand_edits_it_is_asked_to() {
+        let dir = project();
+        let path = seeded_and_hand_edited(dir.path());
+        let keep = MvrKeep {
+            fixtures: BTreeMap::from([("Brick 1".to_string(), vec!["position".to_string()])]),
+            focus_points: vec!["Drummer".to_string()],
+        };
+        let options = MvrImportOptions { keep, ..options() };
+        let report =
+            import_mvr_bytes(&unchanged_mvr(), "kellys.mvr", &options, dir.path()).unwrap();
+        let brick1 = report
+            .plan
+            .fixtures
+            .iter()
+            .find(|f| f.name == "Brick 1")
+            .unwrap();
+        assert!(brick1.overwrites.is_empty());
+        assert_eq!(brick1.kept_edits, ["position"]);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let venue = &parse_venues(&text).unwrap()["kellys"];
+        assert_eq!(
+            venue.fixtures()["Brick 1"].position(),
+            Some([-1.5, 7.0, 4.2])
+        );
+        assert_eq!(venue.focus_points()["Drummer"], [0.4, 9.8, 1.4]);
+        // Not on the keep list: Brick 2's patch goes back to the MVR's.
+        assert_eq!(venue.fixtures()["Brick 2"].start_channel(), 5);
+        assert!(text.contains("# moved after the rig check"), "{text}");
+    }
+
+    #[test]
+    fn a_change_the_mvr_made_is_not_a_hand_edit() {
+        let dir = project();
+        let first = mvr_bytes(&scene_with(&brick("Brick 1", "1.1", -2000.0), ""));
+        import_mvr_bytes(&first, "kellys.mvr", &options(), dir.path()).unwrap();
+        // The rig moves and re-patches Brick 1 itself; the venue is untouched.
+        let second = mvr_bytes(&scene_with(&brick("Brick 1", "1.9", -1000.0), ""));
+        let plan = inspect_mvr_bytes(&second, "kellys.mvr", &options(), dir.path()).unwrap();
+        assert!(
+            plan.fixtures[0].overwrites.is_empty(),
+            "{:?}",
+            plan.fixtures[0]
+        );
+        assert!(plan.fixtures[0]
+            .change
+            .as_deref()
+            .unwrap()
+            .contains("patch"));
+    }
+
+    /// A brick patched in `mode` rather than "8: RGBS".
+    fn brick_in(name: &str, address: &str, x_mm: f64, mode: &str) -> String {
+        brick(name, address, x_mm).replace("8: RGBS", mode)
+    }
+
+    fn venue_text(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("lighting/venues/kellys.venue")).unwrap()
+    }
+
+    #[test]
+    fn two_modes_of_one_archive_are_one_type_and_every_line_states_its_mode() {
+        let dir = project();
+        let bytes = mvr_bytes(&scene_with(
+            &[
+                brick_in("Spot", "1.1", 0.0, "Mover 16bit"),
+                brick("Brick 1", "1.10", -2000.0),
+                brick("Brick 2", "1.20", 2000.0),
+            ]
+            .join("\n"),
+            "",
+        ));
+        let report = import_mvr_bytes(&bytes, "kellys.mvr", &options(), dir.path()).unwrap();
+        let types = &report.plan.fixture_types;
+        assert_eq!(types.len(), 1, "{types:?}");
+        assert_eq!(types[0].name, "Synth Brick", "no mode in the name");
+        assert_eq!(types[0].modes, ["8: RGBS", "Mover 16bit"]);
+        assert_eq!(types[0].fixture_file, None, "no record to write");
+        let mode = |name: &str| {
+            report
+                .plan
+                .fixtures
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .mode
+                .clone()
+        };
+        assert_eq!(mode("Spot").as_deref(), Some("Mover 16bit"));
+        assert_eq!(mode("Brick 1").as_deref(), Some("8: RGBS"));
+
+        let text = venue_text(dir.path());
+        assert!(
+            text.contains("  fixture \"Spot\" \"Synth Brick\" mode \"Mover 16bit\" @ 1:1 "),
+            "{text}"
+        );
+        assert!(
+            text.contains("  fixture \"Brick 1\" \"Synth Brick\" mode \"8: RGBS\" @ 1:10 "),
+            "{text}"
+        );
+
+        // Through the real loader, each fixture gets its own mode's channels.
+        let config = crate::config::lighting::Lighting::new(
+            Some("kellys".to_string()),
+            None,
+            Some(crate::config::lighting::Directories::new(
+                Some("lighting/fixture_types".to_string()),
+                Some("lighting/venues".to_string()),
+            )),
+        );
+        let mut system = crate::lighting::system::LightingSystem::new();
+        system.load(&config, dir.path()).unwrap();
+        let infos = system.get_current_venue_fixtures().unwrap();
+        let channels = |name: &str| &infos.iter().find(|f| f.name == name).unwrap().channels;
+        assert_eq!(channels("Spot").get("pan"), Some(&1));
+        assert_eq!(channels("Brick 1").get("red"), Some(&1));
+    }
+
+    #[test]
+    fn a_merge_moves_a_line_s_mode_the_way_it_moves_an_address() {
+        let dir = project();
+        let first = mvr_bytes(&scene_with(
+            &[
+                brick("Brick 1", "1.1", -2000.0),
+                brick("Brick 2", "1.10", 2000.0),
+                brick("Brick 3", "1.20", 0.0),
+            ]
+            .join("\n"),
+            "",
+        ));
+        import_mvr_bytes(&first, "kellys.mvr", &options(), dir.path()).unwrap();
+        // A hand-added fixture in a mode of its own.
+        let path = dir.path().join("lighting/venues/kellys.venue");
+        std::fs::write(
+            &path,
+            venue_text(dir.path()).replace(
+                "}\n",
+                "  fixture \"Own Spot\" \"Synth Brick\" mode \"Mover 16bit\" @ 2:1\n}\n",
+            ),
+        )
+        .unwrap();
+
+        // The console re-modes Brick 2.
+        let second = mvr_bytes(&scene_with(
+            &[
+                brick("Brick 1", "1.1", -2000.0),
+                brick_in("Brick 2", "1.10", 2000.0, "Mover 16bit"),
+                brick("Brick 3", "1.20", 0.0),
+            ]
+            .join("\n"),
+            "",
+        ));
+        let report = import_mvr_bytes(&second, "kellys.mvr", &options(), dir.path()).unwrap();
+        let brick2 = report
+            .plan
+            .fixtures
+            .iter()
+            .find(|f| f.name == "Brick 2")
+            .unwrap();
+        assert_eq!(
+            brick2.change.as_deref(),
+            Some("mode \"8: RGBS\" → \"Mover 16bit\"")
+        );
+        assert!(brick2.overwrites.is_empty(), "the MVR changed it, not you");
+        assert_eq!(report.plan.kept_fixtures, ["Own Spot"]);
+        let venue = &parse_venues(&venue_text(dir.path())).unwrap()["kellys"];
+        assert_eq!(venue.fixtures()["Brick 2"].mode(), Some("Mover 16bit"));
+        assert_eq!(venue.fixtures()["Brick 1"].mode(), Some("8: RGBS"));
+        assert_eq!(venue.fixtures()["Own Spot"].mode(), Some("Mover 16bit"));
+    }
+
+    #[test]
+    fn a_hand_changed_mode_is_listed_and_kept_when_asked() {
+        let dir = project();
+        let bytes = mvr_bytes(&scene_with(&brick("Brick 1", "1.1", 0.0), ""));
+        import_mvr_bytes(&bytes, "kellys.mvr", &options(), dir.path()).unwrap();
+        let path = dir.path().join("lighting/venues/kellys.venue");
+        std::fs::write(
+            &path,
+            venue_text(dir.path()).replace(
+                "\"Synth Brick\" mode \"8: RGBS\" @ 1:1",
+                "\"Synth Brick\" mode \"Mover 16bit\" @ 1:1",
+            ),
+        )
+        .unwrap();
+        let revised = mvr_bytes(&scene_with(
+            &format!("{}\n<!-- revised -->", brick("Brick 1", "1.1", 0.0)),
+            "",
+        ));
+        let plan = inspect_mvr_bytes(&revised, "kellys.mvr", &options(), dir.path()).unwrap();
+        let edits: Vec<(&str, &str, &str)> = plan.fixtures[0]
+            .overwrites
+            .iter()
+            .map(|e| (e.field.as_str(), e.mine.as_str(), e.mvr.as_str()))
+            .collect();
+        assert_eq!(edits, [("mode", "\"Mover 16bit\"", "\"8: RGBS\"")]);
+
+        let keep = MvrKeep {
+            fixtures: BTreeMap::from([("Brick 1".to_string(), vec!["mode".to_string()])]),
+            focus_points: Vec::new(),
+        };
+        import_mvr_bytes(
+            &revised,
+            "kellys.mvr",
+            &MvrImportOptions { keep, ..options() },
+            dir.path(),
+        )
+        .unwrap();
+        let venue = &parse_venues(&venue_text(dir.path())).unwrap()["kellys"];
+        assert_eq!(venue.fixtures()["Brick 1"].mode(), Some("Mover 16bit"));
+
+        // Without the keep, the MVR's mode wins.
+        import_mvr_bytes(&revised, "kellys.mvr", &options(), dir.path()).unwrap();
+        let venue = &parse_venues(&venue_text(dir.path())).unwrap()["kellys"];
+        assert_eq!(venue.fixtures()["Brick 1"].mode(), Some("8: RGBS"));
+    }
+
     #[test]
     fn the_synthetic_scene_walks_end_to_end() {
         // The mvr module's own synthetic scene: one resolvable brick, one
@@ -1782,5 +2635,163 @@ mod tests {
             plan.warnings
         );
         assert_eq!(plan.focus_points[0].name, "Drummer");
+    }
+
+    /// The venue "kellys", seeded by an import, at
+    /// `lighting/venues/kellys.venue`; its MVR's bytes.
+    fn seeded(dir: &Path) -> Vec<u8> {
+        let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+        import_mvr_bytes(&bytes, "kellys.mvr", &options(), dir).unwrap();
+        bytes
+    }
+
+    /// The revision of [`seeded`]'s MVR that moves B to 1.2.
+    fn revised() -> Vec<u8> {
+        mvr_bytes(&scene_with(&brick("B", "1.2", 0.0), ""))
+    }
+
+    fn venues_dir(dir: &Path) -> PathBuf {
+        dir.join("lighting/venues")
+    }
+
+    /// Every file under the venues directory, relative to it.
+    fn venue_files(dir: &Path) -> Vec<String> {
+        let root = venues_dir(dir);
+        crate::lighting::project_files::files_under(&root, &["venue", "light"])
+            .iter()
+            .map(|p| crate::lighting::project_files::display_in(&root, p))
+            .collect()
+    }
+
+    #[test]
+    fn a_venue_whose_file_is_its_alone_is_merged_where_it_lives() {
+        let dir = project();
+        seeded(dir.path());
+        let venues = venues_dir(dir.path());
+        std::fs::create_dir_all(venues.join("tour")).unwrap();
+        std::fs::rename(venues.join("kellys.venue"), venues.join("tour/2024.venue")).unwrap();
+
+        let plan = inspect_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path()).unwrap();
+        assert!(plan.merge);
+        assert_eq!(plan.venue_file, "lighting/venues/tour/2024.venue");
+        let report = import_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path()).unwrap();
+
+        assert!(report
+            .written
+            .contains(&"lighting/venues/tour/2024.venue".to_string()));
+        assert_eq!(venue_files(dir.path()), ["tour/2024.venue"]);
+        let text = std::fs::read_to_string(venues.join("tour/2024.venue")).unwrap();
+        assert!(text.contains("@ 1:2"), "{text}");
+    }
+
+    #[test]
+    fn a_venue_whose_file_holds_more_is_refused_and_nothing_is_written() {
+        let dir = project();
+        seeded(dir.path());
+        let venues = venues_dir(dir.path());
+        let mut shared = std::fs::read_to_string(venues.join("kellys.venue")).unwrap();
+        shared.push_str("venue \"Annex\" {\n}\n");
+        std::fs::remove_file(venues.join("kellys.venue")).unwrap();
+        std::fs::write(venues.join("all.venue"), &shared).unwrap();
+        let library = std::fs::read(dir.path().join("lighting/library/kellys.mvr")).unwrap();
+
+        let err = import_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path())
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "cannot import venue \"kellys\": Defined in all.venue alongside venue \"Annex\"; \
+             edit that file by hand."
+        );
+        assert_eq!(
+            std::fs::read_to_string(venues.join("all.venue")).unwrap(),
+            shared
+        );
+        assert_eq!(venue_files(dir.path()), ["all.venue"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("lighting/library/kellys.mvr")).unwrap(),
+            library,
+            "the library's MVR is not replaced"
+        );
+        let err = inspect_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("alongside venue \"Annex\""), "{err}");
+    }
+
+    #[test]
+    fn a_light_venue_moves_to_its_venue_file_when_merged() {
+        let dir = project();
+        seeded(dir.path());
+        let venues = venues_dir(dir.path());
+        std::fs::create_dir_all(venues.join("tour")).unwrap();
+        std::fs::rename(venues.join("kellys.venue"), venues.join("tour/old.light")).unwrap();
+
+        let plan = inspect_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path()).unwrap();
+        assert_eq!(plan.venue_file, "lighting/venues/tour/old.venue");
+        import_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path()).unwrap();
+
+        assert_eq!(venue_files(dir.path()), ["tour/old.venue"]);
+        let text = std::fs::read_to_string(venues.join("tour/old.venue")).unwrap();
+        assert!(text.contains("@ 1:2"), "{text}");
+
+        // Its `.venue` taken, in any case: refused, nothing moved.
+        std::fs::rename(venues.join("tour/old.venue"), venues.join("tour/old.light")).unwrap();
+        std::fs::write(venues.join("tour/OLD.venue"), "").unwrap();
+        let err = import_mvr_bytes(&revised(), "kellys.mvr", &options(), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "cannot import venue \"kellys\": venue \"kellys\" now needs a .venue file, and \
+             tour/OLD.venue is there; move or remove it by hand, then save again"
+        );
+        assert_eq!(
+            venue_files(dir.path()),
+            ["tour/OLD.venue", "tour/old.light"]
+        );
+    }
+
+    #[test]
+    fn a_new_venue_is_claimed_at_its_stem_and_a_taken_file_is_refused() {
+        let dir = project();
+        let venues = venues_dir(dir.path());
+        std::fs::create_dir_all(&venues).unwrap();
+        std::fs::write(venues.join("Kellys.venue"), "venue \"Other\" {\n}\n").unwrap();
+        std::fs::write(venues.join("broken.venue"), "venue \"Broken\" {\n").unwrap();
+        let bytes = mvr_bytes(&scene_with(&brick("B", "1.1", 0.0), ""));
+
+        let err = import_mvr_bytes(&bytes, "kellys.mvr", &options(), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "cannot import venue \"kellys\": Kellys.venue is taken by \"Other\"; choose another \
+             name"
+        );
+        let broken = MvrImportOptions {
+            name: Some("Broken".to_string()),
+            ..options()
+        };
+        let err = import_mvr_bytes(&bytes, "kellys.mvr", &broken, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "cannot import venue \"Broken\": broken.venue already exists; choose another name"
+        );
+        assert!(
+            !dir.path().join("lighting/library").exists(),
+            "nothing written"
+        );
+
+        let fresh = MvrImportOptions {
+            name: Some("Club (Main)".to_string()),
+            ..options()
+        };
+        let report = import_mvr_bytes(&bytes, "kellys.mvr", &fresh, dir.path()).unwrap();
+        assert_eq!(report.plan.venue_file, "lighting/venues/club_main.venue");
+        assert!(venues.join("club_main.venue").is_file());
     }
 }

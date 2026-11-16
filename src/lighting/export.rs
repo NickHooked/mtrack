@@ -30,17 +30,17 @@
 
 pub mod gdtf;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+pub use super::mvr_types::{FixedFixture, MvrExport};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::import::fixture_filename_stem;
-use super::parser::{parse_fixture_types, parse_venues};
-use super::types::{Fixture, FixtureType, Vec3, Venue};
+use super::effects::out_of_frame;
+use super::mvr_types::export_file_name;
+use super::types::{ChannelDef, Fixture, FixtureType, Vec3, Venue};
 
 /// How an export is run.
 #[derive(Clone, Debug)]
@@ -67,37 +67,42 @@ impl MvrExportOptions {
         MvrExportOptions {
             venue: venue.to_string(),
             output: None,
-            fixture_types_dir: "lighting/fixture_types".to_string(),
-            venues_dir: "lighting/venues".to_string(),
+            fixture_types_dir: crate::config::lighting::DEFAULT_FIXTURE_TYPES_DIR.to_string(),
+            venues_dir: crate::config::lighting::DEFAULT_VENUES_DIR.to_string(),
             layers_from_tags: false,
         }
     }
 }
 
-/// What an export produced, for reporting.
-#[derive(Debug, Serialize)]
-pub struct MvrExport {
-    /// The venue's name.
-    pub venue: String,
-    /// The `.mvr` written, project-relative.
-    pub output: String,
-    /// Fixtures in the scene.
-    pub fixtures: usize,
-    /// Focus points in the scene.
-    pub focus_points: usize,
-    /// GDTF archives embedded from the library, by entry name.
-    pub embedded_gdtfs: Vec<String>,
-    /// GDTF archives generated for native fixture types: entry name →
-    /// fixture type.
-    pub generated_gdtfs: BTreeMap<String, String>,
-    /// What was skipped or approximated.
-    pub warnings: Vec<String>,
-}
-
 /// Exports a venue to a `.mvr` in the project. All validation runs before
 /// the write.
 pub fn export_mvr(options: &MvrExportOptions, project: &Path) -> Result<MvrExport, Box<dyn Error>> {
-    let (bytes, mut report) = export_mvr_bytes(options, project)?;
+    let (bytes, report) = export_mvr_bytes(options, project)?;
+    write_export(options, project, &bytes, report, true)
+}
+
+/// A kept export that would replace a file already in the export directory.
+#[derive(Debug)]
+pub struct ExportExists(pub String);
+
+impl std::fmt::Display for ExportExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{EXPORT_DIR}/{} already exists", self.0)
+    }
+}
+
+impl Error for ExportExists {}
+
+/// Writes already-built export bytes into the project's export directory.
+/// Without `overwrite`, an existing file is left alone and [`ExportExists`]
+/// names it.
+pub fn write_export(
+    options: &MvrExportOptions,
+    project: &Path,
+    bytes: &[u8],
+    mut report: MvrExport,
+    overwrite: bool,
+) -> Result<MvrExport, Box<dyn Error>> {
     let output = output_path(options)?;
     // The export directory is the one place an export writes. It is
     // created if missing and then proven to be inside the project (a
@@ -129,13 +134,15 @@ pub fn export_mvr(options: &MvrExportOptions, project: &Path) -> Result<MvrExpor
         )
         .into());
     }
-    super::import::write(&path, &bytes)?;
+    if !overwrite && path.exists() {
+        return Err(Box::new(ExportExists(output)));
+    }
+    super::import::write(&path, bytes)?;
     report.output = format!("{EXPORT_DIR}/{output}");
     Ok(report)
 }
 
-/// Where exports land, relative to the project.
-pub const EXPORT_DIR: &str = "lighting/export";
+pub use super::mvr_types::EXPORT_DIR;
 
 /// [`export_mvr`] without the write: the archive bytes and the report
 /// (whose `output` names where [`export_mvr`] would put them).
@@ -163,7 +170,7 @@ pub fn export_mvr_bytes(
             }
         )
     })?;
-    let fixture_types = load_fixture_types(&project.join(&options.fixture_types_dir))?;
+    let fixture_types = load_fixture_types(project, &project.join(&options.fixture_types_dir))?;
 
     let mut warnings = Vec::new();
     let mut fixtures: Vec<&Fixture> = venue.fixtures().values().collect();
@@ -185,28 +192,54 @@ pub fn export_mvr_bytes(
     let mut entries: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut taken: BTreeSet<String> = BTreeSet::new();
     let mut entry_of_source: HashMap<String, String> = HashMap::new();
+    // One entry per type (the type is the whole archive, design §21); the
+    // mode is each fixture's own, from its venue line.
+    let mut entry_of_type: HashMap<&str, String> = HashMap::new();
     let mut gdtf_of: HashMap<&str, (String, String)> = HashMap::new();
     let mut embedded = Vec::new();
     let mut generated = BTreeMap::new();
     for fixture in &fixtures {
         let type_name = fixture.fixture_type();
-        if gdtf_of.contains_key(type_name) {
-            continue;
-        }
         let fixture_type = fixture_types.get(type_name).ok_or_else(|| {
             format!(
-                "fixture \"{}\" uses fixture type \"{type_name}\", which {} does not define",
+                "fixture \"{}\" uses fixture type \"{type_name}\", which neither {} nor {} \
+                 defines",
                 fixture.name(),
-                options.fixture_types_dir
+                options.fixture_types_dir,
+                crate::lighting::library::LIBRARY_DIR
             )
         })?;
-        let (entry, mode) = match fixture_type.source() {
+        let mode = match (fixture_type.source(), fixture.mode()) {
+            (Some(_), Some(mode)) => mode.to_string(),
+            (Some(_), None) => {
+                return Err(format!(
+                    "fixture \"{}\" of \"{type_name}\" names no mode; every fixture of a \
+                     GDTF fixture states its mode — add `mode \"...\"` to its venue line",
+                    fixture.name()
+                )
+                .into())
+            }
+            (None, Some(mode)) => {
+                return Err(format!(
+                    "fixture \"{}\" names mode \"{mode}\", but fixture type \"{type_name}\" is \
+                     not GDTF-sourced and has no modes; remove the mode",
+                    fixture.name()
+                )
+                .into())
+            }
+            (None, None) => gdtf::MODE_NAME.to_string(),
+        };
+        if let Some(entry) = entry_of_type.get(type_name) {
+            gdtf_of.insert(fixture.name(), (entry.clone(), mode));
+            continue;
+        }
+        let entry = match fixture_type.source() {
             Some(source) => {
                 let source_key = format!("archive:{}", source.path);
                 let entry = match entry_of_source.get(&source_key) {
                     Some(entry) => entry.clone(),
                     None => {
-                        let bytes = std::fs::read(project.join(&source.path)).map_err(|e| {
+                        let bytes = crate::util::read_file(&project.join(&source.path)).map_err(|e| {
                             format!(
                                 "fixture type \"{type_name}\" references {}, which cannot be read: {e}",
                                 source.path
@@ -231,7 +264,7 @@ pub fn export_mvr_bytes(
                         entry
                     }
                 };
-                (entry, source.mode.clone())
+                entry
             }
             None => {
                 let source_key = format!("native:{type_name}");
@@ -249,10 +282,89 @@ pub fn export_mvr_bytes(
                         entry
                     }
                 };
-                (entry, gdtf::MODE_NAME.to_string())
+                entry
             }
         };
-        gdtf_of.insert(type_name, (entry, mode));
+        entry_of_type.insert(type_name, entry.clone());
+        gdtf_of.insert(fixture.name(), (entry, mode));
+    }
+
+    // Each referential fixture's mode as its archive spells it: a line may
+    // write a mode the loader matches only after normalizing, and the MVR
+    // must name the archive's own mode. A mode the archive does not have
+    // refuses the export, by fixture, before anything is written.
+    let mut parsed: HashMap<String, Option<super::gdtf::Description>> = HashMap::new();
+    for fixture in &fixtures {
+        if fixture_types[fixture.fixture_type()].source().is_none() {
+            continue;
+        }
+        let (entry, mode) = gdtf_of
+            .get_mut(fixture.name())
+            .expect("every fixture has an entry");
+        let description = parsed
+            .entry(entry.clone())
+            .or_insert_with(|| {
+                entries
+                    .get(entry.as_str())
+                    .and_then(|bytes| super::gdtf::parse_archive(bytes).ok())
+            })
+            .as_ref()
+            .ok_or_else(|| {
+                format!(
+                    "fixture \"{}\": the GDTF archive of fixture type \"{}\" does not parse",
+                    fixture.name(),
+                    fixture.fixture_type()
+                )
+            })?;
+        let matched = super::gdtf::match_mode(description, mode).map_err(|_| {
+            format!(
+                "fixture \"{}\" is in mode \"{mode}\", which the GDTF archive of fixture type \
+                 \"{}\" does not have; correct the mode before exporting",
+                fixture.name(),
+                fixture.fixture_type()
+            )
+        })?;
+        *mode = matched.name;
+    }
+
+    // Which fixtures move: a mover's aim is its pan and tilt, so it links
+    // to no focus point here. A referential type's channels live in its
+    // archive, per mode — one archive can be a mover in one mode and not in
+    // another; one that cannot be distilled counts as moving, and so goes
+    // unlinked, which is what every export did before links existed.
+    let mut moves_in: HashMap<(&str, &str), bool> = HashMap::new();
+    let mut moving: HashSet<&str> = HashSet::new();
+    for fixture in &fixtures {
+        let type_name = fixture.fixture_type();
+        let (entry, mode) = &gdtf_of[fixture.name()];
+        let fixture_type = &fixture_types[type_name];
+        let moves = match moves_in.get(&(type_name, mode.as_str())) {
+            Some(moves) => *moves,
+            None => {
+                let moves = if fixture_type.source().is_none() {
+                    has_pose(fixture_type.channel_defs())
+                } else {
+                    parsed
+                        .entry(entry.clone())
+                        .or_insert_with(|| {
+                            entries
+                                .get(entry)
+                                .and_then(|bytes| super::gdtf::parse_archive(bytes).ok())
+                        })
+                        .as_ref()
+                        .and_then(|description| {
+                            super::gdtf::distill(description, mode, type_name).ok()
+                        })
+                        .map(|distilled| has_pose(distilled.fixture_type.channel_defs()))
+                        .unwrap_or(true)
+                };
+                moves_in.insert((type_name, mode.as_str()), moves);
+                moves
+            }
+        };
+        if moves {
+            moving.insert(fixture.name());
+        }
     }
 
     let origin_mm = venue
@@ -272,10 +384,20 @@ pub fn export_mvr_bytes(
         ));
     }
 
+    let fixed_fixtures: Vec<FixedFixture> = fixtures
+        .iter()
+        .filter(|f| f.position().is_some() && !moving.contains(f.name()))
+        .map(|f| FixedFixture {
+            name: f.name().to_string(),
+            focus: aimed_at(f, venue).map(str::to_string),
+        })
+        .collect();
+
     let scene = render_scene(
         venue,
         &fixtures,
         &gdtf_of,
+        &moving,
         &origin_mm,
         options.layers_from_tags,
     );
@@ -289,28 +411,16 @@ pub fn export_mvr_bytes(
             focus_points: venue.focus_points().len(),
             embedded_gdtfs: embedded,
             generated_gdtfs: generated,
+            positioned_fixtures: fixtures.len() - unplaced,
+            fixed_fixtures,
             warnings,
         },
     ))
 }
 
-/// The output's bare file name: `.mvr`, no directories, nothing hidden.
+/// The output's bare file name ([`export_file_name`]).
 fn output_path(options: &MvrExportOptions) -> Result<String, Box<dyn Error>> {
-    let output = match &options.output {
-        Some(output) => output.trim().to_string(),
-        None => format!("{}.mvr", fixture_filename_stem(&options.venue)),
-    };
-    let bare = Path::new(&output).file_name() == Some(std::ffi::OsStr::new(output.as_str()));
-    if !bare || output.starts_with('.') || output.contains('\\') || output.contains('\0') {
-        return Err(format!(
-            "output \"{output}\" must be a bare file name; exports land in {EXPORT_DIR}/"
-        )
-        .into());
-    }
-    if !output.to_ascii_lowercase().ends_with(".mvr") || output.len() <= 4 {
-        return Err(format!("output \"{output}\" must end in .mvr").into());
-    }
-    Ok(output)
+    Ok(export_file_name(options.output.as_deref(), &options.venue)?)
 }
 
 /// A zip entry name for a source: the wanted name, or the first free
@@ -335,49 +445,38 @@ fn place(
     name
 }
 
-/// Every venue in a directory (`.venue` and `.light` files alike).
+/// Every venue in a directory and its subdirectories (`.venue` and `.light`
+/// files alike), read as the lighting system reads them. An export is
+/// strict: a file that does not parse, or a name two files declare, stops
+/// it rather than export a rig with something quietly missing.
 fn load_venues(dir: &Path) -> Result<HashMap<String, Venue>, Box<dyn Error>> {
-    let mut venues = HashMap::new();
-    for path in lighting_files(dir, &["venue", "light"])? {
-        let content = std::fs::read_to_string(&path)?;
-        match parse_venues(&content) {
-            Ok(parsed) => venues.extend(parsed),
-            Err(e) => {
-                return Err(format!("{}: {e}", path.display()).into());
-            }
-        }
+    let read = super::project_files::venues(dir);
+    if let Some(problem) = read.problems.first() {
+        return Err(format!("{}: {}", problem.file.display(), problem.error).into());
     }
-    Ok(venues)
+    Ok(read.items.into_iter().map(|d| (d.name, d.item)).collect())
 }
 
-/// Every fixture type in a directory (`.fixture` and `.light` files alike).
-fn load_fixture_types(dir: &Path) -> Result<HashMap<String, FixtureType>, Box<dyn Error>> {
-    let mut types = HashMap::new();
-    for path in lighting_files(dir, &["fixture", "light"])? {
-        let content = std::fs::read_to_string(&path)?;
-        match parse_fixture_types(&content) {
-            Ok(parsed) => types.extend(parsed),
-            Err(e) => {
-                return Err(format!("{}: {e}", path.display()).into());
-            }
-        }
+/// Every fixture type of the project, read as the lighting system reads
+/// them: the type files in a directory and its subdirectories (`.fixture`
+/// and `.light` alike) and the library's unrecorded GDTFs. Strict, as
+/// [`load_venues`] is.
+fn load_fixture_types(
+    project: &Path,
+    dir: &Path,
+) -> Result<HashMap<String, FixtureType>, Box<dyn Error>> {
+    let read = super::project_files::fixture_types(project, Some(dir));
+    if let Some(problem) = read.files.problems.first() {
+        return Err(format!("{}: {}", problem.file.display(), problem.error).into());
     }
-    Ok(types)
-}
-
-fn lighting_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("cannot read directory {}: {e}", dir.display()))?;
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| extensions.contains(&e))
-        })
+    let mut types: HashMap<String, FixtureType> = read
+        .library
+        .types
+        .iter()
+        .map(|t| (t.name.clone(), super::library::declared(t)))
         .collect();
-    files.sort();
-    Ok(files)
+    types.extend(read.files.items.into_iter().map(|d| (d.name, d.item)));
+    Ok(types)
 }
 
 // --- Scene rendering -------------------------------------------------------
@@ -390,7 +489,10 @@ fn lighting_files(dir: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>, Box<d
 fn render_scene(
     venue: &Venue,
     fixtures: &[&Fixture],
+    // Fixture name → (GDTF entry, the fixture's own mode).
     gdtf_of: &HashMap<&str, (String, String)>,
+    // The fixtures that move, by name.
+    moving: &HashSet<&str>,
     origin_mm: &Vec3,
     layers_from_tags: bool,
 ) -> String {
@@ -405,7 +507,7 @@ fn render_scene(
 
     let ids = fixture_ids(fixtures);
     for (index, fixture) in fixtures.iter().enumerate() {
-        let (entry, mode) = &gdtf_of[fixture.fixture_type()];
+        let (entry, mode) = &gdtf_of[fixture.name()];
         let layer = if layers_from_tags {
             fixture
                 .tags()
@@ -433,6 +535,14 @@ fn render_scene(
             escape(entry),
             escape(mode)
         ));
+        if !moving.contains(fixture.name()) {
+            if let Some(focus) = aimed_at(fixture, venue) {
+                xml.push_str(&format!(
+                    "            <Focus>{}</Focus>\n",
+                    uuid(venue.name(), "focus", focus)
+                ));
+            }
+        }
         xml.push_str(&format!(
             "            <Addresses>\n              <Address break=\"0\">{}.{}</Address>\n            </Addresses>\n",
             fixture.universe(),
@@ -478,6 +588,84 @@ fn render_scene(
     out
 }
 
+/// Whether a type has a pose to aim: a pan or a tilt channel.
+fn has_pose(channels: &HashMap<String, ChannelDef>) -> bool {
+    channels
+        .keys()
+        .any(|channel| super::engine::is_position_channel(channel))
+}
+
+/// How far, in degrees, a fixed fixture's beam may pass from a focus point
+/// and still be aimed at it: rotations written to a tenth of a degree, and a
+/// lens a few centimetres off the mounting point, both fit well inside it.
+const FOCUS_TOLERANCE_DEG: f64 = 1.0;
+
+/// The direction a fixture's beam points at rest ([`effects::rest_beam`]
+/// of its mounting).
+///
+/// [`effects::rest_beam`]: super::effects::rest_beam
+pub fn rest_beam(fixture: &Fixture) -> Vec3 {
+    super::effects::rest_beam(fixture.rotation().unwrap_or([0.0; 3]))
+}
+
+/// How far along the beam an aim point sits when the beam never meets the
+/// deck, meters.
+const AIM_FALLBACK_M: f64 = 3.0;
+
+/// The farthest a beam may travel to meet the deck (z = 0) and still make
+/// the aim point there, meters.
+const AIM_MAX_REACH_M: f64 = 50.0;
+
+/// The point an unlinked fixed fixture should be aimed at: where its rest
+/// beam meets the deck plane (z = 0), or [`AIM_FALLBACK_M`] along the beam
+/// when it does not meet it within [`AIM_MAX_REACH_M`] (pointing level or up,
+/// mounted at or below the deck, or too shallow). `None` for a fixture with
+/// no position. Rounded to the millimeter, which moves the beam by far less
+/// than the [`FOCUS_TOLERANCE_DEG`] a link allows.
+pub fn aim_point(fixture: &Fixture) -> Option<Vec3> {
+    let position = fixture.position()?;
+    let beam = rest_beam(fixture);
+    let reach = if beam[2] < -1e-9 && position[2] > 0.01 {
+        let t = position[2] / -beam[2];
+        (t <= AIM_MAX_REACH_M).then_some(t)
+    } else {
+        None
+    }
+    .unwrap_or(AIM_FALLBACK_M);
+    Some(std::array::from_fn(|axis| {
+        ((position[axis] + beam[axis] * reach) * 1000.0).round() / 1000.0
+    }))
+}
+
+/// The focus point a fixed fixture is aimed at, if any: the one its beam —
+/// straight down through its mounting, as a fixture at rest points — passes
+/// nearest, within [`FOCUS_TOLERANCE_DEG`]. Pre-viz tools such as Blender DMX
+/// aim a fixed fixture at its MVR `<Focus>` and, without one, at the origin,
+/// so the link is what makes the export look as the rig is hung.
+fn aimed_at<'a>(fixture: &Fixture, venue: &'a Venue) -> Option<&'a str> {
+    let position = fixture.position()?;
+    let beam = rest_beam(fixture);
+    venue
+        .focus_points()
+        .iter()
+        .filter_map(|(name, point)| {
+            let to = [
+                point[0] - position[0],
+                point[1] - position[1],
+                point[2] - position[2],
+            ];
+            let length = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
+            if length < 1e-6 {
+                return None;
+            }
+            let cos = (beam[0] * to[0] + beam[1] * to[1] + beam[2] * to[2]) / length;
+            let angle = cos.clamp(-1.0, 1.0).acos().to_degrees();
+            (angle <= FOCUS_TOLERANCE_DEG).then_some((name.as_str(), angle))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(b.0)))
+        .map(|(name, _)| name)
+}
+
 /// The MVR transform of a stage pose: the basis of `R = Rz·Ry·Rx` as
 /// columns, the position back in scene millimeters with the venue's origin
 /// restored — the import's [`Matrix::rotation_degrees`] and re-origin
@@ -485,22 +673,9 @@ fn render_scene(
 ///
 /// [`Matrix::rotation_degrees`]: super::mvr::Matrix::rotation_degrees
 fn matrix_text(position: &Vec3, rotation_deg: &Vec3, origin_mm: &Vec3) -> String {
-    let (rx, ry, rz) = (
-        rotation_deg[0].to_radians(),
-        rotation_deg[1].to_radians(),
-        rotation_deg[2].to_radians(),
-    );
-    let rotate = |v: [f64; 3]| -> [f64; 3] {
-        let (cx, sx) = (rx.cos(), rx.sin());
-        let v = [v[0], cx * v[1] - sx * v[2], sx * v[1] + cx * v[2]];
-        let (cy, sy) = (ry.cos(), ry.sin());
-        let v = [cy * v[0] + sy * v[2], v[1], -sy * v[0] + cy * v[2]];
-        let (cz, sz) = (rz.cos(), rz.sin());
-        [cz * v[0] - sz * v[1], sz * v[0] + cz * v[1], v[2]]
-    };
-    let u = rotate([1.0, 0.0, 0.0]);
-    let v = rotate([0.0, 1.0, 0.0]);
-    let w = rotate([0.0, 0.0, 1.0]);
+    let u = out_of_frame(*rotation_deg, [1.0, 0.0, 0.0]);
+    let v = out_of_frame(*rotation_deg, [0.0, 1.0, 0.0]);
+    let w = out_of_frame(*rotation_deg, [0.0, 0.0, 1.0]);
     let o = [
         position[0] * 1000.0 + origin_mm[0],
         position[1] * 1000.0 + origin_mm[1],
@@ -619,9 +794,9 @@ fn build_archive(
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut cursor);
-        let deflated: zip::write::FileOptions<'_, ()> =
+        let deflated: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        let stored: zip::write::FileOptions<'_, ()> =
+        let stored: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
         writer.start_file("GeneralSceneDescription.xml", deflated)?;
         writer.write_all(scene.as_bytes())?;
@@ -639,6 +814,19 @@ mod tests {
     use super::*;
     use crate::lighting::import::{import_mvr_bytes, inspect_mvr_bytes, MvrImportOptions};
     use crate::lighting::mvr;
+    use crate::lighting::parser::parse_venues;
+    use std::path::PathBuf;
+
+    #[test]
+    fn an_export_keeps_its_own_file_naming() {
+        // Not the venue file stem (`built-in`): a kept export is not renamed.
+        assert_eq!(export_file_name(None, "built-in").unwrap(), "built_in.mvr");
+        assert_eq!(
+            export_file_name(None, "Robe-Esprite Rig").unwrap(),
+            "robe_esprite_rig.mvr"
+        );
+        assert_eq!(export_file_name(None, "///").unwrap(), "fixture.mvr");
+    }
 
     /// The scene the tests seed from: two bricks and a mover of the
     /// synthetic GDTF, a focus point, one layer.
@@ -662,10 +850,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
-        let gdtf = crate::lighting::gdtf::build_zip(&[(
-            "description.xml",
-            crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.as_bytes(),
-        )]);
+        let gdtf = crate::testutil::lighting::synthetic_gdtf();
         let bytes = crate::lighting::gdtf::build_zip(&[
             ("GeneralSceneDescription.xml", SCENE.as_bytes()),
             ("Astera_PB15.gdtf", gdtf.as_slice()),
@@ -715,6 +900,12 @@ mod tests {
         assert_eq!(brick.fixture_id.as_deref(), Some("1"));
         assert_eq!(brick.gdtf_mode.as_deref(), Some("8: RGBS"));
         assert_eq!(brick.addresses, vec![(1, 1)]);
+        // One type for the archive, each fixture in its own mode: the
+        // mover's line names its mode, and the export says it per fixture.
+        assert_eq!(before.fixture_types.len(), 1, "{:?}", before.fixture_types);
+        let mover = scene.fixtures.iter().find(|f| f.name == "Mover 1").unwrap();
+        assert_eq!(mover.gdtf_mode.as_deref(), Some("Mover 16bit"));
+        assert_eq!(mover.gdtf_spec.as_deref(), Some("Astera_PB15.gdtf"));
         // The origin was restored: the MVR millimeters come back as they went in.
         let o = brick.matrix.unwrap().o;
         assert!(
@@ -747,6 +938,7 @@ mod tests {
         for (a, b) in after.fixtures.iter().zip(&before.fixtures) {
             assert_eq!(a.name, b.name);
             assert_eq!(a.fixture_type, b.fixture_type);
+            assert_eq!(a.mode, b.mode, "{}", a.name);
             assert_eq!(a.patch, b.patch);
             assert_eq!(a.position.is_some(), b.position.is_some());
             if let (Some(p), Some(q)) = (a.position, b.position) {
@@ -763,6 +955,176 @@ mod tests {
             .focus_points
             .iter()
             .all(|f| f.change.as_deref().is_none_or(|c| c == "unchanged")));
+        let mover = after.fixtures.iter().find(|f| f.name == "Mover 1").unwrap();
+        assert_eq!(mover.mode.as_deref(), Some("Mover 16bit"));
+    }
+
+    #[test]
+    fn a_fixture_mode_is_exported_and_survives_a_full_round_trip() {
+        // Hand-moded: Brick 2 goes to the mover mode in the venue file. The
+        // export carries it, and importing the export into a fresh project
+        // writes it back on the same fixture.
+        let (_dir, project) = seeded_project();
+        let venue_path = project.join("lighting/venues/kellys.venue");
+        let text = std::fs::read_to_string(&venue_path).unwrap();
+        let moded = text.replace(
+            "fixture \"Brick 2\" \"Synth Brick\" mode \"8: RGBS\" @ 1:5",
+            "fixture \"Brick 2\" \"Synth Brick\" mode \"Mover 16bit\" @ 1:5",
+        );
+        assert_ne!(moded, text);
+        std::fs::write(&venue_path, moded).unwrap();
+
+        let (bytes, _) =
+            export_mvr_bytes(&MvrExportOptions::for_venue("kellys"), &project).unwrap();
+        let scene = mvr::parse_archive(&bytes).unwrap();
+        let mode_of = |name: &str| {
+            scene
+                .fixtures
+                .iter()
+                .find(|f| f.name == name)
+                .and_then(|f| f.gdtf_mode.clone())
+        };
+        assert_eq!(mode_of("Brick 1").as_deref(), Some("8: RGBS"));
+        assert_eq!(mode_of("Brick 2").as_deref(), Some("Mover 16bit"));
+        assert_eq!(mode_of("Mover 1").as_deref(), Some("Mover 16bit"));
+
+        let fresh = tempfile::tempdir().unwrap();
+        let report = import_mvr_bytes(
+            &bytes,
+            "round.mvr",
+            &MvrImportOptions {
+                name: Some("round".to_string()),
+                ..MvrImportOptions::default()
+            },
+            fresh.path(),
+        )
+        .unwrap();
+        // One archive, one fixture type; each line carries its own mode.
+        assert_eq!(report.plan.fixture_types.len(), 1);
+        assert_eq!(report.plan.fixture_types[0].fixture_file, None);
+        let venue = &parse_venues(
+            &std::fs::read_to_string(fresh.path().join("lighting/venues/round.venue")).unwrap(),
+        )
+        .unwrap()["round"];
+        assert_eq!(venue.fixtures()["Brick 1"].mode(), Some("8: RGBS"));
+        assert_eq!(venue.fixtures()["Brick 2"].mode(), Some("Mover 16bit"));
+        assert_eq!(venue.fixtures()["Mover 1"].mode(), Some("Mover 16bit"));
+    }
+
+    #[test]
+    fn a_mode_the_type_cannot_have_refuses_the_export() {
+        let (_dir, project) = seeded_project();
+        let types = project.join("lighting/fixture_types");
+        std::fs::create_dir_all(&types).unwrap();
+        std::fs::write(
+            types.join("par.fixture"),
+            "fixture_type \"Par\" {\n  channel \"dimmer\" @ 1\n}\n",
+        )
+        .unwrap();
+        let venue_path = project.join("lighting/venues/kellys.venue");
+        let text = std::fs::read_to_string(&venue_path).unwrap();
+        std::fs::write(
+            &venue_path,
+            text.replace("}\n", "  fixture \"Dim\" Par mode \"8: RGBS\" @ 3:1\n}\n"),
+        )
+        .unwrap();
+        let err = export_mvr_bytes(&MvrExportOptions::for_venue("kellys"), &project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("fixture \"Dim\" names mode \"8: RGBS\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_fixture_mode_is_exported_in_the_archive_s_spelling_or_refused() {
+        let (_dir, project) = seeded_project();
+        let venue_path = project.join("lighting/venues/kellys.venue");
+        let text = std::fs::read_to_string(&venue_path).unwrap();
+        // A drifted spelling the loader accepts with a warning.
+        let drifted = text.replace(
+            "fixture \"Brick 2\" \"Synth Brick\" mode \"8: RGBS\" @ 1:5",
+            "fixture \"Brick 2\" \"Synth Brick\" mode \"mover 16BIT\" @ 1:5",
+        );
+        assert_ne!(drifted, text);
+        std::fs::write(&venue_path, &drifted).unwrap();
+        let (bytes, _) =
+            export_mvr_bytes(&MvrExportOptions::for_venue("kellys"), &project).expect("exports");
+        let scene = mvr::parse_archive(&bytes).expect("reads back");
+        let brick2 = scene
+            .fixtures
+            .iter()
+            .find(|f| f.name == "Brick 2")
+            .expect("Brick 2");
+        assert_eq!(brick2.gdtf_mode.as_deref(), Some("Mover 16bit"));
+
+        // A mode the archive does not have: refused, by fixture.
+        std::fs::write(
+            &venue_path,
+            text.replace(
+                "fixture \"Brick 2\" \"Synth Brick\" mode \"8: RGBS\" @ 1:5",
+                "fixture \"Brick 2\" \"Synth Brick\" mode \"No Such Mode\" @ 1:5",
+            ),
+        )
+        .unwrap();
+        let err = export_mvr_bytes(&MvrExportOptions::for_venue("kellys"), &project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("fixture \"Brick 2\" is in mode \"No Such Mode\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_fixture_links_to_the_focus_point_it_is_aimed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_path_buf();
+        std::fs::create_dir_all(project.join("lighting/fixture_types")).unwrap();
+        std::fs::create_dir_all(project.join("lighting/venues")).unwrap();
+        std::fs::write(
+            project.join("lighting/fixture_types/types.light"),
+            "fixture_type \"Par\" {\n  channels: 4\n  channel_map: {\"red\": 1, \"green\": 2, \"blue\": 3, \"dimmer\": 4}\n}\n\
+             fixture_type \"Mover\" {\n  channels: 3\n  channel_map: {\"pan\": 1, \"tilt\": 2, \"dimmer\": 3}\n}\n",
+        )
+        .unwrap();
+        // "Aimed" sits on the floor 4 m left of center, tipped up 90° and
+        // turned to face +x: its beam runs level along +x, through "center"
+        // at (0, 0, 0) — and, 0.5° off the axis, still inside the tolerance.
+        // "Down" hangs at rest over a point nobody named. The mover is
+        // aimed at "center" by its mounting too, but its aim is its pose.
+        std::fs::write(
+            project.join("lighting/venues/room.venue"),
+            "venue \"Room\" {\n  fixture \"Aimed\" Par @ 1:1 position (-4, 0.035, 0) rotation (90, 0, -90)\n  fixture \"Down\" Par @ 1:5 position (3, 3, 3)\n  fixture \"Head\" Mover @ 1:9 position (-4, 0, 0) rotation (90, 0, -90)\n  focus \"center\" (0, 0, 0)\n  focus \"far\" (9, 9, 9)\n}\n",
+        )
+        .unwrap();
+        let (bytes, _) = export_mvr_bytes(&MvrExportOptions::for_venue("Room"), &project).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("GeneralSceneDescription.xml").unwrap(),
+            &mut xml,
+        )
+        .unwrap();
+        let fixture_xml = |name: &str| -> String {
+            let start = xml.find(&format!("<Fixture name=\"{name}\"")).unwrap();
+            let end = start + xml[start..].find("</Fixture>").unwrap();
+            xml[start..end].to_string()
+        };
+        let center = uuid("Room", "focus", "center");
+        assert!(
+            fixture_xml("Aimed").contains(&format!("<Focus>{center}</Focus>")),
+            "{}",
+            fixture_xml("Aimed")
+        );
+        assert!(!fixture_xml("Down").contains("<Focus>"), "aimed at nothing");
+        assert!(
+            !fixture_xml("Head").contains("<Focus>"),
+            "a mover aims by pose"
+        );
+        // The link names a focus point the scene carries.
+        assert!(xml.contains(&format!("<FocusPoint name=\"center\" uuid=\"{center}\">")));
     }
 
     #[test]
@@ -861,7 +1223,9 @@ mod tests {
             plan.fixtures
         );
         let left = plan.fixtures.iter().find(|f| f.name == "Left").unwrap();
-        assert_eq!(left.fixture_type.as_deref(), Some("Par"));
+        // The generated archive is a GDTF fixture of its own; the native
+        // "Par" keeps its name, so the newcomer is pinned with its stem.
+        assert_eq!(left.fixture_type.as_deref(), Some("Par (mtrackPar)"));
         assert_eq!(left.patch, Some((1, 1)));
         let p = left.position.unwrap();
         assert!(
@@ -881,11 +1245,28 @@ mod tests {
             "{err}"
         );
 
+        // A recorded type whose archive is gone cannot be embedded.
+        let types = project.join("lighting/fixture_types");
+        std::fs::create_dir_all(&types).unwrap();
+        std::fs::write(
+            types.join("synth_brick.fixture"),
+            "fixture_type \"Synth Brick\"\n  from gdtf(\"lighting/library/Astera_PB15.gdtf\")\n{\n}\n",
+        )
+        .unwrap();
         std::fs::remove_file(project.join("lighting/library/Astera_PB15.gdtf")).unwrap();
         let err = export_mvr(&MvrExportOptions::for_venue("kellys"), &project)
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot be read"), "{err}");
+        // With no record, the archive was the type: it is gone with it.
+        std::fs::remove_file(types.join("synth_brick.fixture")).unwrap();
+        let err = export_mvr(&MvrExportOptions::for_venue("kellys"), &project)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("which neither lighting/fixture_types nor lighting/library defines"),
+            "{err}"
+        );
         assert!(!project.join("lighting/export").exists());
     }
 
@@ -951,23 +1332,21 @@ mod tests {
         // directory, and a type that uses it.
         let other_dir = project.join("lighting/library/other");
         std::fs::create_dir_all(&other_dir).unwrap();
-        let other = crate::lighting::gdtf::build_zip(&[(
-            "description.xml",
-            crate::lighting::gdtf::SYNTHETIC_DESCRIPTION
-                .replace("Synth Brick", "Other Brick")
-                .as_bytes(),
-        )]);
+        let other = crate::testutil::lighting::synthetic_gdtf_of(
+            &crate::lighting::gdtf::SYNTHETIC_DESCRIPTION.replace("Synth Brick", "Other Brick"),
+        );
         std::fs::write(other_dir.join("Astera_PB15.gdtf"), &other).unwrap();
+        std::fs::create_dir_all(project.join("lighting/fixture_types")).unwrap();
         std::fs::write(
             project.join("lighting/fixture_types/other_brick.fixture"),
-            "fixture_type \"Other Brick\"\n  from gdtf(\"lighting/library/other/Astera_PB15.gdtf\", mode \"8: RGBS\")\n{\n}\n",
+            "fixture_type \"Other Brick\"\n  from gdtf(\"lighting/library/other/Astera_PB15.gdtf\")\n{\n}\n",
         )
         .unwrap();
         let venue_file = project.join("lighting/venues/kellys.venue");
         let mut venue = std::fs::read_to_string(&venue_file).unwrap();
         venue = venue.replace(
             "\n}",
-            "\n  fixture \"Other 1\" \"Other Brick\" @ 3:1 position (0, 1, 2) rotation (0, 0, 0)\n}",
+            "\n  fixture \"Other 1\" \"Other Brick\" mode \"8: RGBS\" @ 3:1 position (0, 1, 2) rotation (0, 0, 0)\n}",
         );
         std::fs::write(&venue_file, venue).unwrap();
 
@@ -1024,6 +1403,11 @@ mod tests {
             [0.0, 0.0, 180.0],
             [90.0, 0.0, 0.0],
             [30.0, -45.0, 120.0],
+            [90.0, 90.0, 0.0],
+            [-90.0, 90.0, 0.0],
+            [30.0, 90.0, -20.0],
+            [30.0, -90.0, -20.0],
+            [0.0, 90.0, 0.0],
         ] {
             let text = matrix_text(&[-2.0, 3.5, 4.2], &rotation, &[0.0, -3500.0, 0.0]);
             let scene =

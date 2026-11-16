@@ -13,46 +13,45 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { Code, ConnectError } from "@connectrpc/connect";
+import { PlayerService } from "../../src/gen/player/v1/player_pb";
+import { CONFIG_STORE } from "../mock-server/test-data";
+import { getConfigReply } from "../support/config-rpc";
+import { listSongsReply } from "../support/library-rpc";
+import { mockRpc } from "../support/rpc";
 
 test.describe("Error States", () => {
   test("songs page shows error on API failure", async ({ page }) => {
-    await page.route("**/api/songs", async (route) => {
-      await route.fulfill({
-        status: 500,
-        contentType: "application/json",
-        body: JSON.stringify({ error: "Internal server error" }),
-      });
-    });
+    const rpc = await mockRpc(page);
+    rpc.error(
+      PlayerService.method.listSongs,
+      Code.Internal,
+      "Internal server error",
+    );
 
     await page.goto("/#/songs");
     await expect(page.locator(".status.error, .error-banner")).toBeVisible();
   });
 
   test("playlists page shows error on API failure", async ({ page }) => {
-    await page.route("**/api/playlists", async (route) => {
-      if (route.request().method() === "GET") {
-        await route.fulfill({
-          status: 500,
-          contentType: "application/json",
-          body: JSON.stringify({ error: "Internal server error" }),
-        });
-      } else {
-        await route.continue();
-      }
-    });
+    const rpc = await mockRpc(page);
+    rpc.error(
+      PlayerService.method.listPlaylists,
+      Code.Internal,
+      "Internal server error",
+    );
 
     await page.goto("/#/playlists");
     await expect(page.locator(".error-banner")).toBeVisible();
   });
 
   test("config page shows error on API failure", async ({ page }) => {
-    await page.route("**/api/config/store", async (route) => {
-      await route.fulfill({
-        status: 500,
-        contentType: "application/json",
-        body: JSON.stringify({ error: "Internal server error" }),
-      });
-    });
+    const rpc = await mockRpc(page);
+    rpc.error(
+      PlayerService.method.getConfig,
+      Code.Internal,
+      "The config store is unavailable",
+    );
 
     await page.goto("/#/config");
     // Config editor shows error state with retry button
@@ -62,17 +61,13 @@ test.describe("Error States", () => {
 
   test("config error retry button refetches", async ({ page }) => {
     let callCount = 0;
-    await page.route("**/api/config/store", async (route) => {
+    const rpc = await mockRpc(page);
+    rpc.unary(PlayerService.method.getConfig, () => {
       callCount++;
       if (callCount === 1) {
-        await route.fulfill({
-          status: 500,
-          contentType: "application/json",
-          body: JSON.stringify({ error: "Temporary error" }),
-        });
-      } else {
-        await route.continue();
+        throw new ConnectError("Temporary error", Code.Internal);
       }
+      return getConfigReply(CONFIG_STORE);
     });
 
     await page.goto("/#/config");
@@ -88,17 +83,12 @@ test.describe("Error States", () => {
   test("playlist save error shows error banner", async ({ page }) => {
     await page.goto("/#/playlists");
 
-    await page.route("**/api/playlists/setlist", async (route) => {
-      if (route.request().method() === "PUT") {
-        await route.fulfill({
-          status: 409,
-          contentType: "application/json",
-          body: JSON.stringify({ error: "Conflict: playlist modified" }),
-        });
-      } else {
-        await route.continue();
-      }
-    });
+    const rpc = await mockRpc(page);
+    rpc.error(
+      PlayerService.method.savePlaylist,
+      Code.AlreadyExists,
+      "Conflict: playlist modified",
+    );
 
     // Select setlist and modify it
     await page.locator(".playlist-item", { hasText: "setlist" }).click();
@@ -114,19 +104,23 @@ test.describe("Error States", () => {
     // Try to save
     await page.getByRole("button", { name: "Save" }).click();
     await expect(page.locator(".error-banner")).toBeVisible();
+    // The server's own message is what the banner says.
+    await expect(page.locator(".error-banner")).toContainText(
+      "Conflict: playlist modified",
+    );
   });
 
   test("song detail shows error for non-existent song", async ({ page }) => {
-    await page.route("**/api/songs", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({ songs: [], failures: [] }),
-      });
-    });
+    const rpc = await mockRpc(page);
+    rpc.unary(
+      PlayerService.method.listSongs,
+      listSongsReply({ songs: [], failures: [] }),
+    );
 
     await page.goto("/#/songs/NonExistentSong");
-    // Should show some kind of error or empty state
-    await expect(page.getByText(/failed to fetch song/i)).toBeVisible();
+    // The player's own answer is what the page says.
+    await expect(
+      page.getByText(/unable to find song NonExistentSong/i),
+    ).toBeVisible();
   });
 });

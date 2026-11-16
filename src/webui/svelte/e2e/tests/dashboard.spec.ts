@@ -13,6 +13,7 @@
 //
 
 import { test, expect } from "@playwright/test";
+import { stubPlayerService } from "../support/grpc";
 import { DashboardPage } from "../pages/dashboard.page.js";
 
 test.describe("Dashboard", () => {
@@ -27,7 +28,7 @@ test.describe("Dashboard", () => {
     await expect(dashboard.grid).toBeVisible();
   });
 
-  test("shows current song name from WebSocket", async () => {
+  test("shows current song name from the Watch stream", async () => {
     await expect(dashboard.songName).toBeVisible();
     await expect(dashboard.songName).toHaveText("Test Song Alpha");
   });
@@ -73,7 +74,7 @@ test.describe("Dashboard", () => {
     await expect(options).toHaveCount(2);
   });
 
-  test("shows tracks from WebSocket", async () => {
+  test("shows tracks from the Watch stream", async () => {
     await expect(dashboard.trackRows.first()).toBeVisible();
     await expect(dashboard.trackRows).toHaveCount(3);
     await expect(dashboard.trackRows.nth(0)).toContainText("kick");
@@ -86,19 +87,13 @@ test.describe("Dashboard", () => {
   });
 
   test("play button triggers gRPC call", async ({ page }) => {
-    await page.route("**/player.v1.PlayerService/**", async (route) => {
-      await route.fulfill({
-        status: 200,
-        headers: {
-          "content-type": "application/grpc-web+proto",
-          "grpc-status": "0",
-        },
-        body: Buffer.alloc(0),
-      });
-    });
+    await stubPlayerService(page);
 
-    const requestPromise = page.waitForRequest((req) =>
-      req.url().includes("player.v1.PlayerService"),
+    const requestPromise = page.waitForRequest(
+      (req) =>
+        req.url().includes("player.v1.PlayerService") &&
+        // The stage stream is open on the page; a call is the other.
+        !req.url().endsWith("/WatchStage"),
     );
     await dashboard.playButton.click();
     await requestPromise;

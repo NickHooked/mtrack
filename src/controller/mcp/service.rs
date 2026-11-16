@@ -33,7 +33,14 @@
 //! without exception-handling. The `write_*_lighting` and `patch_*_lighting`
 //! tools, by contrast, *do* return `McpError::invalid_params` on invalid
 //! input because for them validation failure is a hard failure.
+//!
+//! **Lock mode.** While the player is locked, every tool not listed in
+//! [`crate::player::lock_policy::OPEN_WHILE_LOCKED`] is refused before it
+//! runs, with a tool error (`isError: true`) whose text says the player is
+//! locked. The gate sits in
+//! `call_tool`, so a new tool is refused while locked until it is listed.
 
+use crate::lighting::effects::LayerSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,21 +48,28 @@ use parking_lot::Mutex;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, GetMeta, Implementation, ListResourcesResult,
-        PaginatedRequestParams, ProtocolVersion, RawResource, ReadResourceRequestParams,
+        CallToolResult, ContentBlock, GetMeta, Implementation, ListResourcesResult,
+        PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
         ReadResourceResult, Resource, ResourceContents, ResourceUpdatedNotification,
-        ResourceUpdatedNotificationParam, ServerCapabilities, ServerInfo, ServerNotification,
+        ResourceUpdatedNotificationParam, ServerCapabilities, ServerConfig, ServerNotification,
         SubscribeRequestParams, UnsubscribeRequestParams,
     },
     service::RequestContext,
     tool, tool_handler, tool_router, ErrorData as McpError, Peer, RoleServer, ServerHandler,
 };
 use schemars::JsonSchema;
+
+use crate::lighting::files::Kind;
+use crate::webui::api::{lighting_api, lighting_writes, playlists, songs_api};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::task::AbortHandle;
 
+use crate::config::store::ConfigSection;
+use crate::lighting::readiness::{group_names, VenueFacts};
+use crate::player::lock_policy::Surface;
 use crate::player::Player;
+use crate::util::FaultKind;
 
 /// Resource URI exposing the live player status as JSON. Clients can read it
 /// directly or subscribe for `notifications/resources/updated` pushes on each
@@ -121,39 +135,66 @@ impl Drop for SubscriptionHandle {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlayFromArgs {
-    /// Time to start playback from, formatted as `mm:ss.mmm` or `Ns` (e.g. `1:23.456`, `45.5s`).
+    /// Time to start playback from: `mm:ss.mmm`, `Ns`, or a bare number of seconds (e.g. `1:23.456`, `45.5s`, `90`).
     pub start_time: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlaySongFromArgs {
     /// Name of the song in the active playlist (or all-songs registry).
     pub song_name: String,
-    /// Optional time to start playback from (`mm:ss.mmm` or `Ns`). Defaults to song start.
+    /// Optional time to start playback from: `mm:ss.mmm`, `Ns`, or a bare number of seconds (e.g. `1:23.456`, `45.5s`, `90`).
+    /// Defaults to song start.
     #[serde(default)]
     pub start_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SwitchPlaylistArgs {
     /// Name of the playlist to switch to.
     pub name: String,
 }
 
+/// Ambient light's mode: one of [`AmbientMode::ALL`]'s names.
+fn ambient_mode_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    use crate::dmx::engine::AmbientMode;
+    let names: Vec<&str> = AmbientMode::ALL.iter().map(|m| m.as_str()).collect();
+    schemars::json_schema!({
+        "type": "string",
+        "enum": names,
+    })
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetAmbientModeArgs {
+    /// `auto` (between songs, after its delay: the usual), `on` (now, over
+    /// any song, until `auto` again) or `off` (none: ambient playing fades
+    /// out).
+    #[schemars(schema_with = "ambient_mode_schema")]
+    pub mode: crate::dmx::engine::AmbientMode,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LoopSectionArgs {
     /// Name of the section to loop. Must match a section defined on the current song.
     pub section_name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SeekArgs {
-    /// Position to seek to, formatted as `mm:ss.mmm` or `Ns` (e.g. `1:23.456`, `45.5s`).
+    /// Position to seek to: `mm:ss.mmm`, `Ns`, or a bare number of seconds (e.g. `1:23.456`, `45.5s`, `90`).
     pub position: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SeekToSectionArgs {
     /// Name of the section to seek to. Must match a section defined on the current song.
     pub section_name: String,
@@ -179,6 +220,7 @@ fn update_body_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 /// Common shape for any subsection-update tool. The `body` is the JSON form of
 /// the subsection (e.g. an `Audio` block, an array of controllers, a profile).
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateConfigArgs {
     /// JSON payload for the subsection being updated. Use `null` to clear an
     /// optional subsection (e.g. `audio: null`).
@@ -190,6 +232,7 @@ pub struct UpdateConfigArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProfileIndexArgs {
     /// Index of the profile in the `profiles` list.
     pub index: u32,
@@ -201,6 +244,7 @@ pub struct ProfileIndexArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RemoveProfileArgs {
     /// Index of the profile to remove.
     pub index: u32,
@@ -209,12 +253,14 @@ pub struct RemoveProfileArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SongNameArgs {
     /// Name of the song as listed by `list_songs`.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteSongArgs {
     /// Name of the song. If the song doesn't yet exist, a new directory is
     /// created under the songs root with this name (after sanity-checking).
@@ -224,6 +270,7 @@ pub struct WriteSongArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlaylistNameArgs {
     /// Optional playlist name. If omitted, returns the top-level `playlist:`
     /// file referenced from the mtrack config.
@@ -232,6 +279,7 @@ pub struct PlaylistNameArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WritePlaylistArgs {
     /// Playlist name. Required when writing into the `playlists_dir`. If only
     /// the top-level `playlist:` file is configured and `name` is omitted, that
@@ -243,14 +291,21 @@ pub struct WritePlaylistArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ValidateLightingArgs {
     /// `.light` DSL source to validate.
     pub source: String,
     /// Song whose tempo map should resolve musical timing when the source has
     /// no `tempo` block of its own. Without it, a show using `@bar/beat`,
     /// `Nbeats`, or `Nbeat` cannot be validated even though it would load fine
-    /// against that song.
+    /// against that song. The source's `include`s also resolve against the
+    /// song's lighting file, so a source with an `include` needs it.
     pub song: Option<String>,
+    /// The song's lighting file the source is a draft of, as
+    /// `write_song_lighting` names it, so its `include`s resolve where
+    /// writing it would. Defaults to the song's first lighting file.
+    #[serde(default)]
+    pub file: Option<String>,
     /// Include each show's resolved cue timeline. Defaults to true; set false
     /// for a parse-only check on a very large show.
     #[serde(default = "default_true")]
@@ -258,6 +313,14 @@ pub struct ValidateLightingArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestGroupTagsArgs {
+    /// A group name some song's show targets (see `list_groups`).
+    pub group: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateShowArgs {
     /// Song name as listed by `list_songs`. Alone, evaluates the song's
     /// registered lighting shows. Passed with `source`, supplies that song's
@@ -266,7 +329,7 @@ pub struct EvaluateShowArgs {
     /// `.light` DSL source to evaluate directly, without registering it against
     /// a song. Pass `song` as well if the source uses measure-based timing.
     pub source: Option<String>,
-    /// Times to evaluate, each `mm:ss.mmm`, `Ns`, or a bare number of seconds.
+    /// Times to evaluate, each `mm:ss.mmm`, `Ns`, or a bare number of seconds (e.g. `1:23.456`, `45.5s`, `90`).
     pub times: Vec<String>,
     /// Include per-fixture channel values. Set false for a cheaper reply when
     /// only the active-effect list is wanted. Defaults to true.
@@ -279,6 +342,7 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeShowArgs {
     /// Song name as listed by `list_songs`. Alone, analyses the song's
     /// registered lighting shows. Passed with `source`, supplies that song's
@@ -290,6 +354,7 @@ pub struct AnalyzeShowArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetCuesArgs {
     /// Song to read cues from. Omit for the song the player currently has
     /// loaded. Naming a song reads it without making it current — inspecting
@@ -298,6 +363,7 @@ pub struct GetCuesArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DiffShowsArgs {
     /// Baseline: a song name, whose registered shows are used. With
     /// `a_source`, supplies the tempo map that `a_source` is parsed against.
@@ -312,6 +378,7 @@ pub struct DiffShowsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SongLightingArgs {
     /// Song name as listed by `list_songs`.
     pub song: String,
@@ -320,22 +387,24 @@ pub struct SongLightingArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListGdtfModesArgs {
     /// Path to a .gdtf archive, relative to the project directory.
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImportGdtfArgs {
     /// Path to a .gdtf archive, relative to the project directory.
     pub path: String,
-    /// The DMX mode to distill (see list_gdtf_modes).
-    pub mode: String,
-    /// Name for the fixture type; defaults to the GDTF's fixture name.
+    /// Name for the fixture type; defaults to the GDTF's fixture name (with
+    /// the archive's file stem added when another fixture has that name).
     pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ImportMvrArgs {
     /// Path to an .mvr archive, relative to the project directory.
     pub path: String,
@@ -348,6 +417,7 @@ pub struct ImportMvrArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExportMvrArgs {
     /// The venue to export, by name.
     pub venue: String,
@@ -359,6 +429,7 @@ pub struct ExportMvrArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WriteSongLightingArgs {
     /// Song name as listed by `list_songs`.
     pub song: String,
@@ -371,17 +442,47 @@ pub struct WriteSongLightingArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LightingFileArgs {
-    /// Basename of a `.light` file (no path separators).
+    /// The file's path relative to the configured directory, as the
+    /// listing gives it (`club.venue`, `tour/old.light`).
     pub file: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct WriteLightingFileArgs {
-    /// Basename of the `.light` file to write (no path separators).
-    pub file: String,
-    /// Full `.light` DSL source. Validated before being written.
+#[serde(deny_unknown_fields)]
+pub struct LightingNameArgs {
+    /// The venue's or fixture type's name, as its file declares it.
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteVenueArgs {
+    /// The venue's name: the one venue `source` declares.
+    pub name: String,
+    /// The venue's whole file: this one venue and nothing else.
     pub source: String,
+    /// The venue's old name, to rename it.
+    #[serde(default)]
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteFixtureTypeArgs {
+    /// The fixture type's name: the one type `source` declares.
+    pub name: String,
+    /// The type's whole file: this one fixture type and nothing else.
+    pub source: String,
+    /// The type's old name, to rename it; every venue line naming the old
+    /// name is retyped.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// `fixture` moves a `.light` type to a `.fixture`; `light` keeps a
+    /// `.light` (refused for a `.fixture`). New types are `.fixture`.
+    #[serde(default)]
+    pub ext: Option<String>,
 }
 
 /// String replacement parameters shared by every patch tool. Matches the
@@ -389,6 +490,9 @@ pub struct WriteLightingFileArgs {
 /// applies only when `old_string` occurs exactly once, forcing the caller to
 /// expand context until the match is unambiguous; `replace_all` opts into
 /// blanket replacement.
+///
+/// Each patch tool takes these three fields itself rather than through
+/// `#[serde(flatten)]`, which unknown-field rejection does not work with.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PatchFields {
     /// Exact text to replace. Must occur in the file.
@@ -402,39 +506,67 @@ pub struct PatchFields {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PatchSongArgs {
     /// Name of the song as listed by `list_songs`.
     pub name: String,
-    #[serde(flatten)]
-    pub patch: PatchFields,
+    /// Exact text to replace. Must occur in the file.
+    pub old_string: String,
+    /// Replacement text.
+    pub new_string: String,
+    /// If true, replace every occurrence. If false (default), the tool errors
+    /// when `old_string` occurs more than once.
+    #[serde(default)]
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PatchPlaylistArgs {
     /// Optional playlist name. With `null`/omitted, edits the top-level
     /// `playlist:` file.
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(flatten)]
-    pub patch: PatchFields,
+    /// Exact text to replace. Must occur in the file.
+    pub old_string: String,
+    /// Replacement text.
+    pub new_string: String,
+    /// If true, replace every occurrence. If false (default), the tool errors
+    /// when `old_string` occurs more than once.
+    #[serde(default)]
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PatchSongLightingArgs {
     /// Name of the song as listed by `list_songs`.
     pub song: String,
     /// Lighting file basename, e.g. `main.light`.
     pub file: String,
-    #[serde(flatten)]
-    pub patch: PatchFields,
+    /// Exact text to replace. Must occur in the file.
+    pub old_string: String,
+    /// Replacement text.
+    pub new_string: String,
+    /// If true, replace every occurrence. If false (default), the tool errors
+    /// when `old_string` occurs more than once.
+    #[serde(default)]
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PatchLightingFileArgs {
-    /// Basename of the `.light` file under the configured directory.
-    pub file: String,
-    #[serde(flatten)]
-    pub patch: PatchFields,
+    /// The venue's or fixture type's name, as its file declares it.
+    pub name: String,
+    /// Exact text to replace. Must occur in the file.
+    pub old_string: String,
+    /// Replacement text.
+    pub new_string: String,
+    /// If true, replace every occurrence. If false (default), the tool errors
+    /// when `old_string` occurs more than once.
+    #[serde(default)]
+    pub replace_all: bool,
 }
 
 #[tool_router]
@@ -442,7 +574,7 @@ impl McpServer {
     pub fn new(player: Arc<Player>) -> Self {
         Self {
             player,
-            tool_router: Self::tool_router(),
+            tool_router: Self::router(),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -452,7 +584,22 @@ impl McpServer {
         light show is loaded — whether its timeline is armed and where its cue \
         pointer sits. `lighting.armed` false, or `cues_remaining` 0 while the \
         song is still playing, means no cues will fire for the rest of this \
-        playback.")]
+        playback. `transitions` says what breaking a looping song's loop would \
+        do, by the playlist: the current entry's `fade_out`, and the song \
+        `next` and `previous` would move to with its `fade_in` (each `null` \
+        for none). `ambient` is the show the rig plays while no song is: its \
+        `mode` (`auto`, `on` or `off`; see `set_ambient_mode`), `show` file \
+        (`null` for none), `source` (whose settings the show plays: \
+        `profile`, `playlist`, or `entry` for the playlist entry waited on; \
+        `null` with no show) and `state` (`pending` while its delay runs, \
+        `playing`, `off`, or `unavailable` when `on` has no show to play); \
+        `null` without a DMX engine. `auto_play` is a song about to start \
+        by itself (its playlist entry's `auto_play` gap running): its `song` \
+        and `starts_in_seconds`, `null` when none is. `ending` is a looping \
+        song fading out after a stop (or next or previous at the end of the \
+        list) over its entry's `fade_out`, the player stopped under it: its \
+        `song` and `remaining_seconds`, `null` when none is; a second `stop` \
+        cuts it.")]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         Ok(ok_json(self.status_snapshot().await?))
     }
@@ -513,30 +660,15 @@ impl McpServer {
         // it current: inspecting cues is a read, and it should not have the
         // side effect of changing what is queued.
         if let Some(name) = args.song.as_deref() {
-            let song = self
-                .player
-                .songs()
-                .get(name)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-            let mut shows: Vec<_> = song
-                .dsl_lighting_shows()
-                .iter()
-                .flat_map(|dsl| dsl.shows().values().cloned())
-                .collect();
-            sort_shows(&mut shows);
+            let song = self.song(name)?;
+            let shows = crate::lighting::evaluate::registered_shows(&song);
 
-            // Merged and time-sorted, the way the player's own timeline
-            // combines a song's shows. Concatenating per show would restart
-            // indices at zero for each one and interleave their times, so the
-            // same song answered differently depending on which branch ran.
-            let tempo = shows.iter().find_map(|s| s.tempo_map.clone());
-            let mut cues: Vec<(std::time::Duration, usize)> = shows
-                .iter()
-                .flat_map(|show| show.cues.iter().map(|cue| (cue.time, cue.effects.len())))
-                .collect();
-            cues.sort_by_key(|(time, _)| *time);
-
-            let cues: Vec<Value> = cues
+            // Merged and time-sorted by the player's own timeline, so the
+            // same song answers as the loaded timeline does.
+            let timeline = crate::lighting::timeline::LightingTimeline::new(shows);
+            let tempo = timeline.tempo_map();
+            let cues: Vec<Value> = timeline
+                .cue_effect_counts()
                 .into_iter()
                 .enumerate()
                 .map(|(index, (time, effects))| {
@@ -544,10 +676,7 @@ impl McpServer {
                         "index": index,
                         "time": format_duration(time),
                         "seconds": time.as_secs_f64(),
-                        "position": tempo.as_ref().map(|m| {
-                            let (measure, beat) = m.time_to_measure_beat(time);
-                            format!("@{measure}/{beat:.2}")
-                        }),
+                        "position": tempo.map(|m| m.position_label(time)),
                         "effects": effects,
                     })
                 })
@@ -575,11 +704,8 @@ impl McpServer {
         each fixture is actually outputting — use `get_fixture_state`."
     )]
     async fn get_active_effects(&self) -> Result<CallToolResult, McpError> {
-        let summary = self
-            .player
-            .format_active_effects()
-            .unwrap_or_else(|| "(no effect engine configured)".to_string());
-        Ok(CallToolResult::success(vec![Content::text(summary)]))
+        let summary = self.player.active_effects_summary();
+        Ok(CallToolResult::success(vec![ContentBlock::text(summary)]))
     }
 
     #[tool(
@@ -599,33 +725,45 @@ impl McpServer {
 
     #[tool(description = "Start playback of the current song in the active playlist.")]
     async fn play(&self) -> Result<CallToolResult, McpError> {
-        let song = self.player.play().await.map_err(internal_err)?;
+        let song = self.player.play().await.map_err(precondition_err)?;
+        let Some(song) = song else {
+            return Ok(ok_json(self.declined().await));
+        };
         Ok(ok_json(json!({
-            "now_playing": song.as_ref().map(|s| song_summary(s)),
+            "started": true,
+            "now_playing": song_summary(&song),
         })))
+    }
+
+    /// The reply for a play the player did not start: why, as the player
+    /// reads it (one already playing, an empty playlist), and what to do.
+    /// Echoing a requested time back here is what once read as success.
+    async fn declined(&self) -> Value {
+        json!({
+            "started": false,
+            "now_playing": Value::Null,
+            "reason": self.player.play_declined().await.to_string(),
+            "hint": "check `status`; call `stop` first, or use `seek` to \
+                     move within the current song",
+        })
     }
 
     #[tool(
         description = "Start playback of the current song from a specific time \
-        (e.g. `1:23.456` or `45.5s`)."
+        (e.g. `1:23.456`, `45.5s` or `90`)."
     )]
     async fn play_from(
         &self,
         Parameters(args): Parameters<PlayFromArgs>,
     ) -> Result<CallToolResult, McpError> {
         let start = parse_duration(&args.start_time)?;
-        let song = self.player.play_from(start).await.map_err(internal_err)?;
-        // Same no-op as `play_song_from`: echoing the requested time back when
-        // nothing started is what made this misleading.
+        let song = self
+            .player
+            .play_from(start)
+            .await
+            .map_err(precondition_err)?;
         let Some(song) = song else {
-            return Ok(ok_json(json!({
-                "started": false,
-                // See `play_song_from`: `None` covers several cases.
-                "reason": "the player did not start the song; the most common \
-                           cause is that one is already playing",
-                "hint": "check `status`; call `stop` first, or use `seek` to \
-                         move within the current song",
-            })));
+            return Ok(ok_json(self.declined().await));
         };
         Ok(ok_json(json!({
             "started": true,
@@ -650,24 +788,10 @@ impl McpServer {
             .player
             .play_song_from(&args.song_name, start)
             .await
-            .map_err(internal_err)?;
+            .map_err(precondition_err)?;
 
-        // The player refuses to start a song while one is already playing, and
-        // returns nothing. Echoing the requested `start_time` back in that case
-        // reads as success and is how this silently answered the wrong
-        // question — the caller believes they are at 1:49 while playback
-        // continues from wherever it was.
         let Some(song) = song else {
-            return Ok(ok_json(json!({
-                "started": false,
-                // The player returns nothing for more than one reason — a song
-                // already playing, a loop break, an empty playlist — and does
-                // not say which. Report the fact, not a guess at the cause.
-                "reason": "the player did not start the song; the most common \
-                           cause is that one is already playing",
-                "hint": "check `status`; call `stop` first, or use `seek` to \
-                         move within the current song",
-            })));
+            return Ok(ok_json(self.declined().await));
         };
 
         Ok(ok_json(json!({
@@ -685,7 +809,10 @@ impl McpServer {
         Parameters(args): Parameters<SeekArgs>,
     ) -> Result<CallToolResult, McpError> {
         let position = parse_duration(&args.position)?;
-        self.player.seek_to(position).await.map_err(internal_err)?;
+        self.player
+            .seek_to(position)
+            .await
+            .map_err(precondition_err)?;
         Ok(ok_json(json!({
             "position": format_duration(position),
         })))
@@ -699,11 +826,14 @@ impl McpServer {
         self.player
             .seek_to_section(&args.section_name)
             .await
-            .map_err(internal_err)?;
+            .map_err(precondition_err)?;
         Ok(ok_json(json!({ "section": args.section_name })))
     }
 
-    #[tool(description = "Stop playback of the currently playing song.")]
+    #[tool(description = "Stop playback of the currently playing song. A \
+        looping song whose playlist entry has a `fade_out` fades out over it \
+        first, the player stopped under it (see `ending` in `status`); a \
+        second stop cuts it at once.")]
     async fn stop(&self) -> Result<CallToolResult, McpError> {
         let song = self.player.stop().await;
         Ok(ok_json(json!({
@@ -713,7 +843,9 @@ impl McpServer {
 
     #[tool(
         description = "Advance the active playlist to the next song. Returns the \
-        new current song."
+        new current song. On a looping song this breaks the loop and returns the \
+        song playback moves on to, which starts a moment later; on the last \
+        song it ends the loop as `stop` does instead."
     )]
     async fn next(&self) -> Result<CallToolResult, McpError> {
         let song = self.player.next().await;
@@ -724,7 +856,9 @@ impl McpServer {
 
     #[tool(
         description = "Move the active playlist to the previous song. Returns the \
-        new current song."
+        new current song. On a looping song this breaks the loop and returns the \
+        song playback moves back to, which starts a moment later; on the \
+        first song it ends the loop as `stop` does instead."
     )]
     async fn previous(&self) -> Result<CallToolResult, McpError> {
         let song = self.player.prev().await;
@@ -741,7 +875,7 @@ impl McpServer {
         self.player
             .switch_to_playlist(&args.name)
             .await
-            .map_err(|e| McpError::invalid_params(e, None))?;
+            .map_err(|e| fault_err(e.kind(), e.to_string()))?;
         Ok(ok_json(json!({ "active_playlist": args.name })))
     }
 
@@ -749,6 +883,41 @@ impl McpServer {
     async fn stop_samples(&self) -> Result<CallToolResult, McpError> {
         self.player.stop_samples();
         Ok(ok_json(json!({ "ok": true })))
+    }
+
+    #[tool(description = "Set ambient light's mode. `on` fades the ambient show \
+        in now, over its `fade_in`, and holds it until the mode is `auto` \
+        again -- over a song's own show too, which plays on underneath, so \
+        going back to `auto` mid-song crosses back to the song where it is. \
+        `off` fades ambient out, over its `fade_out`, and plays none: the \
+        stage is dark between songs, and songs light as ever. `auto` (the \
+        mode at startup; it is not saved) plays ambient between songs after \
+        its delay. Returns `ambient` as `status` does; `state` \
+        `unavailable` means `on` with no ambient show to play.")]
+    async fn set_ambient_mode(
+        &self,
+        Parameters(args): Parameters<SetAmbientModeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mode = args.mode;
+        let player = self.player.clone();
+        tokio::task::spawn_blocking(move || player.set_ambient_mode(mode))
+            .await
+            .map_err(internal_err)?;
+        Ok(ok_json(
+            json!({ "ambient": ambient_json(self.player.ambient_status().await.as_ref()) }),
+        ))
+    }
+
+    #[tool(
+        description = "Call off an auto play waiting to start (`status.auto_play`), \
+        and nothing else: the player stays stopped on that song, and ambient \
+        light comes up as after a stop. `cancelled` is false when none was \
+        waiting."
+    )]
+    async fn cancel_auto_play(&self) -> Result<CallToolResult, McpError> {
+        Ok(ok_json(
+            json!({ "cancelled": self.player.cancel_waiting_auto_play() }),
+        ))
     }
 
     #[tool(description = "Activate section looping for a named section on the current song.")]
@@ -759,7 +928,7 @@ impl McpServer {
         self.player
             .loop_section(&args.section_name)
             .await
-            .map_err(internal_err)?;
+            .map_err(precondition_err)?;
         Ok(ok_json(json!({ "looping": args.section_name })))
     }
 
@@ -777,7 +946,7 @@ impl McpServer {
         arming the loop so it engages at the section end."
     )]
     async fn section_ack(&self) -> Result<CallToolResult, McpError> {
-        self.player.section_ack().await.map_err(internal_err)?;
+        self.player.section_ack().await.map_err(precondition_err)?;
         Ok(ok_json(json!({ "ok": true })))
     }
 
@@ -803,13 +972,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<UpdateConfigArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.config_store()?;
-        let audio: Option<crate::config::Audio> = parse_optional(args.body)?;
-        let snapshot = store
-            .update_audio(audio, &args.expected_checksum)
-            .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+        self.update_section(ConfigSection::Audio, args).await
     }
 
     #[tool(
@@ -820,13 +983,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<UpdateConfigArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.config_store()?;
-        let midi: Option<crate::config::Midi> = parse_optional(args.body)?;
-        let snapshot = store
-            .update_midi(midi, &args.expected_checksum)
-            .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+        self.update_section(ConfigSection::Midi, args).await
     }
 
     #[tool(
@@ -837,32 +994,18 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<UpdateConfigArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.config_store()?;
-        let dmx: Option<crate::config::Dmx> = parse_optional(args.body)?;
-        let snapshot = store
-            .update_dmx(dmx, &args.expected_checksum)
-            .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+        self.update_section(ConfigSection::Dmx, args).await
     }
 
     #[tool(
         description = "Replace the entire `controllers` list. Pass an array of \
-        controller definitions, each tagged with a `kind` discriminator \
-        (`grpc`, `mcp`, `osc`, `midi`)."
+        controller definitions, each tagged with a `kind` discriminator."
     )]
     async fn update_controllers(
         &self,
         Parameters(args): Parameters<UpdateConfigArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let store = self.config_store()?;
-        let controllers: Vec<crate::config::Controller> = serde_json::from_value(args.body)
-            .map_err(|e| McpError::invalid_params(format!("invalid controllers: {e}"), None))?;
-        let snapshot = store
-            .update_controllers(controllers, &args.expected_checksum)
-            .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+        self.update_section(ConfigSection::Controllers, args).await
     }
 
     #[tool(description = "Append a new hardware profile to the `profiles` list.")]
@@ -876,23 +1019,39 @@ impl McpServer {
         let snapshot = store
             .add_profile(profile, &args.expected_checksum)
             .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+            .map_err(config_err)?;
+        self.reload_and_respond(snapshot).await
     }
 
-    #[tool(description = "Replace the profile at a given index in the `profiles` list.")]
+    #[tool(description = "Update the profile at a given index in the `profiles` \
+        list. Top-level sections (`audio`, `midi`, `dmx`, `trigger`, \
+        `controllers`, `notifications`, `status_events`, `hostname`) that the \
+        body leaves out keep their current values; set a section to `null` to \
+        remove it. A section that is present replaces the current one whole.")]
     async fn update_profile(
         &self,
         Parameters(args): Parameters<ProfileIndexArgs>,
     ) -> Result<CallToolResult, McpError> {
         let store = self.config_store()?;
-        let profile: crate::config::Profile = serde_json::from_value(args.body)
-            .map_err(|e| McpError::invalid_params(format!("invalid profile: {e}"), None))?;
+        let profile = store
+            .profile_from_update(args.index as usize, args.body)
+            .await
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let losses = self
+            .player
+            .layer_losses_at(args.index as usize, &profile)
+            .await;
+        if !losses.is_empty() {
+            return Err(McpError::invalid_params(
+                crate::player::layer_loss_message(&losses),
+                None,
+            ));
+        }
         let snapshot = store
             .update_profile(args.index as usize, profile, &args.expected_checksum)
             .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+            .map_err(config_err)?;
+        self.reload_and_respond(snapshot).await
     }
 
     #[tool(description = "Remove the profile at a given index in the `profiles` list.")]
@@ -904,8 +1063,8 @@ impl McpServer {
         let snapshot = store
             .remove_profile(args.index as usize, &args.expected_checksum)
             .await
-            .map_err(internal_err)?;
-        Ok(snapshot_response(&snapshot))
+            .map_err(config_err)?;
+        self.reload_and_respond(snapshot).await
     }
 
     // ---- Song / playlist file editing ----
@@ -918,18 +1077,9 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SongNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let song = self
-            .player
-            .songs()
-            .get(&args.name)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let path = song
-            .config_path()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| song.base_path().join("song.yaml"));
-        let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
-        })?;
+        let song = self.song(&args.name)?;
+        let path = song.config_path_or_default();
+        let body = read_text(&path).await?;
         Ok(ok_json(json!({
             "name": song.name(),
             "path": path.display().to_string(),
@@ -946,17 +1096,18 @@ impl McpServer {
         wrong by exactly that much), and a `tempo_segments` list that breaks \
         the song into \
         runs of roughly constant tempo (each with `start_seconds`, \
-        `end_seconds`, `beat_count`, `bpm`). The raw per-beat times are NOT \
-        included here — call `song_beat_grid` for those.")]
+        `end_seconds`, `beat_count`, `bpm`). `bpm_unit` says what the BPMs \
+        count: `quarter` when the song or one of its shows declares a meter \
+        (each bar's clicks are read against that bar's length, so a 12/8 \
+        dotted-quarter click reports the tempo block's quarter-note BPM), \
+        `click` otherwise (one beat per detected click). `beat_count` always \
+        counts clicks. The raw per-beat times are NOT included here — call \
+        `song_beat_grid` for those.")]
     async fn song_details(
         &self,
         Parameters(args): Parameters<SongNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let song = self
-            .player
-            .songs()
-            .get(&args.name)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let song = self.song(&args.name)?;
 
         let tracks: Vec<Value> = song
             .tracks()
@@ -970,17 +1121,7 @@ impl McpServer {
             })
             .collect();
 
-        let sections: Vec<Value> = song
-            .sections()
-            .iter()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "start_measure": s.start_measure,
-                    "end_measure": s.end_measure,
-                })
-            })
-            .collect();
+        let summary = song.summary();
 
         // Summary-only beat grid: counts + measure starts (small, useful for
         // bar-boundary work) but without the per-beat times that dominate
@@ -996,13 +1137,25 @@ impl McpServer {
                 "lead_in_seconds": g.lead_in().as_secs_f64(),
             })
         });
-        let bpm = song
-            .beat_grid()
-            .and_then(|g| compute_bpm_from_beats(&g.beats));
-        let tempo_segments = song
-            .beat_grid()
-            .map(|g| compute_tempo_segments(&g.beats))
-            .unwrap_or_default();
+        // With a declared meter the click intervals are read as quarter notes,
+        // the unit a `tempo` block is written in; without one, a click is all
+        // there is to count.
+        let quarter_intervals = song.beat_grid().and_then(|g| {
+            declared_meter(&song).and_then(|meter| quarter_note_intervals(g, &meter))
+        });
+        let (bpm, tempo_segments, bpm_unit) = match (song.beat_grid(), &quarter_intervals) {
+            (Some(g), Some((intervals, weights))) => (
+                compute_bpm_from_intervals(intervals),
+                compute_tempo_segments_from(&g.beats, intervals, weights),
+                Some("quarter"),
+            ),
+            (Some(g), None) => (
+                compute_bpm_from_beats(&g.beats),
+                compute_tempo_segments(&g.beats),
+                Some("click"),
+            ),
+            (None, _) => (None, Vec::new(), None),
+        };
 
         let light_shows: Vec<Value> = song
             .light_shows()
@@ -1018,7 +1171,8 @@ impl McpServer {
             .dsl_lighting_shows()
             .iter()
             .map(|s| {
-                let show_names: Vec<&String> = s.shows().keys().collect();
+                let shows = s.shows();
+                let show_names: Vec<&String> = shows.keys().collect();
                 json!({
                     "file": s.file_path().display().to_string(),
                     "shows": show_names,
@@ -1027,18 +1181,21 @@ impl McpServer {
             .collect();
 
         Ok(ok_json(json!({
-            "name": song.name(),
+            "name": summary.name,
             "base_path": song.base_path().display().to_string(),
             "config_path": song.config_path().map(|p| p.display().to_string()),
-            "duration": format_duration(song.length()),
-            "duration_seconds": song.length().as_secs_f64(),
+            "duration": format_duration(summary.duration),
+            "duration_seconds": summary.duration.as_secs_f64(),
             "num_channels": song.num_channels(),
             "loop_playback": song.loop_playback(),
+            "loop_crossfade_seconds": song.loop_crossfade().map(|d| d.as_secs_f64()),
+            "loop_crossfade_cut": song.loop_crossfade_cut(),
             "has_midi_playback": song.midi_playback().is_some(),
             "tracks": tracks,
-            "sections": sections,
+            "sections": summary.sections,
             "beat_grid": beat_grid,
             "bpm": bpm,
+            "bpm_unit": bpm_unit,
             "tempo_segments": tempo_segments,
             "light_shows": light_shows,
             "dsl_lighting_shows": dsl_lighting_shows,
@@ -1056,11 +1213,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SongNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let song = self
-            .player
-            .songs()
-            .get(&args.name)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let song = self.song(&args.name)?;
         let grid = song.beat_grid();
         Ok(ok_json(json!({
             "name": song.name(),
@@ -1069,51 +1222,34 @@ impl McpServer {
         })))
     }
 
-    #[tool(
-        description = "Write a song's `song.yaml`. Validates the YAML against \
-        `config::Song` before writing. If the song doesn't exist yet, creates a \
-        new song directory under the songs root."
-    )]
+    #[tool(description = "Write a song's config, by the web UI's rules. A song \
+        that exists (loaded, failed to load, or a folder of that name) is \
+        saved as the song editor saves it: to the file it was loaded from, \
+        never over another song's config, and not renamed onto a name \
+        another song holds. Otherwise the song is created as the web UI \
+        creates one: a new folder under the songs root with a `song.yaml`, \
+        refused if the name the YAML declares is another song's. The YAML \
+        is validated as a song config before anything is written.")]
     async fn write_song(
         &self,
         Parameters(args): Parameters<WriteSongArgs>,
     ) -> Result<CallToolResult, McpError> {
-        // Validate the YAML parses as a song config before we touch disk.
-        let _: crate::config::Song = serde_yaml_from_str(&args.yaml)?;
-
+        // Taken turns with the song's other writers, here and in the web UI,
+        // whose edits read the file first.
+        let _writing = crate::webui::api::songs_api::SONG_WRITES.lock().await;
         let songs_root = self.songs_root_verified().await?;
-        let yaml_path = match self.player.songs().get(&args.name) {
-            Ok(existing) => {
-                // Use the recorded `config_path` so flat-layout songs
-                // (`<root>/<name>.yaml`) and directory-layout songs
-                // (`<root>/<name>/song.yaml`) both round-trip through their
-                // original file rather than writing to `<base>/song.yaml`,
-                // which is shared across all flat-layout songs.
-                let path = existing
-                    .config_path()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| existing.base_path().join("song.yaml"));
-                crate::webui::safe_path::SafePath::resolve(&path, &songs_root)
-                    .map_err(safepath_err)?
-                    .as_path()
-                    .to_path_buf()
-            }
-            Err(_) => {
-                crate::webui::safe_path::SafePath::validate_name(&args.name)
-                    .map_err(safepath_err)?;
-                let song_dir = crate::webui::safe_path::SafePath::create_dir(
-                    &songs_root.as_safe_path(),
-                    &args.name,
-                    &songs_root,
-                )
-                .map_err(safepath_err)?;
-                song_dir.join_filename("song.yaml")
-            }
+        let root = songs_root.as_path();
+        // The web UI's save of a song it finds (PUT), else its create
+        // (POST): one rule each, whoever writes.
+        let written = if songs_api::resolve_song_dir(&self.player, root, &args.name).is_ok() {
+            songs_api::save_song(&self.player, root, &args.name, args.yaml.clone()).await
+        } else {
+            songs_api::create_song(&self.player, root, &args.name, args.yaml.clone()).await
         };
-        staged_write_string(&yaml_path, &args.yaml).await?;
+        let yaml_path = song_web(written)?;
         // Rescan the songs directory so list_songs / read_song see the new or
         // updated song without requiring an mtrack restart.
-        self.reload_songs_from_config().await?;
+        self.reload_player_songs().await?;
         Ok(ok_json(json!({
             "path": yaml_path.display().to_string(),
             "bytes": args.yaml.len(),
@@ -1122,15 +1258,17 @@ impl McpServer {
 
     #[tool(description = "Read a playlist YAML file. With no `name`, reads the \
         top-level `playlist:` file from the mtrack config. With a `name`, reads \
-        `<playlists_dir>/<name>.yaml`.")]
+        `<playlists_dir>/<name>.yaml`, else `<name>.yml`.")]
     async fn read_playlist(
         &self,
         Parameters(args): Parameters<PlaylistNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self.resolve_playlist_path(args.name.as_deref()).await?;
-        let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
-        })?;
+        let path = self
+            .resolve_playlist_path(args.name.as_deref())
+            .await?
+            .path()
+            .to_path_buf();
+        let body = read_text(&path).await?;
         Ok(ok_json(json!({
             "path": path.display().to_string(),
             "yaml": body,
@@ -1139,39 +1277,49 @@ impl McpServer {
 
     #[tool(
         description = "Write a playlist YAML file. Validates the YAML against \
-        `config::Playlist` before writing. With no `name`, writes the top-level \
-        playlist file. With a `name`, writes `<playlists_dir>/<name>.yaml` and \
-        creates the file if missing."
+        `config::Playlist`, and its transitions against the songs, before \
+        writing. With no `name`, writes the top-level playlist file. With a \
+        `name`, writes `<playlists_dir>/<name>.yaml` (or the `<name>.yml` \
+        already there) and creates the file if missing; `all_songs` is the \
+        player's own and has no file. Each `songs:` entry is a song name, or a map with `song:` and \
+        its own transitions: `fade_out` (how a looping song fades out under the \
+        next song when play/next/previous breaks its loop) and `fade_in` (how \
+        the song fades in when it starts under such a fade-out). Each is a \
+        length (`3s`, `500ms`, `6beats`, `1measure`; `0s` for none) or a map \
+        with `length`, `curve` (`equal_power` or `linear`), `exclude` (track \
+        names that do not fade) and, for `fade_out` only, `lights` (how long \
+        the lights cross into the next song's show). An entry's `auto_play` \
+        (`true`, `false`, or a gap such as `2s`) starts its song by itself when \
+        the song before it ends or next/previous lands on it while stopped. \
+        A top-level `ambient:` \
+        sets the playlist's ambient light, played while no song is: `false` \
+        for none, or a map of `show` (a `.light` file, relative to the \
+        project), `delay`, `fade_in` and `fade_out`, each overriding the \
+        profile's `dmx.lighting.ambient`. An entry's own `ambient:`, in the \
+        same form, sets the ambient light in the gap before its song, while \
+        the player waits on it, its settings overriding the playlist's one by \
+        one; one naming a `show` plays even under a playlist's `false`."
     )]
     async fn write_playlist(
         &self,
         Parameters(args): Parameters<WritePlaylistArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let _: crate::config::Playlist = serde_yaml_from_str(&args.yaml)?;
-        let path = self.resolve_playlist_path(args.name.as_deref()).await?;
-        // Same rule as the web UI's playlist write and every other configured
-        // root: created only when it is inside the project. A `playlists_dir:`
-        // pointing elsewhere is the operator's to set up.
-        //
-        // The file is then written under the directory that was made, not the
-        // spelling it was configured as -- those differ when the setting holds
-        // a `..`, and the spelling names a path that was never created.
-        let path = match (path.parent(), path.file_name()) {
-            (Some(parent), Some(name)) => {
-                let project = crate::util::project_dir_of(self.config_store()?.path());
-                let created = crate::util::create_dir_within_async(parent.to_path_buf(), project)
-                    .await
-                    .map_err(create_within_err)?;
-                created.as_path().join(name)
-            }
-            _ => path,
-        };
-        staged_write_string(&path, &args.yaml).await?;
+        // Taken turns with the web UI's playlist saves, which read the file
+        // to keep what the editor does not send.
+        let _writing = crate::webui::api::playlists::PLAYLIST_WRITES.lock().await;
+        let file = self.playlist_file_to_write(args.name.as_deref()).await?;
+        // Checked under the lock, against the songs and the file as they
+        // are: a web song delete holds it while it takes the song off every
+        // playlist, and a check before it would write the deleted song back.
+        self.validate_playlist(&args.yaml).await?;
+        let project = self.project_dir()?;
+        let written =
+            web(playlists::write_playlist_file(&file, args.yaml.clone(), &project).await).await?;
         // Rebuild the player's playlist set so `list_playlists` /
         // `switch_playlist` see the new file without requiring a restart.
-        self.reload_songs_from_config().await?;
+        self.reload_player_songs().await?;
         Ok(ok_json(json!({
-            "path": path.display().to_string(),
+            "path": written.display().to_string(),
             "bytes": args.yaml.len(),
         })))
     }
@@ -1183,8 +1331,8 @@ impl McpServer {
         ALWAYS read this before generating `.light` files."
     )]
     async fn lighting_dsl_reference(&self) -> Result<CallToolResult, McpError> {
-        Ok(CallToolResult::success(vec![Content::text(
-            include_str!("dsl_reference.md").to_string(),
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            super::dsl_reference::dsl_reference(&self.player.layers()),
         )]))
     }
 
@@ -1200,14 +1348,35 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ValidateLightingArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let tempo = self.song_tempo_map(args.song.as_deref())?;
-        let parsed_shows =
-            crate::lighting::parser::parse_light_shows_with_tempo(&args.source, tempo.as_ref())
-                .map_err(|e| e.to_string());
+        let (tempo, draft_path, root) = match args.song.as_deref() {
+            Some(name) => {
+                let song = self.song(name)?;
+                let path = match args.file.as_deref() {
+                    Some(file) => {
+                        validate_lighting_filename(file)?;
+                        song_lighting_target(&song, file)
+                    }
+                    None => song.lighting_draft_path(),
+                };
+                (
+                    song_lighting_tempo(&song),
+                    Some(path),
+                    Some(self.include_root(&song).await),
+                )
+            }
+            None => (None, None, None),
+        };
+        let parsed_shows = crate::lighting::parser::parse_light_file_within(
+            &self.player.layers(),
+            &args.source,
+            draft_path.as_deref(),
+            root.as_deref(),
+            tempo.as_ref(),
+        )
+        .map_err(|e| e.to_string());
         match parsed_shows {
             Ok(shows) => {
-                let mut parsed: Vec<_> = shows.values().cloned().collect();
-                sort_shows(&mut parsed);
+                let parsed: Vec<_> = shows.values().cloned().collect();
                 let warnings = self.lint_warnings(&parsed, args.song.as_deref()).await?;
                 let mut summary: Vec<Value> = shows
                     .iter()
@@ -1251,72 +1420,20 @@ impl McpServer {
         song: Option<&str>,
     ) -> Result<Vec<Value>, McpError> {
         // Resolved before the song is looked up: `LintContext` borrows the
-        // song, and a borrow of it must not be held across an await.
-        let dmx = self.player.dmx_engine();
-        let configured_universes = dmx.as_ref().map(|d| d.configured_universes());
-        let (group_fixture_counts, group_capabilities, mut venue_warnings, focus_points) =
-            match dmx.and_then(|dmx| dmx.broadcast_handles().lighting_system) {
-                Some(system) => {
-                    let names = group_names(shows);
-                    // The lighting-system mutex is shared with the effects loop
-                    // thread, so taking it belongs off the async worker.
-                    tokio::task::spawn_blocking(move || {
-                        let mut guard = system.lock();
-                        let mut counts = std::collections::HashMap::new();
-                        let mut capabilities = std::collections::HashMap::new();
-                        let mut venue_warnings = Vec::new();
-                        let focus_points: Option<std::collections::HashSet<String>> = guard
-                            .get_current_venue()
-                            .map(|venue| venue.focus_points().keys().cloned().collect());
-                        // Only when a venue is actually loaded. Without one every
-                        // group resolves to nothing, and reporting them all as empty
-                        // would be noise rather than a finding.
-                        if guard.get_current_venue().is_some() {
-                            let fixtures = guard.get_current_venue_fixtures().unwrap_or_default();
-                            for name in names {
-                                let members = guard.resolve_logical_group_graceful(&name);
-                                counts.insert(name.clone(), members.len());
-                                capabilities.insert(
-                                    name,
-                                    crate::lighting::lint::GroupCapabilities::from_fixtures(
-                                        fixtures.iter().filter(|f| members.contains(&f.name)),
-                                    ),
-                                );
-                            }
-                            if let Some(configured) = &configured_universes {
-                                venue_warnings =
-                                    crate::lighting::lint::universe_coverage(&fixtures, configured);
-                            }
-                        }
-                        (counts, capabilities, venue_warnings, focus_points)
-                    })
-                    .await
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?
-                }
-                None => Default::default(),
-            };
+        // song, and a borrow of it must not be held across an await. The
+        // context itself is built by the same code the web UI's readiness hub
+        // uses, so the two cannot disagree.
+        let facts = VenueFacts::from_engine(self.player.dmx_engine(), group_names(shows))
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
         let song = match song {
-            Some(name) => Some(
-                self.player
-                    .songs()
-                    .get(name)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?,
-            ),
+            Some(name) => Some(self.song(name)?),
             None => None,
         };
 
-        let ctx = crate::lighting::lint::LintContext {
-            song_duration: song.as_ref().map(|s| s.duration()),
-            beat_grid: song.as_ref().and_then(|s| s.beat_grid()),
-            group_fixture_counts,
-            group_capabilities,
-            focus_points,
-        };
-
-        let mut warnings = crate::lighting::lint::lint_shows(shows, &ctx);
-        warnings.append(&mut venue_warnings);
-        Ok(warnings
+        Ok(facts
+            .lint(shows, song.as_deref())
             .into_iter()
             .map(|w| json!({"kind": w.kind, "message": w.message}))
             .collect())
@@ -1329,25 +1446,18 @@ impl McpServer {
         build_lighting_snapshot(&self.player).await
     }
 
-    /// Looks up a song's lighting tempo map by name, if a name was given.
-    fn song_tempo_map(
-        &self,
-        song: Option<&str>,
-    ) -> Result<Option<crate::tempo::TempoMap>, McpError> {
-        let Some(name) = song else {
-            return Ok(None);
-        };
-        let song = self
-            .player
-            .songs()
-            .get(name)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        Ok(song_lighting_tempo(&song))
+    /// The folder a song's lighting `include`s must stay inside: the songs
+    /// root, or the song's own folder when the root cannot be resolved.
+    async fn include_root(&self, song: &crate::songs::Song) -> std::path::PathBuf {
+        match self.songs_root_verified().await {
+            Ok(root) => root.as_path().to_path_buf(),
+            Err(_) => song.base_path().to_path_buf(),
+        }
     }
 
     /// Resolves `evaluate_show`'s `song`/`source` choice into the shows to
     /// evaluate plus the song's tempo map, if any.
-    fn resolve_shows_to_evaluate(
+    async fn resolve_shows_to_evaluate(
         &self,
         args: &EvaluateShowArgs,
     ) -> Result<
@@ -1363,17 +1473,17 @@ impl McpServer {
                 // song's tempo the parser rejects every `@bar`/`beat` construct,
                 // so this is the only way to evaluate an unsaved edit of a
                 // measure-timed show.
-                let song = self
-                    .player
-                    .songs()
-                    .get(name)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                let song = self.song(name)?;
                 let tempo = song_lighting_tempo(&song);
-                let shows =
-                    crate::lighting::parser::parse_light_shows_with_tempo(source, tempo.as_ref())
-                        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                let mut shows: Vec<_> = shows.into_values().collect();
-                sort_shows(&mut shows);
+                let shows = crate::lighting::parser::parse_light_file_within(
+                    &self.player.layers(),
+                    source,
+                    Some(&song.lighting_draft_path()),
+                    Some(&self.include_root(&song).await),
+                    tempo.as_ref(),
+                )
+                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+                let shows: Vec<_> = shows.into_values().collect();
                 Ok((shows, tempo))
             }
             (None, None) => Err(McpError::invalid_params(
@@ -1382,17 +1492,8 @@ impl McpServer {
                 None,
             )),
             (Some(name), None) => {
-                let song = self
-                    .player
-                    .songs()
-                    .get(name)
-                    .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-                let mut shows: Vec<_> = song
-                    .dsl_lighting_shows()
-                    .iter()
-                    .flat_map(|dsl| dsl.shows().values().cloned())
-                    .collect();
-                sort_shows(&mut shows);
+                let song = self.song(name)?;
+                let shows = crate::lighting::evaluate::registered_shows(&song);
                 if shows.is_empty() {
                     return Err(McpError::invalid_params(
                         format!(
@@ -1405,7 +1506,12 @@ impl McpServer {
                 Ok((shows, song_lighting_tempo(&song)))
             }
             (None, Some(source)) => {
-                let shows = crate::lighting::parser::parse_light_shows(source).map_err(|e| {
+                let shows = crate::lighting::parser::parse_light_shows_in(
+                    &self.player.layers(),
+                    source,
+                    None,
+                )
+                .map_err(|e| {
                     McpError::invalid_params(
                         format!(
                             "{e}\n\nIf this show uses `@bar`/`beat` timing, pass `song` \
@@ -1414,8 +1520,7 @@ impl McpServer {
                         None,
                     )
                 })?;
-                let mut shows: Vec<_> = shows.into_values().collect();
-                sort_shows(&mut shows);
+                let shows: Vec<_> = shows.into_values().collect();
                 Ok((shows, None))
             }
         }
@@ -1433,7 +1538,7 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<EvaluateShowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let (shows, fallback_tempo) = self.resolve_shows_to_evaluate(&args)?;
+        let (shows, fallback_tempo) = self.resolve_shows_to_evaluate(&args).await?;
 
         let times = args
             .times
@@ -1450,64 +1555,31 @@ impl McpServer {
         // The lighting system and effect engine are `parking_lot` mutexes shared
         // with the effects loop thread, and evaluation is pure CPU besides — both
         // belong off the async worker.
-        let evaluations = tokio::task::spawn_blocking(move || {
-            // Resolve every group the show mentions once, up front, so the lock
-            // is held for a short bounded step rather than across evaluation.
-            let (fixtures, focus_points, group_map) = match &lighting_system {
-                Some(system) => {
-                    let mut guard = system.lock();
-                    let fixtures = guard.get_current_venue_fixtures().unwrap_or_default();
-                    let focus_points: HashMap<String, [f64; 3]> = guard
-                        .get_current_venue()
-                        .map(|venue| {
-                            venue
-                                .focus_points()
-                                .iter()
-                                .map(|(name, point)| (name.clone(), *point))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let mut group_map: HashMap<String, Vec<String>> = HashMap::new();
-                    for name in group_names(&shows) {
-                        let resolved = guard.resolve_logical_group_graceful(&name);
-                        group_map.insert(name, resolved);
-                    }
-                    (fixtures, focus_points, group_map)
-                }
-                None => (Vec::new(), HashMap::new(), HashMap::new()),
-            };
-
-            crate::lighting::evaluate::evaluate_show(
+        let evaluated = tokio::task::spawn_blocking(move || {
+            crate::lighting::evaluate::evaluate_with_system(
                 shows,
-                &fixtures,
-                &focus_points,
                 fallback_tempo.as_ref(),
                 &times,
-                |mut effect| {
-                    effect.target_fixtures = effect
-                        .target_fixtures
-                        .iter()
-                        .flat_map(|target| match group_map.get(target) {
-                            Some(resolved) => resolved.clone(),
-                            // Not a known group — already a fixture name, or a
-                            // name that resolves to nothing. Either way, leave it
-                            // for the engine to accept or reject.
-                            None => vec![target.clone()],
-                        })
-                        .collect();
-                    effect
-                },
+                lighting_system.as_deref(),
             )
         })
         .await
-        .map_err(|e| McpError::internal_error(format!("evaluation failed: {e}"), None))?;
+        .map_err(|e| McpError::internal_error(format!("evaluation failed: {e}"), None))?
+        .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
 
-        let results: Vec<Value> = evaluations
+        let layers = self.player.layers();
+        let results: Vec<Value> = evaluated
+            .evaluations
             .iter()
-            .map(|evaluation| evaluation_json(evaluation, include_fixtures))
+            .map(|evaluation| evaluation_json(evaluation, include_fixtures, &layers))
             .collect();
 
-        Ok(ok_json(json!({ "evaluations": results })))
+        // A venue that does not register is said, not shown as an empty rig.
+        let mut body = json!({ "evaluations": results });
+        if let Some(error) = evaluated.venue_error {
+            body["venue_error"] = json!(error);
+        }
+        Ok(ok_json(body))
     }
 
     #[tool(description = "Analyse a light show's coverage: where the rig goes \
@@ -1523,12 +1595,14 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<AnalyzeShowArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let (shows, fallback_tempo) = self.resolve_shows_to_evaluate(&EvaluateShowArgs {
-            song: args.song.clone(),
-            source: args.source.clone(),
-            times: Vec::new(),
-            include_fixtures: false,
-        })?;
+        let (shows, fallback_tempo) = self
+            .resolve_shows_to_evaluate(&EvaluateShowArgs {
+                song: args.song.clone(),
+                source: args.source.clone(),
+                times: Vec::new(),
+                include_fixtures: false,
+            })
+            .await?;
 
         // Warnings come from the shared linter rather than a second
         // implementation here, so `analyze_show` and `validate_lighting` cannot
@@ -1541,6 +1615,7 @@ impl McpServer {
         .await
         .map_err(|e| McpError::internal_error(format!("analysis failed: {e}"), None))?;
 
+        let layers = self.player.layers();
         let dark_windows: Vec<Value> = analysis
             .dark_windows
             .iter()
@@ -1563,7 +1638,7 @@ impl McpServer {
             "per_layer_seconds": analysis
                 .per_layer_seconds
                 .iter()
-                .map(|(layer, secs)| (format!("{layer:?}").to_lowercase(), *secs))
+                .map(|(layer, secs)| (layers.display_name(*layer), *secs))
                 .collect::<std::collections::BTreeMap<_, _>>(),
             "warnings": warnings,
         })))
@@ -1587,21 +1662,28 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<DiffShowsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let (before, before_tempo) = self.resolve_shows_to_evaluate(&EvaluateShowArgs {
-            song: args.a_song.clone(),
-            source: args.a_source.clone(),
-            times: Vec::new(),
-            include_fixtures: false,
-        })?;
-        let (after, after_tempo) = self.resolve_shows_to_evaluate(&EvaluateShowArgs {
-            song: args.b_song.clone(),
-            source: args.b_source.clone(),
-            times: Vec::new(),
-            include_fixtures: false,
-        })?;
+        let (before, before_tempo) = self
+            .resolve_shows_to_evaluate(&EvaluateShowArgs {
+                song: args.a_song.clone(),
+                source: args.a_source.clone(),
+                times: Vec::new(),
+                include_fixtures: false,
+            })
+            .await?;
+        let (after, after_tempo) = self
+            .resolve_shows_to_evaluate(&EvaluateShowArgs {
+                song: args.b_song.clone(),
+                source: args.b_source.clone(),
+                times: Vec::new(),
+                include_fixtures: false,
+            })
+            .await?;
 
+        let layers = self.player.layers();
+        let diff_layers = layers.clone();
         let diff = tokio::task::spawn_blocking(move || {
             crate::lighting::diff::diff_shows(
+                &diff_layers,
                 before,
                 after,
                 before_tempo.as_ref(),
@@ -1617,9 +1699,9 @@ impl McpServer {
                 "position": e.position,
                 "groups": e.groups,
                 "type": e.effect_type,
-                "layer": format!("{:?}", e.layer).to_lowercase(),
+                "layer": layers.display_name(e.layer),
                 "duration": e.duration.as_secs_f64(),
-                "blend_mode": format!("{:?}", e.blend_mode).to_lowercase(),
+                "blend_mode": e.blend_mode.keyword(),
                 "parameters": e.parameters,
             })
         };
@@ -1714,6 +1796,49 @@ impl McpServer {
         })))
     }
 
+    #[tool(description = "Suggest which venue fixtures should carry which tags \
+        so a group the songs' shows use finds fixtures. Returns the group's \
+        needs (`all_of`, `any_of`, `prefer` tags), what the shows ask of it \
+        (`wants`: move, color, strobe, cells), and — when the group finds no \
+        fixtures — a `suggestion` (the fixtures, the tags to add to them, and \
+        a structured `reason`: count, fixture type, where they hang, what they \
+        can do) plus `others`, the alternative clusters. With no fitting \
+        fixtures the group reports `unmet`: the wants nothing in the venue \
+        meets. Read-only: nothing is tagged until the venue is written. The \
+        web UI's Fit shows page offers exactly this suggestion.")]
+    async fn suggest_group_tags(
+        &self,
+        Parameters(args): Parameters<SuggestGroupTagsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let player = self.player.clone();
+        let report =
+            tokio::task::spawn_blocking(move || crate::lighting::fit::FitReport::gather(&player))
+                .await
+                .map_err(|e| McpError::internal_error(format!("fit task failed: {e}"), None))?;
+        if report.venue.is_none() {
+            return Err(McpError::invalid_params(
+                "no current venue is loaded, so there are no fixtures to tag",
+                None,
+            ));
+        }
+        let group = report
+            .groups
+            .iter()
+            .find(|g| g.name == args.group)
+            .map(|g| json!(g))
+            .ok_or_else(|| {
+                let known: Vec<&str> = report.groups.iter().map(|g| g.name.as_str()).collect();
+                McpError::invalid_params(
+                    format!(
+                        "no song's show targets a group named '{}'; groups the shows use: {known:?}",
+                        args.group
+                    ),
+                    None,
+                )
+            })?;
+        Ok(ok_json(group))
+    }
+
     #[tool(description = "List every group name valid as a cue target. Groups \
         are tag/constraint-based and declared under `dmx.lighting.groups` in the \
         player config; each is returned with its constraints and, when a venue \
@@ -1774,7 +1899,12 @@ impl McpServer {
         })))
     }
 
-    #[tool(description = "List the fixture types known to the lighting engine.")]
+    #[tool(
+        description = "List the fixture types known to the lighting engine. Each says \
+        its strobe_curve (period, linear or declared; null when automatic) and the curve in \
+        use: a GDTF fixture follows its file (declared) unless its record says otherwise, a \
+        hand-written type uses period."
+    )]
     async fn list_fixture_types(&self) -> Result<CallToolResult, McpError> {
         let dmx = match self.player.dmx_engine() {
             Some(d) => d,
@@ -1784,23 +1914,70 @@ impl McpServer {
             Some(s) => s,
             None => return Ok(ok_json(json!({ "fixture_types": [] }))),
         };
-        let guard = system.lock();
-        let types: Vec<Value> = guard
-            .fixture_types_iter()
-            .map(|(name, ft)| {
-                json!({
-                    "name": name,
-                    "channels": ft.channels(),
+        // A native type has its own channels. A GDTF type is the whole
+        // archive: its channels are a mode's, and each venue fixture states
+        // its mode — so it is listed with the archive and its modes.
+        type GdtfEntry = (String, String, Option<crate::lighting::types::StrobeCurve>);
+        let (natives, gdtf): (Vec<Value>, Vec<GdtfEntry>) = {
+            let guard = system.lock();
+            (
+                guard
+                    .fixture_types_iter()
+                    .map(|(name, ft)| {
+                        json!({
+                            "name": name,
+                            "channels": ft.channels(),
+                            "gdtf": false,
+                            "strobe_curve": ft.strobe_curve(),
+                            "strobe_curve_in_use": ft.effective_strobe_curve(),
+                        })
+                    })
+                    .collect(),
+                guard
+                    .gdtf_types_iter()
+                    .filter_map(|(name, ft)| {
+                        ft.source()
+                            .map(|s| (name.clone(), s.path.clone(), ft.strobe_curve()))
+                    })
+                    .collect(),
+            )
+        };
+        let project = self
+            .config_store()
+            .map(|store| crate::util::project_dir_of(store.path()))
+            .ok();
+        let gdtf = tokio::task::spawn_blocking(move || {
+            gdtf.into_iter()
+                .map(|(name, archive, curve)| {
+                    let modes: Vec<String> = project
+                        .as_ref()
+                        .and_then(|project| crate::util::read_file(&project.join(&archive)).ok())
+                        .and_then(|bytes| crate::lighting::gdtf::parse_archive(&bytes).ok())
+                        .map(|d| d.modes.into_iter().map(|m| m.name).collect())
+                        .unwrap_or_default();
+                    json!({
+                        "name": name,
+                        "gdtf": true,
+                        "archive": archive,
+                        "modes": modes,
+                        "strobe_curve": curve,
+                        "strobe_curve_in_use": curve
+                            .unwrap_or(crate::lighting::types::StrobeCurve::automatic(true)),
+                    })
                 })
-            })
-            .collect();
+                .collect::<Vec<Value>>()
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("listing task failed: {e}"), None))?;
+        let mut types: Vec<Value> = natives.into_iter().chain(gdtf).collect();
+        types.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         Ok(ok_json(json!({ "fixture_types": types })))
     }
 
     /// Resolves a caller-supplied project-relative path, refusing anything
     /// that escapes the project directory.
     fn resolve_in_project(&self, relative: &str) -> Result<std::path::PathBuf, McpError> {
-        let project = crate::util::project_dir_of(self.config_store()?.path());
+        let project = self.project_dir()?;
         let candidate = project.join(relative);
         let canonical = candidate.canonicalize().map_err(|e| {
             McpError::invalid_params(format!("cannot resolve {relative}: {e}"), None)
@@ -1818,16 +1995,20 @@ impl McpServer {
     }
 
     #[tool(description = "List the DMX modes of a GDTF fixture archive, with \
-        channel counts and DMX footprints. Mode selection is the one human \
-        input a GDTF import needs; pick against the venue's patch sheet.")]
+        channel counts and DMX footprints. Each venue fixture of a GDTF type \
+        states one of these on its line (`mode \"...\"`); pick against the \
+        venue's patch sheet.")]
     async fn list_gdtf_modes(
         &self,
         Parameters(args): Parameters<ListGdtfModesArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = self.resolve_in_project(&args.path)?;
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            McpError::invalid_params(format!("cannot read {}: {e}", args.path), None)
-        })?;
+        let bytes = tokio::task::spawn_blocking(move || crate::util::read_file(&path))
+            .await
+            .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?
+            .map_err(|e| {
+                McpError::invalid_params(format!("cannot read {}: {e}", args.path), None)
+            })?;
         let description = crate::lighting::gdtf::parse_archive(&bytes)
             .map_err(|e| McpError::invalid_params(format!("not a parseable GDTF: {e}"), None))?;
         let modes: Vec<Value> = crate::lighting::gdtf::mode_summaries(&description)
@@ -1847,27 +2028,28 @@ impl McpServer {
         })))
     }
 
-    #[tool(description = "Import one mode of a GDTF fixture archive: copies \
-        the archive into lighting/library/, writes a GDTF-referential \
-        .fixture definition, and warms the expansion cache through the same \
-        path the player loads with. Returns the resolved channels and every \
-        distillation warning. The archive must already be inside the \
-        project directory (download it there first).")]
+    #[tool(description = "Import a GDTF fixture archive: copies it into \
+        lighting/library/, where it is a fixture type that a venue fixture can \
+        use in any of its modes (`mode \"...\"` on every fixture line of it). \
+        An archive already imported is reported (already_imported) and left \
+        alone; a name another fixture has gets the archive's file stem added \
+        (renamed_from). `name` writes a record giving the type that name. \
+        Returns the type name, the mode count and the modes it cannot drive \
+        and why. The archive must already be inside the project directory \
+        (download it there first).")]
     async fn import_gdtf(
         &self,
         Parameters(args): Parameters<ImportGdtfArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = self.resolve_in_project(&args.path)?;
-        let project = crate::util::project_dir_of(self.config_store()?.path());
+        let project = self.project_dir()?;
+        let (types_dir, _) = self.project_lighting_dirs().await?;
+        // A pinned name writes a fixture type record: taken in turn with the
+        // web UI's fixture type and venue saves, as write_fixture_type is.
+        let _writing = crate::webui::api::lighting_api::VENUE_WRITES.lock().await;
         let report = tokio::task::spawn_blocking(move || {
-            crate::lighting::import::import_gdtf(
-                &path,
-                &args.mode,
-                args.name.as_deref(),
-                &project,
-                "lighting/fixture_types",
-            )
-            .map_err(|e| e.to_string())
+            crate::lighting::import::import_gdtf(&path, args.name.as_deref(), &project, &types_dir)
+                .map_err(|e| e.to_string())
         })
         .await
         .map_err(|e| McpError::internal_error(format!("import task failed: {e}"), None))?
@@ -1877,19 +2059,39 @@ impl McpServer {
         })?))
     }
 
-    fn mvr_options(&self, args: &ImportMvrArgs) -> crate::lighting::import::MvrImportOptions {
-        crate::lighting::import::MvrImportOptions {
+    async fn mvr_options(
+        &self,
+        args: &ImportMvrArgs,
+    ) -> Result<crate::lighting::import::MvrImportOptions, McpError> {
+        let (fixture_types_dir, venues_dir) = self.project_lighting_dirs().await?;
+        Ok(crate::lighting::import::MvrImportOptions {
             name: args.name.clone(),
             origin_mm: args.origin_mm,
+            fixture_types_dir,
+            venues_dir,
             ..crate::lighting::import::MvrImportOptions::default()
-        }
+        })
+    }
+
+    /// The project's fixture types and venues directories, relative to the
+    /// project, as the engine reads them: the host-matched profile's
+    /// configured ones, else the defaults.
+    async fn project_lighting_dirs(&self) -> Result<(String, String), McpError> {
+        let config_path = self.config_store()?.path().to_path_buf();
+        let dirs = tokio::task::spawn_blocking(move || {
+            crate::config::Player::lighting_dirs_at(&config_path)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?
+        .map_err(|e| McpError::internal_error(format!("the config does not load: {e}"), None))?;
+        Ok((dirs.fixture_types, dirs.venues))
     }
 
     #[tool(description = "Resolve an MVR venue archive against the project and \
         report what importing it would do, writing nothing: the venue file it \
         would seed or merge into, every referenced fixture type (and whether \
-        a .fixture already covers it), each patched fixture with its stage \
-        position, TODOs for fixtures whose GDTF or mode cannot be resolved, \
+        the library already has its archive), each patched fixture with its \
+        mode and stage position, TODOs for fixtures whose GDTF or mode cannot be resolved, \
         and — on a re-import — what changed. Pick `origin_mm` from the report's \
         positions so downstage-center lands at (0, 0, 0), then call import_mvr.")]
     async fn inspect_mvr(
@@ -1897,8 +2099,8 @@ impl McpServer {
         Parameters(args): Parameters<ImportMvrArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = self.resolve_in_project(&args.path)?;
-        let project = crate::util::project_dir_of(self.config_store()?.path());
-        let options = self.mvr_options(&args);
+        let project = self.project_dir()?;
+        let options = self.mvr_options(&args).await?;
         let plan = tokio::task::spawn_blocking(move || {
             crate::lighting::import::inspect_mvr(&path, &options, &project)
                 .map_err(|e| e.to_string())
@@ -1912,9 +2114,10 @@ impl McpServer {
     }
 
     #[tool(description = "Import an MVR venue archive: copies the MVR and its \
-        embedded GDTFs into lighting/library/, writes a GDTF-referential \
-        .fixture per referenced fixture type, and seeds a .venue file with \
-        positions, rotations and focus points in stage coordinates. A venue \
+        embedded GDTFs into lighting/library/ (each GDTF is a fixture type; \
+        an archive already there is reused), and seeds a .venue file whose \
+        every fixture line states its mode, with positions, rotations and \
+        focus points in stage coordinates. A venue \
         seeded earlier from the same MVR is merged instead — rig facts from \
         the new file, tags and focus names kept. Tags are empty on a fresh \
         seed: the venue file is the user's to tag afterwards. All validation \
@@ -1925,8 +2128,11 @@ impl McpServer {
         Parameters(args): Parameters<ImportMvrArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = self.resolve_in_project(&args.path)?;
-        let project = crate::util::project_dir_of(self.config_store()?.path());
-        let options = self.mvr_options(&args);
+        let project = self.project_dir()?;
+        let options = self.mvr_options(&args).await?;
+        // A re-import merges into the venue file it reads, so it holds the
+        // lock from that read to its write, as patch_venue does.
+        let _writing = crate::webui::api::lighting_api::VENUE_WRITES.lock().await;
         let report = tokio::task::spawn_blocking(move || {
             crate::lighting::import::import_mvr(&path, &options, &project)
                 .map_err(|e| e.to_string())
@@ -1950,10 +2156,13 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<ExportMvrArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let project = crate::util::project_dir_of(self.config_store()?.path());
+        let project = self.project_dir()?;
+        let (fixture_types_dir, venues_dir) = self.project_lighting_dirs().await?;
         let options = crate::lighting::export::MvrExportOptions {
             output: args.output.clone(),
             layers_from_tags: args.layers_from_tags.unwrap_or(false),
+            fixture_types_dir,
+            venues_dir,
             ..crate::lighting::export::MvrExportOptions::for_venue(&args.venue)
         };
         let report = tokio::task::spawn_blocking(move || {
@@ -1975,54 +2184,49 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<SongLightingArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let song = self
-            .player
-            .songs()
-            .get(&args.song)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+        let song = self.song(&args.song)?;
         validate_lighting_filename(&args.file)?;
-        let path = find_song_lighting_path(&song, &args.file).ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "song `{}` has no lighting file named `{}` — check the song's \
-                     `lighting:` block for the exact filename it references",
-                    args.song, args.file
-                ),
-                None,
-            )
-        })?;
-        let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
-        })?;
+        let path = existing_song_lighting_path(&song, &args.song, &args.file)?;
+        let body = read_song_show(&path, &args.file).await?;
         Ok(ok_json(json!({
             "path": path.display().to_string(),
             "source": body,
         })))
     }
 
-    #[tool(description = "List the venue files (`.light` and `.venue`) in the \
-        configured venues directory. Returns the resolved directory and a list \
-        of basenames.")]
+    #[tool(description = "List the venues in the configured venues directory \
+        (the host's profile's), as the lighting system reads them: every \
+        `.light` and `.venue` file at any depth (`files`, relative to `dir`), \
+        and each venue with its file and whether it can be written by name \
+        (`venues`: `{name, file, editable, reason}`; `name` is null for a \
+        file that does not parse). A venue whose file is not its alone (it \
+        shares the file, the file holds other items, or the name is declared \
+        twice) is read-only: `reason` says why, and the file is edited by \
+        hand.")]
     async fn list_venue_files(&self) -> Result<CallToolResult, McpError> {
-        let dir = self.resolve_lighting_dir(LightingDirKind::Venues).await?;
-        let entries = list_light_files(&dir, LightingDirKind::Venues).await?;
+        let dir = self.resolve_lighting_dir(Kind::Venue).await?;
+        let listed = dir.clone();
+        let (files, venues) = tokio::task::spawn_blocking(move || {
+            let record = crate::lighting::project_files::venues(&listed).record;
+            listing_of(Kind::Venue, &listed, &record)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         Ok(ok_json(json!({
             "dir": dir.display().to_string(),
-            "files": entries,
+            "files": files,
+            "venues": venues,
         })))
     }
 
-    #[tool(description = "Read a venue file (`.light` or `.venue`) by basename.")]
+    #[tool(description = "Read any file in the configured venues directory \
+        by its path relative to it, as list_venue_files gives it.")]
     async fn read_venue(
         &self,
         Parameters(args): Parameters<LightingFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self
-            .resolve_lighting_file(LightingDirKind::Venues, &args.file)
-            .await?;
-        let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
-        })?;
+        let path = self.resolve_lighting_file(Kind::Venue, &args.file).await?;
+        let body = read_text(&path).await?;
         Ok(ok_json(json!({
             "path": path.display().to_string(),
             "source": body,
@@ -2030,71 +2234,111 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Validate and write a venue file (`.light`, or `.venue` \
-        for one using positions, focus points or MVR provenance) into the \
-        configured venues directory. The DSL is parsed with the in-tree venue \
-        parser; on failure the file is not written."
+        description = "Write a venue by name, by the web UI's rules: `source` \
+        is the venue's whole file and declares this one venue and nothing \
+        else. A new venue is written to `<venues dir>/<stem>.venue` and is \
+        refused when the name or that file is taken; an existing one is \
+        rewritten where it lives, only when its file is its alone (otherwise \
+        it is read-only, refused with the file and why). `from` renames: a \
+        file at the old name's own place moves to the new name's, any other \
+        keeps its file name. A `.light` venue whose text needs the newer \
+        format (positions, rotations, a `beam_angle`, a mode, focus points or \
+        MVR provenance) moves to `<its stem>.venue`."
     )]
     async fn write_venue(
         &self,
-        Parameters(args): Parameters<WriteLightingFileArgs>,
+        Parameters(args): Parameters<WriteVenueArgs>,
     ) -> Result<CallToolResult, McpError> {
-        crate::lighting::parser::parse_venues(&args.source)
-            .map_err(|e| McpError::invalid_params(format!("invalid venue: {e}"), None))?;
-        let path = self
-            .resolve_lighting_file(LightingDirKind::Venues, &args.file)
-            .await?;
-        staged_write_string(&path, &args.source).await?;
-        let reloaded = self.reload_venue_if_current().await;
-        Ok(ok_json(json!({
-            "path": path.display().to_string(),
-            "bytes": args.source.len(),
+        let dir = self.resolve_lighting_dir(Kind::Venue).await?;
+        let project = self.project_root()?;
+        let saved = save_by_name(move || {
+            lighting_writes::save_venue(lighting_writes::VenueSave {
+                project,
+                dir,
+                name: args.name,
+                from: args.from,
+                expected: None,
+                needs_new_format: None,
+                body: lighting_writes::Body::Text(args.source),
+            })
+        })
+        .await?;
+        let (reloaded, venue_error) = self.reload_venue_if_current().await;
+        let mut body = json!({
+            "path": saved.file.display().to_string(),
+            "bytes": saved.text.len(),
             "reloaded": reloaded,
-        })))
+        });
+        if let Some(error) = venue_error {
+            body["venue_error"] = error;
+        }
+        Ok(ok_json(body))
     }
 
     /// After a venue file changed: re-read the venues and re-register the
     /// current one with the running engine, pushing fresh stage metadata to
-    /// web clients. Best effort — the file is the durable truth.
-    async fn reload_venue_if_current(&self) -> bool {
-        if self.player.dmx_engine().is_none() {
-            return false;
-        }
+    /// web clients. Best effort — the file is the durable truth. The second
+    /// value says when the current venue does not register after it, so the
+    /// write can report that the rig is now dark, and why.
+    async fn reload_venue_if_current(&self) -> (bool, Option<Value>) {
+        let Some(dmx) = self.player.dmx_engine() else {
+            return (false, None);
+        };
         let player = self.player.clone();
-        match tokio::task::spawn_blocking(move || player.reload_current_venue()).await {
+        let reloaded = match tokio::task::spawn_blocking(move || player.reload_current_venue())
+            .await
+        {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "venue written, but the running engine could not reload it");
                 false
             }
             Err(_) => false,
-        }
+        };
+        let venue_error = dmx
+            .venue_registration()
+            .filter(|r| !r.ok && r.venue.is_some())
+            .map(|r| {
+                json!({
+                    "venue": r.venue,
+                    "fixture": r.fixture,
+                    "reason": r.error,
+                })
+            });
+        (reloaded, venue_error)
     }
 
-    #[tool(description = "Delete a venue file (`.light` or `.venue`) from the \
-        configured venues directory.")]
+    #[tool(description = "Delete a venue by name, by the web UI's rules: its \
+        file is removed only when it is the venue's alone; a read-only venue \
+        is refused with the file and why.")]
     async fn delete_venue(
         &self,
-        Parameters(args): Parameters<LightingFileArgs>,
+        Parameters(args): Parameters<LightingNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self
-            .resolve_lighting_file(LightingDirKind::Venues, &args.file)
-            .await?;
-        remove_lighting_file(&path).await?;
-        Ok(ok_json(json!({"deleted": path.display().to_string()})))
+        let dir = self.resolve_lighting_dir(Kind::Venue).await?;
+        let deleted = save_by_name(move || lighting_writes::delete_venue(&dir, &args.name)).await?;
+        Ok(ok_json(json!({"deleted": deleted.display().to_string()})))
     }
 
-    #[tool(description = "Delete a fixture-type `.light` file from the \
-        configured fixture types directory.")]
+    #[tool(description = "Delete a fixture type by name, by the web UI's \
+        rules: its file is removed only when it is the type's alone (a \
+        read-only type is refused with the file and why), with its GDTF \
+        archive when no other type uses it; a GDTF in the library with no \
+        record is its archive, deleted.")]
     async fn delete_fixture_type(
         &self,
-        Parameters(args): Parameters<LightingFileArgs>,
+        Parameters(args): Parameters<LightingNameArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self
-            .resolve_lighting_file(LightingDirKind::FixtureTypes, &args.file)
-            .await?;
-        remove_lighting_file(&path).await?;
-        Ok(ok_json(json!({"deleted": path.display().to_string()})))
+        let dir = self.resolve_lighting_dir(Kind::FixtureType).await?;
+        let root = self.project_root()?;
+        let deleted =
+            save_by_name(move || lighting_writes::delete_fixture_type(&root, &dir, &args.name))
+                .await?;
+        Ok(ok_json(json!({
+            "deleted": deleted.file.map(|f| f.display().to_string()),
+            "archive_removed": deleted.archive_removed,
+            "archive_kept": deleted.archive_kept,
+        })))
     }
 
     #[tool(description = "Delete a lighting `.light` file belonging to a song, \
@@ -2108,39 +2352,36 @@ impl McpServer {
         Parameters(args): Parameters<SongLightingArgs>,
     ) -> Result<CallToolResult, McpError> {
         validate_lighting_filename(&args.file)?;
-        let song = self
-            .player
-            .songs()
-            .get(&args.song)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let path = find_song_lighting_path(&song, &args.file).ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "song `{}` has no lighting file named `{}`",
-                    args.song, args.file
-                ),
-                None,
-            )
-        })?;
+        // Held from looking the song up: a web song save or delete reloads
+        // the songs under it, and the file and reference found before it
+        // could be ones the song no longer has.
+        let _writing = crate::webui::api::songs_api::SONG_WRITES.lock().await;
+        let song = self.song(&args.song)?;
+        let path = existing_song_lighting_path(&song, &args.song, &args.file)?;
 
-        let config_path = song
-            .config_path()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| song.base_path().join("song.yaml"));
-        let reference = path
-            .strip_prefix(song.base_path())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let config_path = song.config_path_or_default();
+        let reference = shown_in(song.base_path(), &path);
+
+        // The web UI's rule for deleting a light show, checked before the
+        // song's config is touched.
+        let store = self.config_store()?;
+        let songs_root = self.songs_root_verified().await?;
+        let shown = shown_in(songs_root.as_path(), &path);
+        // The file to remove: a link itself, not what it leads to.
+        let removed = answered(
+            lighting_api::check_light_show_delete(store.path(), &songs_root, &path, &shown).await,
+        )?;
 
         let original = read_text(&config_path).await?;
         let referenced = references_lighting_file(&original, &reference);
         let unregistered = match unregister_lighting_file(&original, &reference) {
             Some(updated) => {
-                // Same guard the write path uses: never leave a song.yaml that
+                // Saved as the song editor saves it: never a song.yaml that
                 // would not load back.
-                let _: crate::config::Song = serde_yaml_from_str(&updated)?;
-                staged_write_string(&config_path, &updated).await?;
+                song_web(
+                    songs_api::save_song(&self.player, songs_root.as_path(), &args.song, updated)
+                        .await,
+                )?;
                 true
             }
             None if referenced => {
@@ -2164,65 +2405,133 @@ impl McpServer {
 
         // The file goes last. If removal fails, the only thing that happened is
         // the config edit, and the song still loads.
-        remove_lighting_file(&path).await?;
-        self.reload_songs_from_config().await?;
+        answered(lighting_api::remove_light_show(songs_root.as_path(), &removed).await)?;
+        self.reload_player_songs().await?;
 
         Ok(ok_json(json!({
-            "deleted": path.display().to_string(),
+            "deleted": removed.display().to_string(),
             "unregistered": unregistered,
             "reference": reference,
         })))
     }
 
-    #[tool(description = "List the fixture-type `.light` or `.fixture` files \
-        in the configured fixture types directory.")]
+    #[tool(description = "List the fixture types in the configured fixture \
+        types directory (the host's profile's), as the lighting system reads \
+        them: every `.light` and `.fixture` file at any depth (`files`, \
+        relative to `dir`), each type with its file and whether it can be \
+        written by name (`fixture_types`: `{name, file, editable, reason}`; \
+        `name` is null for a file that does not parse), and the library's \
+        GDTF types with no record (`library`: `{name, archive}`).")]
     async fn list_fixture_type_files(&self) -> Result<CallToolResult, McpError> {
-        let dir = self
-            .resolve_lighting_dir(LightingDirKind::FixtureTypes)
-            .await?;
-        let entries = list_light_files(&dir, LightingDirKind::FixtureTypes).await?;
+        let dir = self.resolve_lighting_dir(Kind::FixtureType).await?;
+        let root = self.project_root()?;
+        let listed = dir.clone();
+        let (files, types, library) = tokio::task::spawn_blocking(move || {
+            let project = crate::lighting::project_files::fixture_types(&root, Some(&listed));
+            let (files, types) = listing_of(Kind::FixtureType, &listed, &project.files.record);
+            let library: Vec<Value> = project
+                .library
+                .types
+                .iter()
+                .map(|t| json!({"name": t.name, "archive": t.archive}))
+                .collect();
+            (files, types, library)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
         Ok(ok_json(json!({
             "dir": dir.display().to_string(),
-            "files": entries,
+            "files": files,
+            "fixture_types": types,
+            "library": library,
         })))
     }
 
-    #[tool(description = "Read a fixture-type `.light` or `.fixture` file by \
-        basename.")]
+    #[tool(description = "Read any file in the configured fixture types \
+        directory by its path relative to it, as list_fixture_type_files \
+        gives it.")]
     async fn read_fixture_type(
         &self,
         Parameters(args): Parameters<LightingFileArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = self
-            .resolve_lighting_file(LightingDirKind::FixtureTypes, &args.file)
+            .resolve_lighting_file(Kind::FixtureType, &args.file)
             .await?;
-        let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
-            McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
-        })?;
+        let body = read_text(&path).await?;
         Ok(ok_json(json!({
             "path": path.display().to_string(),
             "source": body,
         })))
     }
 
-    #[tool(description = "Validate and write a fixture-type `.light` or \
-        `.fixture` file into the configured fixture types directory. The DSL \
-        is parsed first; on failure the file is not written.")]
+    #[tool(description = "Write a fixture type by name, by the web UI's \
+        rules: `source` is the type's whole file and declares this one type \
+        and nothing else. A new type is written to `<fixture types \
+        dir>/<stem>.fixture` and is refused when the name, that file or an \
+        unrecorded library GDTF's name is taken; an existing one is \
+        rewritten where it lives, only when its file is its alone (otherwise \
+        it is read-only, refused with the file and why). `from` renames, \
+        retyping every venue line naming the old name (refused, nothing \
+        written, when a venue file cannot be). A `.light` type whose text \
+        needs a `.fixture` (rich channels, a GDTF reference, or `ext: \
+        fixture`) moves to `<its stem>.fixture`.")]
     async fn write_fixture_type(
         &self,
-        Parameters(args): Parameters<WriteLightingFileArgs>,
+        Parameters(args): Parameters<WriteFixtureTypeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let types = crate::lighting::parser::parse_fixture_types(&args.source)
-            .map_err(|e| McpError::invalid_params(format!("invalid fixture type: {e}"), None))?;
-        refuse_rich_channels_in_light(&args.file, types.values())?;
-        let path = self
-            .resolve_lighting_file(LightingDirKind::FixtureTypes, &args.file)
+        let ext = crate::webui::api::lighting_api::fixture_type_extension(args.ext.as_deref())
+            .map_err(answer_err)?;
+        let renaming = args.from.is_some();
+        let type_name = args.name.clone();
+        let save = self
+            .type_save(
+                args.name,
+                args.from,
+                ext,
+                lighting_writes::Body::Text(args.source),
+            )
             .await?;
-        staged_write_string(&path, &args.source).await?;
-        Ok(ok_json(json!({
-            "path": path.display().to_string(),
-            "bytes": args.source.len(),
-        })))
+        let saved = save_by_name(move || lighting_writes::save_fixture_type(save)).await?;
+        let mut body = json!({
+            "path": saved.file.display().to_string(),
+            "bytes": saved.text.len(),
+            "rename": saved.rename,
+        });
+        if renaming {
+            let venues_dir = self.resolve_lighting_dir(Kind::Venue).await?;
+            let config_path = self.config_store()?.path().to_path_buf();
+            let error = crate::webui::api::fixture_settings::reload_types_and_venues(
+                &self.player,
+                &config_path,
+                &type_name,
+                &venues_dir,
+            )
+            .await;
+            if let Some(error) = error {
+                body["venue_error"] = json!(error);
+            }
+        }
+        Ok(ok_json(body))
+    }
+
+    /// A fixture type save in the host's directories.
+    async fn type_save(
+        &self,
+        name: String,
+        from: Option<String>,
+        ext: Option<&'static str>,
+        body: lighting_writes::Body,
+    ) -> Result<lighting_writes::TypeSave, McpError> {
+        Ok(lighting_writes::TypeSave {
+            root: self.project_root()?,
+            dir: self.resolve_lighting_dir(Kind::FixtureType).await?,
+            venues_dir: self.resolve_lighting_dir(Kind::Venue).await?,
+            name,
+            from,
+            ext,
+            from_form: false,
+            body,
+        })
     }
 
     #[tool(description = "Validate and write a lighting `.light` file for a \
@@ -2243,22 +2552,17 @@ impl McpServer {
         Parameters(args): Parameters<WriteSongLightingArgs>,
     ) -> Result<CallToolResult, McpError> {
         validate_lighting_filename(&args.file)?;
-        let song = self
-            .player
-            .songs()
-            .get(&args.song)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        // Validate against the tempo this song will actually load it with,
-        // otherwise a bar/beat show is rejected here and then loads fine.
-        crate::lighting::parser::parse_light_shows_with_tempo(
-            &args.source,
-            song_lighting_tempo(&song).as_ref(),
-        )
-        .map_err(|e| McpError::invalid_params(format!("invalid .light source: {e}"), None))?;
+        // As patch_song: the registration below edits song.yaml. Held from
+        // looking the song up, so the tempo the show is checked against and
+        // the place it is written are the song's as a web save left them.
+        let _writing = crate::webui::api::songs_api::SONG_WRITES.lock().await;
+        let song = self.song(&args.song)?;
 
-        let path = match find_song_lighting_path(&song, &args.file) {
+        let path = match find_song_lighting_write_path(&song, &args.file) {
             Some(existing) => existing,
             None => {
+                crate::webui::safe_path::SafePath::validate_new_name(&args.file)
+                    .map_err(safepath_err)?;
                 // First time we're writing this basename for this song: drop
                 // it into the conventional `lighting/` subdirectory and
                 // create that directory if it doesn't exist yet.
@@ -2289,26 +2593,23 @@ impl McpServer {
                         None,
                     ));
                 }
-                let lighting_dir = song.base_path().join("lighting");
-                crate::util::create_dir_all_async(&lighting_dir)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to create {}: {e}", lighting_dir.display()),
-                            None,
-                        )
-                    })?;
-                lighting_dir.join(&args.file)
+                // Made by the write, once the show is checked.
+                song.base_path().join("lighting").join(&args.file)
             }
         };
-        staged_write_string(&path, &args.source).await?;
+        // Saved as the web UI saves a light show: checked against the tempo
+        // this song loads it with (otherwise a bar/beat show is rejected
+        // here and then loads fine), and where it is written, which its
+        // `include`s resolve against.
+        self.save_light_show(&song, &path, args.source.clone())
+            .await?;
 
         // Writing the file is not enough: without a `lighting:` entry pointing
         // at it the show never loads, and the caller gets a success response,
         // a real path, and a rig that does nothing.
         let registration = self.register_song_lighting(&song, &path).await?;
 
-        self.reload_songs_from_config().await?;
+        self.reload_player_songs().await?;
         Ok(ok_json(json!({
             "path": path.display().to_string(),
             "bytes": args.source.len(),
@@ -2324,18 +2625,11 @@ impl McpServer {
         song: &crate::songs::Song,
         path: &std::path::Path,
     ) -> Result<Registration, McpError> {
-        let config_path = song
-            .config_path()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| song.base_path().join("song.yaml"));
+        let config_path = song.config_path_or_default();
 
         // The reference is stored relative to the song directory, matching how
         // a hand-written block spells it.
-        let reference = path
-            .strip_prefix(song.base_path())
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let reference = shown_in(song.base_path(), path);
 
         let original = read_text(&config_path).await?;
         let Some(updated) = register_lighting_file(&original, &reference) else {
@@ -2346,10 +2640,12 @@ impl McpServer {
             });
         };
 
-        // Same guard `patch_song` uses: never write a song.yaml that would not
-        // load back.
-        let _: crate::config::Song = serde_yaml_from_str(&updated)?;
-        staged_write_string(&config_path, &updated).await?;
+        // Saved as the song editor saves it: never a song.yaml that would
+        // not load back.
+        let songs_root = self.songs_root_verified().await?;
+        song_web(
+            songs_api::save_song(&self.player, songs_root.as_path(), song.name(), updated).await,
+        )?;
 
         Ok(Registration {
             registered: true,
@@ -2368,36 +2664,54 @@ impl McpServer {
         &self,
         Parameters(args): Parameters<PatchSongArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let song = self
-            .player
-            .songs()
-            .get(&args.name)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let path = song
-            .config_path()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| song.base_path().join("song.yaml"));
+        // Held from the lookup and the read, so a save between them and the
+        // write, such as the web UI's song editor, is not lost.
+        let _writing = crate::webui::api::songs_api::SONG_WRITES.lock().await;
+        let song = self.song(&args.name)?;
+        let path = song.config_path_or_default();
         let original = read_text(&path).await?;
-        let updated = apply_patch(&original, &args.patch)?;
-        let _: crate::config::Song = serde_yaml_from_str(&updated)?;
-        staged_write_string(&path, &updated).await?;
-        self.reload_songs_from_config().await?;
+        let updated = apply_patch(
+            &original,
+            &PatchFields::of(&args.old_string, &args.new_string, args.replace_all),
+        )?;
+        // Saved as the song editor saves it.
+        let songs_root = self.songs_root_verified().await?;
+        let path = song_web(
+            songs_api::save_song(
+                &self.player,
+                songs_root.as_path(),
+                &args.name,
+                updated.clone(),
+            )
+            .await,
+        )?;
+        self.reload_player_songs().await?;
         Ok(patch_response(&path, &original, &updated))
     }
 
     #[tool(description = "Patch a playlist YAML file with a string replacement. \
-        The result is parse-validated as `config::Playlist` before being \
-        written. With no `name`, edits the top-level playlist file.")]
+        The result is validated as `config::Playlist`, its transitions against \
+        the songs, before being written. With no `name`, edits the top-level \
+        playlist file. See `write_playlist` for the entry format, including \
+        `fade_out` and `fade_in`.")]
     async fn patch_playlist(
         &self,
         Parameters(args): Parameters<PatchPlaylistArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self.resolve_playlist_path(args.name.as_deref()).await?;
+        // As write_playlist, with the web UI's saves; held from the read, so
+        // a save between it and the write is not lost.
+        let _writing = crate::webui::api::playlists::PLAYLIST_WRITES.lock().await;
+        let file = self.playlist_file_to_write(args.name.as_deref()).await?;
+        let path = file.path().to_path_buf();
         let original = read_text(&path).await?;
-        let updated = apply_patch(&original, &args.patch)?;
-        let _: crate::config::Playlist = serde_yaml_from_str(&updated)?;
-        staged_write_string(&path, &updated).await?;
-        self.reload_songs_from_config().await?;
+        let updated = apply_patch(
+            &original,
+            &PatchFields::of(&args.old_string, &args.new_string, args.replace_all),
+        )?;
+        self.validate_playlist(&updated).await?;
+        let project = self.project_dir()?;
+        web(playlists::write_playlist_file(&file, updated.clone(), &project).await).await?;
+        self.reload_player_songs().await?;
         Ok(patch_response(&path, &original, &updated))
     }
 
@@ -2412,82 +2726,111 @@ impl McpServer {
         Parameters(args): Parameters<PatchSongLightingArgs>,
     ) -> Result<CallToolResult, McpError> {
         validate_lighting_filename(&args.file)?;
-        let song = self
-            .player
-            .songs()
-            .get(&args.song)
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-        let path = find_song_lighting_path(&song, &args.file).ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "song `{}` has no lighting file named `{}` — check the song's \
-                     `lighting:` block for the exact filename it references",
-                    args.song, args.file
-                ),
-                None,
-            )
-        })?;
-        let original = read_text(&path).await?;
-        let updated = apply_patch(&original, &args.patch)?;
-        // Validate against the tempo this song loads it with, matching
-        // `write_song_lighting`. Otherwise a patch to a tempo-inheriting show
-        // is rejected here and would have loaded fine.
-        crate::lighting::parser::parse_light_shows_with_tempo(
-            &updated,
-            song_lighting_tempo(&song).as_ref(),
-        )
-        .map_err(|e| McpError::invalid_params(format!("patched .light is invalid: {e}"), None))?;
-        staged_write_string(&path, &updated).await?;
-        self.reload_songs_from_config().await?;
+        // Held from looking the song up, so the tempo the patch is checked
+        // against is the song's as a web save left it.
+        let _writing = crate::webui::api::songs_api::SONG_WRITES.lock().await;
+        let song = self.song(&args.song)?;
+        let path = existing_song_lighting_path(&song, &args.song, &args.file)?;
+        let original = read_song_show(&path, &args.file).await?;
+        let updated = apply_patch(
+            &original,
+            &PatchFields::of(&args.old_string, &args.new_string, args.replace_all),
+        )?;
+        // Saved as `write_song_lighting` saves, by the web UI's rule.
+        self.save_light_show(&song, &path, updated.clone()).await?;
+        self.reload_player_songs().await?;
         Ok(patch_response(&path, &original, &updated))
     }
 
-    #[tool(
-        description = "Patch a venue file (`.light` or `.venue`) with a string \
-        replacement. The result is parsed with the venue parser before being written."
-    )]
+    #[tool(description = "Patch a venue by name with a string replacement, by \
+        the web UI's rules: only a venue whose file is its alone (a \
+        read-only one is refused with the file and why), and the result must \
+        still declare this one venue and nothing else. A `.light` venue whose \
+        patched text needs the newer format moves to `<its stem>.venue`.")]
     async fn patch_venue(
         &self,
         Parameters(args): Parameters<PatchLightingFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self
-            .resolve_lighting_file(LightingDirKind::Venues, &args.file)
-            .await?;
-        let original = read_text(&path).await?;
-        let updated = apply_patch(&original, &args.patch)?;
-        crate::lighting::parser::parse_venues(&updated).map_err(|e| {
-            McpError::invalid_params(format!("patched venue is invalid: {e}"), None)
-        })?;
-        staged_write_string(&path, &updated).await?;
-        self.reload_venue_if_current().await;
-        Ok(patch_response(&path, &original, &updated))
+        let dir = self.resolve_lighting_dir(Kind::Venue).await?;
+        let project = self.project_root()?;
+        let patch = patch_of(&args);
+        let saved = save_by_name(move || {
+            lighting_writes::save_venue(lighting_writes::VenueSave {
+                project,
+                dir,
+                name: args.name,
+                from: None,
+                expected: None,
+                needs_new_format: None,
+                body: lighting_writes::Body::Patch(patch),
+            })
+        })
+        .await?;
+        let before = saved.before.as_deref().unwrap_or_default();
+        let (_, venue_error) = self.reload_venue_if_current().await;
+        let Some(error) = venue_error else {
+            return Ok(patch_response(&saved.file, before, &saved.text));
+        };
+        // The patch landed; the current venue no longer registers.
+        Ok(ok_json(json!({
+            "path": saved.file.display().to_string(),
+            "bytes_before": before.len(),
+            "bytes_after": saved.text.len(),
+            "contents": saved.text,
+            "venue_error": error,
+        })))
     }
 
-    #[tool(description = "Patch a fixture-type `.light` file with a string \
-        replacement. The result is parsed with the fixture-type parser before \
-        being written.")]
+    #[tool(description = "Patch a fixture type by name with a string \
+        replacement, by the web UI's rules: only a type whose file is its \
+        alone (a read-only one is refused with the file and why), and the \
+        result must still declare this one type and nothing else. A `.light` \
+        type whose patched text needs a `.fixture` moves to `<its \
+        stem>.fixture`.")]
     async fn patch_fixture_type(
         &self,
         Parameters(args): Parameters<PatchLightingFileArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = self
-            .resolve_lighting_file(LightingDirKind::FixtureTypes, &args.file)
+        let patch = patch_of(&args);
+        let save = self
+            .type_save(args.name, None, None, lighting_writes::Body::Patch(patch))
             .await?;
-        let original = read_text(&path).await?;
-        let updated = apply_patch(&original, &args.patch)?;
-        let types = crate::lighting::parser::parse_fixture_types(&updated).map_err(|e| {
-            McpError::invalid_params(format!("patched fixture type is invalid: {e}"), None)
-        })?;
-        refuse_rich_channels_in_light(&args.file, types.values())?;
-        staged_write_string(&path, &updated).await?;
-        Ok(patch_response(&path, &original, &updated))
+        let saved = save_by_name(move || lighting_writes::save_fixture_type(save)).await?;
+        let before = saved.before.as_deref().unwrap_or_default();
+        Ok(patch_response(&saved.file, before, &saved.text))
+    }
+}
+
+impl McpServer {
+    /// The tool error a locked player answers a write with, or `None` when
+    /// the call may proceed.
+    fn refused_while_locked(&self, tool: &str) -> Option<CallToolResult> {
+        if !self.tool_router.has_route(tool) {
+            return None;
+        }
+        let e = self.player.check_lock(Surface::Mcp, tool).err()?;
+        Some(CallToolResult::error(vec![ContentBlock::text(
+            e.to_string(),
+        )]))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for McpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, McpError> {
+        if let Some(refused) = self.refused_while_locked(&request.name) {
+            return Ok(refused.into());
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -2512,75 +2855,38 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                Resource {
-                    raw: RawResource {
-                        uri: RESOURCE_STATUS_URI.to_string(),
-                        name: "Player Status".to_string(),
-                        title: None,
-                        description: Some(
-                            "Live JSON snapshot of the player: active playlist, \
-                             current song, playing flag, elapsed time."
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/json".to_string()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    },
-                    annotations: None,
-                },
-                Resource {
-                    raw: RawResource {
-                        uri: RESOURCE_LIGHTING_URI.to_string(),
-                        name: "Lighting State".to_string(),
-                        title: None,
-                        description: Some(
-                            "Live per-fixture DMX values (0-255, including \
-                             virtual-dimmer RGB scaling), the effects running, \
-                             and which effects drive each fixture. Subscribe for \
-                             pushes instead of polling; notifications are \
-                             coalesced to at most 10 per second and are only sent \
-                             when the state actually changes."
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/json".to_string()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    },
-                    annotations: None,
-                },
-                Resource {
-                    raw: RawResource {
-                        uri: RESOURCE_CONFIG_URI.to_string(),
-                        name: "Mtrack Configuration".to_string(),
-                        title: None,
-                        description: Some(
-                            "Full mtrack configuration as YAML, with the current \
-                             checksum for optimistic-concurrency edits."
-                                .to_string(),
-                        ),
-                        mime_type: Some("application/x-yaml".to_string()),
-                        size: None,
-                        icons: None,
-                        meta: None,
-                    },
-                    annotations: None,
-                },
-            ],
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(RESOURCE_STATUS_URI, "Player Status")
+                .with_description(
+                    "Live JSON snapshot of the player: active playlist, \
+                     current song, playing flag, elapsed time.",
+                )
+                .with_mime_type("application/json"),
+            Resource::new(RESOURCE_LIGHTING_URI, "Lighting State")
+                .with_description(
+                    "Live per-fixture DMX values (0-255, including \
+                     virtual-dimmer RGB scaling), the effects running, \
+                     and which effects drive each fixture. Subscribe for \
+                     pushes instead of polling; notifications are \
+                     coalesced to at most 10 per second and are only sent \
+                     when the state actually changes.",
+                )
+                .with_mime_type("application/json"),
+            Resource::new(RESOURCE_CONFIG_URI, "Mtrack Configuration")
+                .with_description(
+                    "Full mtrack configuration as YAML, with the current \
+                     checksum for optimistic-concurrency edits.",
+                )
+                .with_mime_type("application/x-yaml"),
+        ]))
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        match request.uri.as_str() {
+    ) -> Result<ReadResourceResponse, McpError> {
+        let result = match request.uri.as_str() {
             RESOURCE_STATUS_URI => {
                 let json = self.status_snapshot().await?;
                 Ok(ReadResourceResult::new(vec![ResourceContents::text(
@@ -2609,7 +2915,8 @@ impl ServerHandler for McpServer {
                 "unknown resource",
                 Some(json!({"uri": other})),
             )),
-        }
+        };
+        result.map(Into::into)
     }
 
     async fn subscribe(
@@ -2656,6 +2963,7 @@ impl ServerHandler for McpServer {
 fn evaluation_json(
     evaluation: &crate::lighting::evaluate::Evaluation,
     include_fixtures: bool,
+    layers: &LayerSet,
 ) -> Value {
     let effects: Vec<Value> = evaluation
         .active_effects
@@ -2664,7 +2972,7 @@ fn evaluation_json(
             json!({
                 "id": effect.id,
                 "type": effect.effect_type,
-                "layer": format!("{:?}", effect.layer).to_lowercase(),
+                "layer": layers.display_name(effect.layer),
                 "elapsed": effect.elapsed.as_secs_f64(),
                 "duration": effect.duration.as_secs_f64(),
                 "fixtures": effect.fixtures,
@@ -2716,6 +3024,13 @@ fn song_lighting_tempo(song: &crate::songs::Song) -> Option<crate::tempo::TempoM
     song.lighting_tempo_map()
 }
 
+/// Where `write_song_lighting` puts lighting file `file` of `song`: the
+/// existing file of that name, else `<song>/lighting/<file>`.
+fn song_lighting_target(song: &crate::songs::Song, file: &str) -> std::path::PathBuf {
+    find_song_lighting_write_path(song, file)
+        .unwrap_or_else(|| song.base_path().join("lighting").join(file))
+}
+
 /// What `write_song_lighting` did about the song's `lighting:` block.
 struct Registration {
     /// An entry was added.
@@ -2726,20 +3041,12 @@ struct Registration {
     reference: String,
 }
 
-/// Removes the file, mapping a missing path to a clear error rather than an
-/// opaque io message.
-async fn remove_lighting_file(path: &std::path::Path) -> Result<(), McpError> {
-    tokio::fs::remove_file(path).await.map_err(|e| {
-        McpError::internal_error(format!("failed to delete {}: {e}", path.display()), None)
-    })
-}
-
 /// The `lighting:` block's location in a song's YAML: the key line, the item
 /// spans beneath it, and where the block ends.
 ///
 /// YAML lets a sequence sit at the key's own indentation or deeper, and an
-/// entry may run over several lines — the shipped songs write `- name: "..."`
-/// with `file:` underneath. Both callers need the same understanding of that
+/// entry may run over several lines — hand-written songs often write
+/// `- name: "..."` with `file:` underneath. Both callers need the same understanding of that
 /// shape, so they share this rather than each scanning lines their own way.
 struct LightingBlock {
     key_index: usize,
@@ -2898,10 +3205,10 @@ fn cue_timeline(show: &crate::lighting::parser::LightShow) -> Vec<Value> {
         .iter()
         .enumerate()
         .map(|(index, cue)| {
-            let position = show.tempo_map.as_ref().map(|map| {
-                let (measure, beat) = map.time_to_measure_beat(cue.time);
-                format!("@{measure}/{beat:.2}")
-            });
+            let position = show
+                .tempo_map
+                .as_ref()
+                .map(|map| map.position_label(cue.time));
             json!({
                 "index": index,
                 "time": cue.time.as_secs_f64(),
@@ -2912,46 +3219,24 @@ fn cue_timeline(show: &crate::lighting::parser::LightShow) -> Vec<Value> {
         .collect()
 }
 
-/// Orders shows by name so evaluation is reproducible.
-///
-/// Shows arrive from a `HashMap`, so without this both the cue order for
-/// identically-timed cues and — because `LightingTimeline` takes the first
-/// show's tempo map — which tempo block wins would vary between runs.
-fn sort_shows(shows: &mut [crate::lighting::parser::LightShow]) {
-    shows.sort_by(|a, b| a.name.cmp(&b.name));
-}
-
-/// Every distinct group name a set of shows targets, deduplicated.
-fn group_names(shows: &[crate::lighting::parser::LightShow]) -> Vec<String> {
-    let mut names: Vec<String> = shows
-        .iter()
-        .flat_map(|show| show.cues.iter())
-        .flat_map(|cue| cue.effects.iter())
-        .flat_map(|effect| effect.groups.iter().cloned())
-        .collect();
-    names.sort();
-    names.dedup();
-    names
-}
-
 /// Returns a successful tool result wrapping a JSON value as pretty-printed text.
 pub(crate) fn ok_json(value: Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-    CallToolResult::success(vec![Content::text(text)])
+    CallToolResult::success(vec![ContentBlock::text(text)])
 }
 
 /// Derives BPM from a click-track beat grid using the median inter-beat
 /// interval. Median is robust to tempo changes and bad first/last beats;
 /// when a song has a single uniform tempo it matches the mean.
 pub(crate) fn compute_bpm_from_beats(beats: &[f64]) -> Option<f64> {
-    if beats.len() < 2 {
-        return None;
-    }
-    let mut intervals: Vec<f64> = beats
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .filter(|d| *d > 0.0)
-        .collect();
+    let intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+    compute_bpm_from_intervals(&intervals)
+}
+
+/// [`compute_bpm_from_beats`] over intervals already measured, so a caller
+/// can hand it intervals normalized to quarter notes.
+fn compute_bpm_from_intervals(intervals: &[f64]) -> Option<f64> {
+    let mut intervals: Vec<f64> = intervals.iter().copied().filter(|d| *d > 0.0).collect();
     if intervals.is_empty() {
         return None;
     }
@@ -2962,6 +3247,71 @@ pub(crate) fn compute_bpm_from_beats(beats: &[f64]) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// Each click interval of `grid` scaled to the length of one quarter note,
+/// with the number of quarters each click is worth,
+/// using the meter `meter` declares for the bar the interval falls in.
+///
+/// A click is not always a quarter note: in 12/8 it is usually the dotted
+/// quarter, and a click track may switch to eighths for a bar or two. Read
+/// raw, those report the click rate (112 for a 12/8 song at 169) rather than
+/// the tempo a `tempo` block is written in (#515). Bars come from the accented
+/// clicks, so each bar's length is known whatever its clicks subdivide into;
+/// a click in a bar of `n` clicks is worth `beats_per_measure / n` quarters.
+/// Clicks before the first downbeat or after the last take the nearest bar's
+/// value.
+fn quarter_note_intervals(
+    grid: &crate::audio::click_analysis::BeatGrid,
+    meter: &crate::tempo::TempoMap,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    let starts = &grid.measure_starts;
+    if starts.len() < 2 || grid.beats.len() < 2 {
+        return None;
+    }
+    // Quarters per click, one value per complete bar.
+    let per_bar: Vec<(usize, f64)> = starts
+        .windows(2)
+        .filter_map(|w| {
+            let clicks = w[1].checked_sub(w[0]).filter(|n| *n > 0)?;
+            let at = std::time::Duration::from_secs_f64(grid.beats.get(w[0])?.max(0.0));
+            let quarters = meter.time_signature_at_time(at, 0.0).beats_per_measure();
+            Some((w[0], quarters / clicks as f64))
+        })
+        .collect();
+    if per_bar.is_empty() {
+        return None;
+    }
+    let quarters_per_click = |beat: usize| {
+        let bar = per_bar.partition_point(|(start, _)| *start <= beat);
+        per_bar[bar.saturating_sub(1)].1
+    };
+    Some(
+        grid.beats
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                let quarters = quarters_per_click(i);
+                ((w[1] - w[0]) / quarters, quarters)
+            })
+            .unzip(),
+    )
+}
+
+/// The meter a song declares, for reading its click grid in quarter notes:
+/// its own `tempo:` block, else the first of its shows with a `tempo` block.
+///
+/// Not [`Song::lighting_tempo_map`], deliberately: that falls back to the
+/// grid itself, and the grid read against a meter derived from the grid
+/// would answer nothing. This is a question about the declared meter only.
+///
+/// [`Song::lighting_tempo_map`]: crate::songs::Song::lighting_tempo_map
+fn declared_meter(song: &crate::songs::Song) -> Option<crate::tempo::TempoMap> {
+    song.tempo_map().cloned().or_else(|| {
+        song.dsl_lighting_shows()
+            .iter()
+            .find_map(|s| s.shows().values().find_map(|show| show.tempo_map.clone()))
+    })
 }
 
 /// Width (in intervals) of the median window used to smooth out individual
@@ -2981,11 +3331,22 @@ const TEMPO_MIN_SEGMENT_INTERVALS: usize = 8;
 /// arrangement (e.g. an 8-minute song with a half-time bridge yields
 /// three segments rather than a sea of single-beat fluctuations).
 pub(crate) fn compute_tempo_segments(beats: &[f64]) -> Vec<Value> {
-    if beats.len() < TEMPO_SMOOTHING_WINDOW + 2 {
-        return Vec::new();
-    }
     let intervals: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
-    if intervals.is_empty() {
+    let weights = vec![1.0; intervals.len()];
+    compute_tempo_segments_from(beats, &intervals, &weights)
+}
+
+/// [`compute_tempo_segments`] over intervals already measured: `intervals[i]`
+/// is the length of one beat between `beats[i]` and `beats[i + 1]`, and
+/// `weights[i]` how many beats that span is worth — 1 for a raw click, the
+/// quarters per click once normalized (see [`quarter_note_intervals`]). The
+/// noise filter measures a segment in those beats, so a bar of eighth clicks
+/// is as short as the bar it is.
+fn compute_tempo_segments_from(beats: &[f64], intervals: &[f64], weights: &[f64]) -> Vec<Value> {
+    if beats.len() < TEMPO_SMOOTHING_WINDOW + 2
+        || intervals.len() + 1 != beats.len()
+        || weights.len() != intervals.len()
+    {
         return Vec::new();
     }
 
@@ -3044,31 +3405,39 @@ pub(crate) fn compute_tempo_segments(beats: &[f64]) -> Vec<Value> {
     segs.push((run_start, smoothed.len() - 1, current));
 
     // Noise filter: repeatedly fold the shortest sub-threshold segment into
-    // its larger neighbour, then re-merge any adjacent equal-BPM runs that
+    // its nearer-tempo neighbour, then re-merge any adjacent equal-BPM runs that
     // result. Terminates when no sub-threshold segment remains (or there's
     // only one segment left).
+    let len = |s: usize, e: usize| weights[s..=e].iter().sum::<f64>();
     loop {
         let short = segs
             .iter()
             .enumerate()
-            .filter(|(_, (s, e, _))| e - s + 1 < TEMPO_MIN_SEGMENT_INTERVALS)
-            .min_by_key(|(_, (s, e, _))| e - s + 1)
+            .filter(|(_, (s, e, _))| len(*s, *e) < TEMPO_MIN_SEGMENT_INTERVALS as f64)
+            .min_by(|(_, (sa, ea, _)), (_, (sb, eb, _))| len(*sa, *ea).total_cmp(&len(*sb, *eb)))
             .map(|(idx, _)| idx);
         let Some(idx) = short else { break };
         if segs.len() == 1 {
             break;
         }
         let left_len = if idx > 0 {
-            segs[idx - 1].1 - segs[idx - 1].0 + 1
+            len(segs[idx - 1].0, segs[idx - 1].1)
         } else {
-            0
+            0.0
         };
         let right_len = if idx + 1 < segs.len() {
-            segs[idx + 1].1 - segs[idx + 1].0 + 1
+            len(segs[idx + 1].0, segs[idx + 1].1)
         } else {
-            0
+            0.0
         };
-        let merge_left = idx > 0 && (idx + 1 >= segs.len() || left_len >= right_len);
+        // Into the neighbour whose tempo it is nearer — a jittery fragment of
+        // the next section belongs to the next section, however short that
+        // section is — and the longer one only on a tie.
+        let gap = |other: usize| (segs[other].2 - segs[idx].2).abs();
+        let merge_left = idx > 0
+            && (idx + 1 >= segs.len()
+                || gap(idx - 1) < gap(idx + 1)
+                || (gap(idx - 1) == gap(idx + 1) && left_len >= right_len));
         if merge_left {
             segs[idx - 1].1 = segs[idx].1;
             segs.remove(idx);
@@ -3104,82 +3473,64 @@ pub(crate) fn compute_tempo_segments(beats: &[f64]) -> Vec<Value> {
         .collect()
 }
 
-/// Formats a [`std::time::Duration`] as `M:SS.mmm`.
+/// Formats a [`std::time::Duration`] as `M:SS.mmm`: the `M:SS` every
+/// surface shows ([`crate::util::duration_minutes_seconds`]) with the
+/// milliseconds a tool wants, whole ones.
 pub(crate) fn format_duration(d: std::time::Duration) -> String {
-    let total = d.as_secs_f64();
-    let minutes = (total / 60.0).floor() as u64;
-    let seconds = total - (minutes as f64) * 60.0;
-    format!("{}:{:06.3}", minutes, seconds)
+    format!(
+        "{}.{:03}",
+        crate::util::duration_minutes_seconds(d),
+        d.subsec_millis()
+    )
 }
 
 /// Builds a compact summary value for a song.
 pub(crate) fn song_summary(song: &crate::songs::Song) -> Value {
     let tracks: Vec<&str> = song.tracks().iter().map(|t| t.name()).collect();
-    let sections: Vec<Value> = song
-        .sections()
-        .iter()
-        .map(|s| {
-            json!({
-                "name": s.name,
-                "start_measure": s.start_measure,
-                "end_measure": s.end_measure,
-            })
-        })
-        .collect();
+    let summary = song.summary();
     json!({
-        "name": song.name(),
-        "duration": format_duration(song.length()),
+        "name": summary.name,
+        "duration": format_duration(summary.duration),
         "tracks": tracks,
-        "sections": sections,
+        "sections": summary.sections,
     })
 }
 
-/// Parses an `mm:ss.mmm` or `Ns` / `N.Ns` time string into a [`Duration`].
+/// Parses a playback position (`1:23.456`, `45.5s`, `90`) into a
+/// [`std::time::Duration`], as every surface parses one (see
+/// [`crate::util::parse_position`]).
 pub(crate) fn parse_duration(value: &str) -> Result<std::time::Duration, McpError> {
-    let trimmed = value.trim();
-    let seconds = if let Some(stripped) = trimmed
-        .strip_suffix('s')
-        .or_else(|| trimmed.strip_suffix('S'))
-    {
-        if stripped.contains(':') {
-            parse_mm_ss(stripped)?
-        } else {
-            stripped
-                .parse::<f64>()
-                .map_err(|e| McpError::invalid_params(format!("invalid seconds: {e}"), None))?
-        }
-    } else if trimmed.contains(':') {
-        parse_mm_ss(trimmed)?
-    } else {
-        trimmed
-            .parse::<f64>()
-            .map_err(|e| McpError::invalid_params(format!("invalid duration: {e}"), None))?
-    };
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(McpError::invalid_params(
-            "duration must be a finite non-negative number",
-            None,
-        ));
-    }
-    Ok(std::time::Duration::from_secs_f64(seconds))
-}
-
-fn parse_mm_ss(s: &str) -> Result<f64, McpError> {
-    let (mm, ss) = s
-        .split_once(':')
-        .ok_or_else(|| McpError::invalid_params("expected mm:ss.mmm", None))?;
-    let minutes: u64 = mm
-        .parse()
-        .map_err(|e| McpError::invalid_params(format!("invalid minutes: {e}"), None))?;
-    let seconds: f64 = ss
-        .parse()
-        .map_err(|e| McpError::invalid_params(format!("invalid seconds: {e}"), None))?;
-    Ok((minutes as f64) * 60.0 + seconds)
+    crate::util::parse_position(value).map_err(|e| McpError::invalid_params(e, None))
 }
 
 /// Wraps a domain error into [`McpError::internal_error`].
 pub(crate) fn internal_err<E: std::fmt::Display>(e: E) -> McpError {
     McpError::internal_error(e.to_string(), None)
+}
+
+/// A fault as an MCP error: the one table from [`FaultKind`] to a code.
+/// MCP has one code for what the caller got wrong, so every fault short of
+/// mtrack's own is `invalid_params`, never `internal_error`.
+fn fault_err(kind: FaultKind, message: String) -> McpError {
+    match kind {
+        FaultKind::Internal => McpError::internal_error(message, None),
+        FaultKind::NotFound | FaultKind::Precondition | FaultKind::Invalid => {
+            McpError::invalid_params(message, None)
+        }
+    }
+}
+
+/// A player refusal (not playing, no such section, already playing) as an
+/// MCP error: a precondition the caller can see to, not a fault of the
+/// server.
+fn precondition_err<E: std::fmt::Display>(e: E) -> McpError {
+    fault_err(FaultKind::Precondition, e.to_string())
+}
+
+/// A config store error as an MCP error: a change the config would not load
+/// with is the caller's to fix, not a fault of the server.
+fn config_err(e: crate::config::ConfigError) -> McpError {
+    fault_err(e.kind(), e.to_string())
 }
 
 /// Sends a `notifications/resources/updated` to a peer with a JSON payload
@@ -3196,9 +3547,7 @@ async fn send_resource_updated(
     meta_key: &str,
     payload: Value,
 ) -> Result<(), rmcp::ServiceError> {
-    let params = ResourceUpdatedNotificationParam {
-        uri: uri.to_string(),
-    };
+    let params = ResourceUpdatedNotificationParam::new(uri);
     let mut notif =
         ServerNotification::ResourceUpdatedNotification(ResourceUpdatedNotification::new(params));
     notif.get_meta_mut().0.insert(meta_key.to_string(), payload);
@@ -3212,7 +3561,7 @@ async fn build_lighting_snapshot(player: &Player) -> Result<Value, McpError> {
     let Some(engine) = player.effect_engine() else {
         return Ok(json!({
             "available": false,
-            "reason": "no effect engine configured",
+            "reason": crate::player::NO_EFFECT_ENGINE,
         }));
     };
 
@@ -3231,7 +3580,7 @@ async fn build_lighting_snapshot(player: &Player) -> Result<Value, McpError> {
     .await
     .map_err(|e| McpError::internal_error(format!("snapshot failed: {e}"), None))?;
 
-    let mut value = evaluation_json(&snapshot, true);
+    let mut value = evaluation_json(&snapshot, true, &player.layers());
     value["available"] = json!(true);
     Ok(value)
 }
@@ -3242,57 +3591,89 @@ async fn build_lighting_snapshot(player: &Player) -> Result<Value, McpError> {
 /// reference cycle through `subscriptions` → `SubscriptionHandle` →
 /// `AbortHandle` and silently defeat abort-on-Drop).
 async fn build_status_snapshot(player: &Player) -> Result<Value, McpError> {
-    let playlist = player.get_playlist();
-    let current = playlist.current();
-    let playing = player.is_playing().await;
-    let elapsed = player
-        .elapsed()
-        .await
+    // The player's one status, its DMX reads bounded: `status` is the
+    // diagnostic of last resort, and must answer if the effects loop wedges
+    // holding the timeline lock.
+    let status = player.status_snapshot().await;
+    let elapsed = status
+        .elapsed
+        .clone()
         .map_err(internal_err)?
         .unwrap_or_default();
     // Whether the lighting will actually fire, answerable here rather than by
-    // polling for effects and inferring from their absence (#332).
-    //
-    // The timeline mutex is shared with the effects loop thread, so this reads
-    // it on the blocking pool rather than parking a tokio worker on it.
-    let lighting = match player.dmx_engine() {
-        Some(dmx) => {
-            // Bounded, because this is the diagnostic of last resort: if the
-            // effects loop wedges holding the timeline mutex, `status` must
-            // still answer rather than hang alongside it. A timeout or a
-            // panicked task is reported as such, not silently flattened into
-            // "no show loaded" — that is the one field meant to tell those
-            // apart.
-            let read = tokio::task::spawn_blocking(move || dmx.lighting_arming_state());
-            match tokio::time::timeout(std::time::Duration::from_millis(500), read).await {
-                Ok(Ok(Some((armed, total, remaining, next)))) => Some(json!({
-                    "armed": armed,
-                    "cues_total": total,
-                    "cues_remaining": remaining,
-                    "next_cue_seconds": next.map(|t| t.as_secs_f64()),
-                })),
-                Ok(Ok(None)) => None,
-                Ok(Err(e)) => Some(json!({
-                    "available": false,
-                    "reason": format!("lighting state read failed: {e}"),
-                })),
-                Err(_) => Some(json!({
-                    "available": false,
-                    "reason": "timed out reading lighting state — the effects \
-                               loop may be stalled holding the timeline lock",
-                })),
-            }
-        }
-        None => None,
+    // polling for effects and inferring from their absence (#332). A timeout
+    // or a panicked read is reported as such, not silently flattened into
+    // "no show loaded" -- that is the one field meant to tell those apart.
+    let lighting = match &status.lighting {
+        Some(crate::player::DmxRead::Read(Some(lighting))) => Some(json!({
+            "armed": lighting.armed,
+            "cues_total": lighting.cues_total,
+            "cues_remaining": lighting.cues_remaining,
+            "next_cue_seconds": lighting.next_cue.map(|t| t.as_secs_f64()),
+        })),
+        Some(crate::player::DmxRead::Read(None)) | None => None,
+        Some(crate::player::DmxRead::Failed(e)) => Some(json!({
+            "available": false,
+            "reason": format!("lighting state read failed: {e}"),
+        })),
+        Some(crate::player::DmxRead::TimedOut) => Some(json!({
+            "available": false,
+            "reason": "timed out reading lighting state — the effects \
+                       loop may be stalled holding the timeline lock",
+        })),
     };
+    let playlist = &status.playlist;
 
     Ok(json!({
         "playlist_name": playlist.name(),
-        "current_song": current.as_ref().map(|s| song_summary(s)),
-        "playing": playing,
+        "current_song": status.current_song.as_ref().map(|s| song_summary(s)),
+        "playing": status.playing,
         "elapsed": format_duration(elapsed),
         "lighting": lighting,
+        "ambient": ambient_json(status.ambient.as_ref()),
+        "auto_play": status.auto_play.as_ref().map(|(song, starts_in)| json!({
+            "song": song,
+            "starts_in_seconds": starts_in.as_secs_f64(),
+        })),
+        "ending": status.ending.as_ref().map(|(song, remaining)| json!({
+            "song": song,
+            "remaining_seconds": remaining.as_secs_f64(),
+        })),
+        "transitions": transitions_json(playlist),
     }))
+}
+
+/// Ambient light's mode and state for `status`, `null` without a DMX
+/// engine, as the player's status read it (bounded on the blocking pool:
+/// the effects loop holds the ambient lock while it starts the show).
+fn ambient_json(ambient: Option<&crate::player::DmxRead<crate::player::AmbientStatus>>) -> Value {
+    json!(ambient.map(crate::player::DmxRead::view))
+}
+
+/// What breaking the current song's loop would do, by the playlist's
+/// transitions: how the current entry fades out, and the song next and
+/// previous would move to with how it fades in.
+fn transitions_json(playlist: &crate::playlist::Playlist) -> Value {
+    let on = playlist.loop_break(false);
+    let back = playlist.loop_break(true);
+    let target = |handover: &crate::playlist::LoopBreak| {
+        json!({
+            "song": handover.target.as_ref().map(|s| s.name().to_string()),
+            "fade_in": fade_json(handover.fade_in.as_ref()),
+        })
+    };
+    json!({
+        "fade_out": fade_json(on.fade_out.as_ref()),
+        "next": target(&on),
+        "previous": target(&back),
+    })
+}
+
+/// A transition's fade as configured, `null` for none. A `null` `exclude`
+/// is the default (a fade-out's `loop_crossfade_cut`, a fade-in's none),
+/// as is a `null` `lights` (the length).
+fn fade_json(fade: Option<&crate::config::Fade>) -> Value {
+    fade.map_or(Value::Null, |fade| json!(fade.status()))
 }
 
 impl McpServer {
@@ -3450,6 +3831,15 @@ impl McpServer {
         Ok(handle.abort_handle())
     }
 
+    /// The loaded song by `name`. One that failed to load says why, as
+    /// [`crate::songs::Songs::get`] answers.
+    pub(crate) fn song(&self, name: &str) -> Result<Arc<crate::songs::Song>, McpError> {
+        self.player
+            .songs()
+            .get(name)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))
+    }
+
     /// Returns the player's [`ConfigStore`] or an MCP error when none is wired.
     pub(crate) fn config_store(&self) -> Result<Arc<crate::config::store::ConfigStore>, McpError> {
         self.player.config_store().ok_or_else(|| {
@@ -3460,6 +3850,12 @@ impl McpServer {
         })
     }
 
+    /// The project directory: the one holding the config file
+    /// ([`crate::util::project_dir_of`]).
+    fn project_dir(&self) -> Result<std::path::PathBuf, McpError> {
+        Ok(crate::util::project_dir_of(self.config_store()?.path()))
+    }
+
     /// Resolves the songs root path from the live config and returns it as a
     /// `VerifiedRoot` (canonicalized, used for traversal-safe path joins).
     pub(crate) async fn songs_root_verified(
@@ -3467,8 +3863,12 @@ impl McpServer {
     ) -> Result<crate::webui::safe_path::VerifiedRoot, McpError> {
         let store = self.config_store()?;
         let path = store.path().to_path_buf();
-        let cfg = store.read_config().await;
-        let songs = cfg.songs(&path);
+        // The songs directory the player's songs were loaded from, so a
+        // song written here is one its reload picks up.
+        let songs = match self.player.song_sources() {
+            Some(sources) => sources.songs,
+            None => store.read_config().await.songs(&path),
+        };
         // Created only when it is inside the project. A `songs:` pointing
         // elsewhere is the operator's to set up -- see `create_dir_within`.
         let project = crate::util::project_dir_of(&path);
@@ -3481,153 +3881,249 @@ impl McpServer {
         crate::webui::safe_path::VerifiedRoot::new(created.as_path()).map_err(safepath_err)
     }
 
-    /// Resolves the configured lighting subdirectory (venues or fixture types)
-    /// to an absolute path. The directory is created if it doesn't yet exist
-    /// *and* lies inside the project directory, so write tools work against
-    /// fresh configs without making directories wherever a config points.
+    /// Resolves the project's lighting subdirectory (venues or fixture types:
+    /// the host-matched profile's configured one, else the default the
+    /// engine reads) to an absolute path inside the project, as the web UI
+    /// resolves it, without creating it: a save makes it once its text has
+    /// passed its checks ([`lighting_writes`]), so a refused one makes
+    /// nothing.
     pub(crate) async fn resolve_lighting_dir(
         &self,
-        kind: LightingDirKind,
+        kind: Kind,
     ) -> Result<std::path::PathBuf, McpError> {
-        let store = self.config_store()?;
-        let config_path = store.path().to_path_buf();
-        let cfg = store.read_config().await;
-        let lighting = cfg.lighting_from_profiles().ok_or_else(|| {
-            McpError::invalid_params("no lighting configuration in the active profile", None)
-        })?;
-        let dirs = lighting.directories().ok_or_else(|| {
-            McpError::invalid_params(
-                "no lighting `directories:` configured (expected `fixture_types`/`venues`)",
-                None,
-            )
-        })?;
+        use crate::webui::safe_path::{SafePath, VerifiedRoot};
+        let (fixture_types, venues) = self.project_lighting_dirs().await?;
         let rel = match kind {
-            LightingDirKind::Venues => dirs.venues(),
-            LightingDirKind::FixtureTypes => dirs.fixture_types(),
-        }
-        .ok_or_else(|| {
-            McpError::invalid_params(
-                format!(
-                    "no `{}` directory configured under `lighting.directories`",
-                    kind.field_name()
-                ),
-                None,
-            )
-        })?;
-        let rel_path = std::path::PathBuf::from(rel);
-        let dir = if rel_path.is_absolute() {
-            rel_path
-        } else {
-            crate::util::project_dir_of(&config_path).join(rel_path)
+            Kind::Venue => venues,
+            Kind::FixtureType => fixture_types,
         };
-        let project = crate::util::project_dir_of(&config_path);
-        let created = crate::util::create_dir_within_async(dir.clone(), project)
-            .await
-            .map_err(create_within_err)?;
-        Ok(created.into_path_buf())
+        let project = self.project_dir()?;
+        let root = VerifiedRoot::new(&project).map_err(safepath_err)?;
+        SafePath::validate_relative(&rel, &root).map_err(safepath_err)
     }
 
-    /// Resolves a single `.light` filename inside a lighting subdirectory,
-    /// after validating the basename for path-traversal safety and the
-    /// `.light` extension.
+    /// The project root, canonical, as the web UI's lighting writes take it.
+    fn project_root(&self) -> Result<std::path::PathBuf, McpError> {
+        let project = self.project_dir()?;
+        project.canonicalize().map_err(|e| {
+            McpError::internal_error(
+                format!("cannot resolve the project {}: {e}", project.display()),
+                None,
+            )
+        })
+    }
+
+    /// Resolves a file in a lighting subdirectory by its path relative to
+    /// it, at any depth: kept inside the directory however it is spelled
+    /// (`..`, a symlink out).
     pub(crate) async fn resolve_lighting_file(
         &self,
-        kind: LightingDirKind,
-        name: &str,
+        kind: Kind,
+        file: &str,
     ) -> Result<std::path::PathBuf, McpError> {
-        validate_lighting_dir_filename(kind, name)?;
+        use crate::webui::safe_path::{SafePath, VerifiedRoot};
         let dir = self.resolve_lighting_dir(kind).await?;
-        Ok(dir.join(name))
+        let root = VerifiedRoot::new(&dir).map_err(safepath_err)?;
+        let path = SafePath::resolve(&dir.join(file), &root).map_err(safepath_err)?;
+        Ok(path.as_path().to_path_buf())
     }
 
     /// Rescans songs from disk and rebuilds the player's playlists. Used after
     /// any tool that creates, edits, or removes a song file so subsequent
     /// `list_songs` / `read_song` / `write_song_lighting` calls see the new
-    /// state without requiring an mtrack restart. Mirrors the resolution
-    /// logic in `cli::local::start`.
-    pub(crate) async fn reload_songs_from_config(&self) -> Result<(), McpError> {
-        let store = self.config_store()?;
-        let config_path = store.path().to_path_buf();
-        let cfg = store.read_config().await;
+    /// state without requiring an mtrack restart. Reads the player's song
+    /// sources, as every surface's reload does, and reports a reload that
+    /// failed: every write tool reported success while the player kept
+    /// stale songs.
+    pub(crate) async fn reload_player_songs(&self) -> Result<(), McpError> {
+        self.player.reload_songs().await.map_err(|e| {
+            McpError::internal_error(
+                format!("the change was written, but the player could not reload its songs: {e}"),
+                None,
+            )
+        })
+    }
 
-        // Resolved, like songs_root_verified: the configured spelling is not
-        // always usable now that the stray intermediate is not created, and a
-        // rescan that fails here only logs a warning -- every write tool would
-        // report success while the player kept stale songs.
-        let songs_path = crate::util::resolved_dir(&cfg.songs(&config_path));
-        let playlists_dir = cfg
-            .playlists_dir(&config_path)
-            .or_else(|| Some(crate::util::project_dir_of(&config_path).join("playlists")));
+    /// Checks a playlist about to be written: that it parses, and that its
+    /// transitions do and name tracks their songs have, as the player will
+    /// when it loads it, that no fade outlasts the song it plays under, that
+    /// every song it names exists (the player drops a playlist naming one
+    /// that does not), and that its ambient show is inside the project.
+    async fn validate_playlist(&self, yaml: &str) -> Result<(), McpError> {
+        let config: crate::config::Playlist = serde_yaml_from_str(yaml)?;
+        web(playlists::check_playlist(&config, &self.player)).await
+    }
 
-        let legacy_playlist_path = cfg.playlist().map(|rel| {
-            if rel.is_absolute() {
-                rel
-            } else {
-                crate::util::project_dir_of(&config_path).join(rel)
+    /// The file a playlist save writes. With a `name`, the web UI's rule
+    /// ([`playlists::playlist_file_to_write`]) in the playlists directory
+    /// the loader reads; with none, the top-level `playlist:` file. Nothing
+    /// is made: [`playlists::write_playlist_file`] makes the directory,
+    /// inside the project, once the save is checked.
+    async fn playlist_file_to_write(
+        &self,
+        name: Option<&str>,
+    ) -> Result<crate::util::NamedFile, McpError> {
+        let sources = self.playlist_sources().await?;
+        match name {
+            Some(name) => {
+                let dir = sources.playlists_dir.ok_or_else(|| {
+                    McpError::invalid_params("no playlists directory configured", None)
+                })?;
+                web(playlists::playlist_file_to_write(&dir, name).await).await
             }
-        });
+            None => {
+                let path = sources.legacy_playlist.ok_or_else(|| {
+                    McpError::invalid_params("no top-level playlist file configured", None)
+                })?;
+                // Written whether or not it is there yet, as the config
+                // names it; its directory made by `write_playlist_file`.
+                Ok(crate::util::NamedFile::Found(path))
+            }
+        }
+    }
 
-        self.player.reload_songs(
-            &songs_path,
-            playlists_dir.as_deref(),
-            legacy_playlist_path.as_deref(),
-        );
-        Ok(())
+    /// Writes a song's light show `source` to `path` by the web UI's rule
+    /// ([`lighting_api::save_light_show`]): inside the songs root, against
+    /// the tempo `song` loads it with, its `include`s kept inside the songs
+    /// root.
+    async fn save_light_show(
+        &self,
+        song: &crate::songs::Song,
+        path: &std::path::Path,
+        source: String,
+    ) -> Result<(), McpError> {
+        let store = self.config_store()?;
+        let root = self.songs_root_verified().await?;
+        let shown = shown_in(root.as_path(), path);
+        answered(
+            lighting_api::save_light_show(
+                &self.player.layers(),
+                store.path(),
+                &root,
+                path,
+                &shown,
+                source,
+                song_lighting_tempo(song).as_ref(),
+            )
+            .await,
+        )
     }
 
     /// Resolves a playlist file path. With `None`, returns the top-level
     /// `playlist:` file referenced from the config. With `Some(name)`, returns
-    /// `<playlists_dir>/<name>.yaml` (after validating `name`).
+    /// the file in the playlists directory that holds it
+    /// (`playlist::playlist_file`: its `.yaml`, else its `.yml`, else a new
+    /// `.yaml`), after validating `name`; the player's own `all_songs` has
+    /// none, and a new file named as one there but for case is refused.
+    /// Whether it exists is the directory listing's answer.
     pub(crate) async fn resolve_playlist_path(
         &self,
         name: Option<&str>,
-    ) -> Result<std::path::PathBuf, McpError> {
-        let store = self.config_store()?;
-        let config_path = store.path().to_path_buf();
-        let cfg = store.read_config().await;
+    ) -> Result<PlaylistTarget, McpError> {
+        let sources = self.playlist_sources().await?;
         match name {
             Some(n) => {
                 crate::webui::safe_path::SafePath::validate_name(n).map_err(safepath_err)?;
-                let dir = cfg.playlists_dir(&config_path).ok_or_else(|| {
-                    McpError::invalid_params(
-                        "no playlists_dir configured; cannot resolve named playlist",
-                        None,
-                    )
+                // The directory the loader reads: `SongSources` already
+                // defaults it to `playlists/` beside the config.
+                let dir = sources.playlists_dir.ok_or_else(|| {
+                    McpError::invalid_params("no playlists directory configured", None)
                 })?;
-                Ok(dir.join(format!("{n}.yaml")))
+                crate::playlist::playlist_file(&dir, n)
+                    .map(PlaylistTarget::Named)
+                    .map_err(|e| McpError::invalid_params(e.to_string(), None))
             }
-            None => {
-                let rel = cfg.playlist().ok_or_else(|| {
+            None => sources
+                .legacy_playlist
+                .map(PlaylistTarget::Legacy)
+                .ok_or_else(|| {
                     McpError::invalid_params("no top-level playlist file configured", None)
-                })?;
-                if rel.is_absolute() {
-                    Ok(rel)
-                } else {
-                    Ok(crate::util::project_dir_of(&config_path).join(rel))
-                }
-            }
+                }),
         }
     }
 }
 
-/// Parses an `Option<T>` from a JSON value, accepting `null` as `None`.
-pub(crate) fn parse_optional<T: for<'de> serde::Deserialize<'de>>(
-    value: Value,
-) -> Result<Option<T>, McpError> {
-    if value.is_null() {
-        return Ok(None);
+impl McpServer {
+    /// The playlists the player reloads from, so a playlist written here
+    /// is one it picks up: the command line's legacy playlist included.
+    async fn playlist_sources(&self) -> Result<crate::player::SongSources, McpError> {
+        let store = self.config_store()?;
+        Ok(match self.player.song_sources() {
+            Some(sources) => sources,
+            None => {
+                crate::player::SongSources::resolve(&store.read_config().await, store.path(), None)
+            }
+        })
     }
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|e| McpError::invalid_params(format!("invalid payload: {e}"), None))
 }
 
-/// Returns a tool response containing the updated config YAML and new checksum.
-pub(crate) fn snapshot_response(snapshot: &crate::config::store::ConfigSnapshot) -> CallToolResult {
-    ok_json(json!({
+/// The file a playlist tool acts on: the top-level `playlist:` file the
+/// config names, or a named playlist's file as the playlists directory's
+/// listing has it.
+pub(crate) enum PlaylistTarget {
+    Legacy(std::path::PathBuf),
+    Named(crate::util::NamedFile),
+}
+
+impl PlaylistTarget {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            PlaylistTarget::Legacy(path) => path,
+            PlaylistTarget::Named(file) => file.path(),
+        }
+    }
+}
+
+impl McpServer {
+    /// Saves `section` from the tool's body, then applies it.
+    async fn update_section(
+        &self,
+        section: ConfigSection,
+        args: UpdateConfigArgs,
+    ) -> Result<CallToolResult, McpError> {
+        let snapshot = self
+            .config_store()?
+            .update_section(section, args.body, &args.expected_checksum)
+            .await
+            .map_err(config_err)?;
+        self.reload_and_respond(snapshot).await
+    }
+
+    /// Applies a saved config change to the running hardware and answers
+    /// with the new snapshot, as every surface's config change does. A
+    /// change saved here was otherwise not applied until something else
+    /// reloaded the hardware or mtrack restarted. While a song plays or is
+    /// paused the reload waits for the player to be idle, and a reload that
+    /// fails leaves the change for the next one; the reply says either with
+    /// `applied: false` and a `message`. Controllers are restarted only by a
+    /// change to them.
+    async fn reload_and_respond(
+        &self,
+        snapshot: crate::config::store::ConfigSnapshot,
+    ) -> Result<CallToolResult, McpError> {
+        let outcome = self.player.apply_config_change().await;
+        Ok(snapshot_response(&snapshot, &outcome))
+    }
+}
+
+/// Returns a tool response containing the updated config YAML and new
+/// checksum, and whether the change has been applied to the hardware.
+pub(crate) fn snapshot_response(
+    snapshot: &crate::config::store::ConfigSnapshot,
+    outcome: &crate::player::ConfigChange,
+) -> CallToolResult {
+    let mut response = json!({
         "yaml": snapshot.yaml,
         "checksum": snapshot.checksum,
-    }))
+        "applied": outcome.applied(),
+    });
+    if let Some(message) = outcome.message() {
+        response["message"] = json!(message);
+    }
+    if let Some(songs_error) = &outcome.songs_error {
+        response["songs_error"] = json!(songs_error);
+    }
+    ok_json(response)
 }
 
 /// Parses a YAML string into `T`, returning an MCP `invalid_params` error.
@@ -3662,6 +4158,24 @@ pub(crate) fn safepath_err(err: crate::webui::safe_path::SafePathError) -> McpEr
     McpError::invalid_params(err.to_string(), None)
 }
 
+/// [`find_song_lighting_path`], or the one error every lighting-file tool
+/// gives for a file the song does not have.
+fn existing_song_lighting_path(
+    song: &crate::songs::Song,
+    song_name: &str,
+    file: &str,
+) -> Result<std::path::PathBuf, McpError> {
+    find_song_lighting_path(song, file).ok_or_else(|| {
+        McpError::invalid_params(
+            format!(
+                "song `{song_name}` has no lighting file named `{file}` — check the song's \
+                 `lighting:` block for the exact filename it references"
+            ),
+            None,
+        )
+    })
+}
+
 /// Resolves a lighting filename to its on-disk path, searching three
 /// locations in priority order:
 ///
@@ -3670,7 +4184,8 @@ pub(crate) fn safepath_err(err: crate::webui::safe_path::SafePathError) -> McpEr
 /// 2. The conventional `<song>/lighting/<file>` subdirectory location.
 /// 3. The song's root directory `<song>/<file>`.
 ///
-/// Returns the first location that exists, or `None` if the file lives
+/// Returns the first location that exists (a link counts, even one leading
+/// nowhere), or `None` if the file lives
 /// nowhere. Used by read/patch (which expect an existing file) and by
 /// write (to preserve an existing layout instead of overwriting it with a
 /// new file in a different place).
@@ -3690,79 +4205,60 @@ pub(crate) fn find_song_lighting_path(
     }
     // (2) The conventional `lighting/` subdirectory (existing draft files
     // an author has written but not yet referenced from song.yaml).
+    // A link there counts, even one leading nowhere, as the web UI's
+    // delete finds it: it can be deleted, and is refused for writing.
+    let there = |path: &std::path::Path| std::fs::symlink_metadata(path).is_ok();
     let lighting_dir = song.base_path().join("lighting").join(file);
-    if lighting_dir.exists() {
+    if there(&lighting_dir) {
         return Some(lighting_dir);
     }
     // (3) Root-level (Esaweg-style flat layout).
     let root_level = song.base_path().join(file);
-    if root_level.exists() {
+    if there(&root_level) {
         return Some(root_level);
     }
     None
 }
 
-/// Returns true if the song was loaded from `<dir>/song.yaml` (the
-/// directory-layout convention) rather than `<dir>/<name>.yaml` (flat
-/// layout). Used by the lighting writer to decide whether
+/// Where `write_song_lighting` writes an existing file: as
+/// [`find_song_lighting_path`], except that an unreferenced file at the root
+/// of a directory-layout song is not reused. That is a stray (an old draft
+/// beside `song.yaml`), not a location anyone chose for this show — reusing it
+/// put one song's show at the root while every other new show went under
+/// `lighting/` (#516). A referenced root-level file is still reused: it was
+/// loaded. In flat layout the root-level file is the documented way to pick
+/// a location, so it is kept.
+fn find_song_lighting_write_path(
+    song: &crate::songs::Song,
+    file: &str,
+) -> Option<std::path::PathBuf> {
+    let path = find_song_lighting_path(song, file)?;
+    let unreferenced_root = path == song.base_path().join(file)
+        && !song
+            .dsl_lighting_shows()
+            .iter()
+            .any(|s| s.file_path() == path);
+    if unreferenced_root && is_directory_layout(song) {
+        return None;
+    }
+    Some(path)
+}
+
+/// Returns true if the song was loaded from `<dir>/song.yaml` or
+/// `<dir>/song.yml` (the directory-layout convention,
+/// [`crate::songs::is_song_config_name`]) rather than `<dir>/<name>.yaml`
+/// (flat layout). Used by the lighting writer to decide whether
 /// `song.base_path()` names a per-song directory it can safely create
 /// children under.
 fn is_directory_layout(song: &crate::songs::Song) -> bool {
     song.config_path()
-        .and_then(|p| p.file_name())
-        .map(|n| n == "song.yaml")
-        .unwrap_or(false)
+        .is_some_and(crate::songs::is_song_config_name)
 }
 
 /// Validates that `name` is a single path segment ending in `.light`.
-/// A fixture-type or venue file name: `.light`, or the directory's typed
-/// peer extension (`.fixture` / `.venue`).
-pub(crate) fn validate_lighting_dir_filename(
-    kind: LightingDirKind,
-    name: &str,
-) -> Result<(), McpError> {
-    crate::webui::safe_path::SafePath::validate_name(name).map_err(safepath_err)?;
-    let typed = kind.typed_extension();
-    if !name.ends_with(".light") && !name.ends_with(&format!(".{typed}")) {
-        return Err(McpError::invalid_params(
-            format!(
-                "{} filename must end with .light or .{typed}",
-                kind.field_name()
-            ),
-            None,
-        ));
-    }
-    Ok(())
-}
-
-/// The extension is the version marker: rich channel syntax (fine bytes,
-/// ranges, functions) is the v2 DSL and lives in `.fixture` files.
-fn refuse_rich_channels_in_light<'a>(
-    file: &str,
-    types: impl Iterator<Item = &'a crate::lighting::types::FixtureType>,
-) -> Result<(), McpError> {
-    if !file.ends_with(".light") {
-        return Ok(());
-    }
-    for fixture_type in types {
-        if fixture_type.uses_rich_channels() {
-            return Err(McpError::invalid_params(
-                format!(
-                    "fixture type \"{}\" uses rich channel syntax (fine, range, functions), \
-                     which belongs in a .fixture file — write it as {} instead",
-                    fixture_type.name(),
-                    file.trim_end_matches(".light").to_string() + ".fixture"
-                ),
-                None,
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_lighting_filename(name: &str) -> Result<(), McpError> {
     crate::webui::safe_path::SafePath::validate_name(name).map_err(safepath_err)?;
-    if !name.ends_with(".light") {
+    if !crate::songs::FileKind::is_lighting(std::path::Path::new(name)) {
         return Err(McpError::invalid_params(
             "lighting filename must end with .light",
             None,
@@ -3779,35 +4275,20 @@ struct GroupSnapshot {
     logical_defs: Vec<(String, Vec<String>)>,
 }
 
-/// Identifies one of the two lighting subdirectories configured under
-/// `lighting.directories`. Used by the venue / fixture-type tools.
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum LightingDirKind {
-    Venues,
-    FixtureTypes,
-}
-
-impl LightingDirKind {
-    /// The extension of the directory's typed files, a peer of `.light`.
-    pub(crate) fn typed_extension(self) -> &'static str {
-        match self {
-            LightingDirKind::Venues => "venue",
-            LightingDirKind::FixtureTypes => "fixture",
-        }
-    }
-
-    pub(crate) fn field_name(self) -> &'static str {
-        match self {
-            LightingDirKind::Venues => "venues",
-            LightingDirKind::FixtureTypes => "fixture_types",
-        }
-    }
-}
-
 /// Applies a string-replacement patch with the same semantics as Claude Code's
 /// `Edit` tool: `old_string` must be present; if it occurs more than once and
 /// `replace_all` is false, the patch is rejected so the caller can disambiguate
 /// by adding context. Returns the new file contents.
+impl PatchFields {
+    fn of(old_string: &str, new_string: &str, replace_all: bool) -> Self {
+        PatchFields {
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+            replace_all,
+        }
+    }
+}
+
 pub(crate) fn apply_patch(content: &str, patch: &PatchFields) -> Result<String, McpError> {
     if patch.old_string.is_empty() {
         return Err(McpError::invalid_params(
@@ -3857,68 +4338,299 @@ pub(crate) fn patch_response(path: &std::path::Path, before: &str, after: &str) 
 }
 
 /// Reads a file as UTF-8, returning an MCP-friendly error on I/O failure.
-pub(crate) async fn read_text(path: &std::path::Path) -> Result<String, McpError> {
-    tokio::fs::read_to_string(path).await.map_err(|e| {
-        McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
-    })
-}
-
-/// Lists `.light` files directly under `dir` (no recursion). Subdirectories
-/// and other extensions are skipped silently.
-pub(crate) async fn list_light_files(
-    dir: &std::path::Path,
-    kind: LightingDirKind,
-) -> Result<Vec<String>, McpError> {
-    let typed = kind.typed_extension();
-    let mut out = Vec::new();
-    let mut entries = tokio::fs::read_dir(dir).await.map_err(|e| {
-        McpError::internal_error(format!("failed to list {}: {e}", dir.display()), None)
-    })?;
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| McpError::internal_error(format!("read_dir entry: {e}"), None))?
-    {
-        let path = entry.path();
-        let extension = path.extension().and_then(|e| e.to_str());
-        if path.is_file() && (extension == Some("light") || extension == Some(typed)) {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// Writes a string to `path` the same way the config store does, preserving the
-/// file's ownership and staging the content so an interrupted write stays
-/// recoverable (see [`crate::util::write_file`]).
-pub(crate) async fn staged_write_string(
-    path: &std::path::Path,
-    content: &str,
-) -> Result<(), McpError> {
+///
+/// Read as [`crate::util::read_file`] reads, in turn with the writers: a
+/// save rewrites a file in place, and a plain read midway through it finds
+/// the file empty or short (#578).
+/// Reads a song's light show `path` (named `file`), as `read_song_lighting`
+/// and `patch_song_lighting` both do: a link that leads nowhere, which
+/// the lookup finds so that it can be deleted, is refused as one, not
+/// failed as an unreadable file.
+async fn read_song_show(path: &std::path::Path, file: &str) -> Result<String, McpError> {
     let owned = path.to_path_buf();
-    let content = content.to_string();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let parent = owned
-            .parent()
-            .ok_or_else(|| std::io::Error::other("path has no parent"))?;
-        crate::util::create_dir_all(parent)?;
-        crate::util::write_file(&owned, content.as_bytes())
+    let dangling = tokio::task::spawn_blocking(move || {
+        std::fs::symlink_metadata(&owned).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::metadata(&owned).is_err()
     })
     .await
-    .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?
-    .map_err(|e| {
-        let mut message = format!("write failed: {e}");
-        if let Some(hint) =
-            crate::util::write_failure_hint(crate::util::WriteTarget::File(path), &e)
-        {
-            message.push(' ');
-            message.push_str(&hint);
-        }
-        McpError::internal_error(message, None)
+    .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?;
+    if dangling {
+        return Err(McpError::invalid_params(
+            format!("{file} is a link that leads nowhere; delete it or point it at a show"),
+            None,
+        ));
+    }
+    read_text(path).await
+}
+
+pub(crate) async fn read_text(path: &std::path::Path) -> Result<String, McpError> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::util::read_to_string(&owned))
+        .await
+        .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?
+        .map_err(|e| {
+            McpError::internal_error(format!("failed to read {}: {e}", path.display()), None)
+        })
+}
+
+/// A listing of one kind's directory as the loader reads it: every file
+/// (relative to `dir`, at any depth) and each name with its owner
+/// ([`lighting_writes::owners_listing`]).
+fn listing_of(
+    kind: Kind,
+    dir: &std::path::Path,
+    record: &crate::lighting::files::Record,
+) -> (Vec<String>, Value) {
+    let files = record
+        .files()
+        .iter()
+        .map(|read| crate::lighting::project_files::display_in(dir, &read.file))
+        .collect();
+    (files, lighting_writes::owners_listing(kind, dir, record))
+}
+
+/// An answer of the web UI's venue and fixture type writers as a tool
+/// error: the same message and body, `invalid_params` for a refusal and
+/// `internal_error` for a server-side failure, by the web API's status.
+fn answer_err(answer: lighting_writes::Answer) -> McpError {
+    let message = answer.message();
+    if answer.status.is_server_error() {
+        McpError::internal_error(message, Some(answer.body))
+    } else {
+        McpError::invalid_params(message, Some(answer.body))
+    }
+}
+
+/// A refusal of one of the web UI's song, playlist or light show writers,
+/// answered as its response, as the tool's error ([`answer_err`]).
+async fn response_err(response: axum::response::Response) -> McpError {
+    answer_err(lighting_writes::Answer::of_response(response).await)
+}
+
+/// Runs one of the web UI's venue and fixture type writers, which hold the
+/// venue write lock, off the async workers; a refusal as [`answer_err`].
+async fn save_by_name<T: Send + 'static>(
+    write: impl FnOnce() -> Result<T, lighting_writes::Answer> + Send + 'static,
+) -> Result<T, McpError> {
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|e| McpError::internal_error(format!("join error: {e}"), None))?
+        .map_err(answer_err)
+}
+
+/// A patch tool's string replacement as the writers' change of a file.
+fn patch_of(args: &PatchLightingFileArgs) -> lighting_writes::Patch {
+    let fields = PatchFields::of(&args.old_string, &args.new_string, args.replace_all);
+    Box::new(move |text| {
+        apply_patch(text, &fields).map_err(|e| lighting_writes::Answer::bad(e.message))
     })
+}
+
+/// A web UI writer's answer as the tool's: its refusal ([`response_err`]).
+async fn web<T>(result: Result<T, axum::response::Response>) -> Result<T, McpError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(response) => Err(response_err(response).await),
+    }
+}
+
+/// A light show writer's answer as the tool's: its refusal ([`answer_err`]).
+fn answered<T>(result: Result<T, lighting_writes::Answer>) -> Result<T, McpError> {
+    result.map_err(answer_err)
+}
+
+/// A song writer's refusal as the tool's ([`answer_err`]).
+fn song_web<T>(result: Result<T, songs_api::SongError>) -> Result<T, McpError> {
+    result.map_err(|e| answer_err(e.into()))
+}
+
+/// `path` as the web API names it: relative to `root`, with `/`.
+fn shown_in(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+impl McpServer {
+    /// The tools, with the descriptions built from the player's own lists:
+    /// `update_controllers` names the kinds [`crate::config::ControllerKind`]
+    /// has.
+    fn router() -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        if let Some(route) = router.map.get_mut("update_controllers") {
+            let description = format!(
+                "{} Kinds: {}.",
+                route.attr.description.as_deref().unwrap_or_default(),
+                crate::config::ControllerKind::names()
+            );
+            route.attr.description = Some(description.into());
+        }
+        router
+    }
+}
+
+#[cfg(test)]
+mod update_controllers_description_tests {
+    use crate::config::{Controller, ControllerKind};
+    use strum::VariantArray;
+
+    /// A controller of each kind. The match is exhaustive, so a new kind
+    /// needs a sample here before this compiles.
+    fn sample(kind: ControllerKind) -> Controller {
+        match kind {
+            ControllerKind::Ble => Controller::Ble(crate::config::BleController::default()),
+            ControllerKind::Grpc => Controller::Grpc(crate::config::GrpcController::new(1)),
+            ControllerKind::Mcp => Controller::Mcp(crate::config::McpController::new(1)),
+            ControllerKind::Midi => {
+                let event = || crate::config::midi::note_on(1, 0, 127);
+                Controller::Midi(crate::config::MidiController::new(
+                    event(),
+                    event(),
+                    event(),
+                    event(),
+                    event(),
+                    event(),
+                ))
+            }
+            ControllerKind::Multi => Controller::Multi(Default::default()),
+            ControllerKind::Osc => Controller::Osc(Box::default()),
+        }
+    }
+
+    #[test]
+    fn the_description_names_every_controller_kind_by_its_tag() {
+        let router = super::McpServer::router();
+        let description = router
+            .get("update_controllers")
+            .and_then(|tool| tool.description.clone())
+            .expect("update_controllers has a description");
+        for &kind in ControllerKind::VARIANTS {
+            let controller = sample(kind);
+            assert_eq!(controller.kind(), kind);
+            // The name is the tag serde writes.
+            let tagged = serde_json::to_value(&controller).unwrap();
+            assert_eq!(tagged["kind"], kind.name());
+            assert!(
+                description.contains(&format!("`{}`", kind.name())),
+                "{description}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_response_tests {
+    use crate::player::ConfigApply;
+
+    fn reply(outcome: ConfigApply) -> serde_json::Value {
+        let snapshot = crate::config::store::ConfigSnapshot {
+            config: crate::config::Player::default(),
+            yaml: "songs: songs\n".to_string(),
+            checksum: "abc".to_string(),
+        };
+        let result =
+            serde_json::to_value(super::snapshot_response(&snapshot, &outcome.into())).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// A config change's reply says what became of it on the hardware, as
+    /// the web UI's and gRPC's do. A reload that failed after the save used
+    /// to answer with an error, leaving the client without the new checksum
+    /// of a change that was saved.
+    #[test]
+    fn a_config_changes_reply_says_what_became_of_it() {
+        let applied = reply(ConfigApply::Applied);
+        assert_eq!(applied["applied"], true);
+        assert_eq!(applied["checksum"], "abc");
+        assert!(applied.get("message").is_none());
+        let deferred = reply(ConfigApply::Deferred);
+        assert_eq!(deferred["applied"], false);
+        assert!(deferred["message"].as_str().unwrap().contains("idle"));
+        let failed = reply(ConfigApply::Failed("no store".into()));
+        assert_eq!(failed["applied"], false);
+        assert_eq!(failed["checksum"], "abc", "the save's checksum");
+        assert!(failed["message"].as_str().unwrap().contains("no store"));
+    }
+}
+
+#[cfg(test)]
+mod parse_duration_tests {
+    #[test]
+    fn a_position_formats_as_minutes_seconds_and_whole_milliseconds() {
+        let format = super::format_duration;
+        assert_eq!(format(std::time::Duration::from_millis(83_456)), "1:23.456");
+        assert_eq!(
+            format(std::time::Duration::from_micros(119_999_900)),
+            "1:59.999"
+        );
+        assert_eq!(format(std::time::Duration::ZERO), "0:00.000");
+    }
+
+    #[test]
+    fn a_duration_too_large_to_hold_is_turned_down() {
+        assert_eq!(
+            super::parse_duration("90s").unwrap(),
+            std::time::Duration::from_secs(90)
+        );
+        // Finite, but more seconds than a duration holds: it panicked.
+        assert!(super::parse_duration("1e30").is_err());
+        assert!(super::parse_duration("999999999999999999:00").is_err());
+    }
+}
+
+#[cfg(test)]
+mod read_text_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_text_never_sees_a_file_midway_through_a_save() {
+        // #578: a plain read, between a save truncating the file and
+        // writing it back, found it empty or short.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.yaml");
+        let body =
+            "name: S\ntracks:\n".to_string() + &"  - name: t\n    file: t.wav\n".repeat(2000);
+        crate::util::write_file(&path, body.as_bytes()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (path, body, stop) = (path.clone(), body.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    crate::util::write_file(&path, body.as_bytes()).unwrap();
+                }
+            })
+        };
+        let mut torn = 0;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if super::read_text(&path).await.unwrap() != body {
+                torn += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(torn, 0, "read_text read a torn song.yaml {torn} times");
+    }
+}
+
+#[cfg(test)]
+mod validate_lighting_filename_tests {
+    use super::validate_lighting_filename;
+
+    /// A song's light show name is read by the one rule, in any case.
+    #[test]
+    fn a_light_show_is_one_in_any_case() {
+        for name in ["show.light", "Show.LIGHT", "Show.Light"] {
+            assert!(validate_lighting_filename(name).is_ok(), "{name}");
+        }
+        for name in ["show.lights", "show.txt", "show", "../show.light"] {
+            assert!(validate_lighting_filename(name).is_err(), "{name}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3958,10 +4670,10 @@ mod unregister_lighting_tests {
     }
 
     #[test]
-    fn handles_the_multi_line_quoted_form_the_shipped_songs_use() {
-        // examples/songs/dsl-light-show-song/song.yaml writes entries as
-        // `- name: "..."` with `file:` on the next line, quoted and indented
-        // two spaces. Matching only the `-` line misses the path entirely.
+    fn handles_the_multi_line_quoted_form_hand_written_songs_use() {
+        // Hand-written songs commonly write entries as `- name: "..."` with
+        // `file:` on the next line, quoted and indented two spaces (`name` is
+        // ignored by the loader). Matching only the `-` line misses the path.
         let block = [
             "lighting:",
             "  - name: \"Main Show\"",
@@ -4169,7 +4881,51 @@ mod register_lighting_tests {
 
 #[cfg(test)]
 mod bpm_tests {
-    use super::{compute_bpm_from_beats, compute_tempo_segments};
+
+    /// An argument a tool does not take is refused, naming the ones it does:
+    /// `play_song_from` took `position` for `start_time` without a word and
+    /// played from the top.
+    #[test]
+    fn an_unknown_argument_is_refused() {
+        let refused = serde_json::from_value::<crate::controller::mcp::service::PlaySongFromArgs>(
+            serde_json::json!({
+                "song_name": "Song",
+                "position": "0:52",
+            }),
+        )
+        .expect_err("an unknown argument was accepted");
+        let message = refused.to_string();
+        assert!(message.contains("position"), "{message}");
+        assert!(message.contains("start_time"), "{message}");
+
+        // The patch tools too, which take the patch fields themselves.
+        let refused = serde_json::from_value::<crate::controller::mcp::service::PatchSongArgs>(
+            serde_json::json!({
+                "name": "Song",
+                "old_string": "a",
+                "new_string": "b",
+                "replace_al": true,
+            }),
+        )
+        .expect_err("an unknown patch argument was accepted");
+        assert!(refused.to_string().contains("replace_al"));
+        let patch = serde_json::from_value::<crate::controller::mcp::service::PatchSongArgs>(
+            serde_json::json!({
+                "name": "Song",
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        )
+        .expect("the patch fields are taken");
+        assert!(!patch.replace_all);
+    }
+
+    use super::{
+        compute_bpm_from_beats, compute_bpm_from_intervals, compute_tempo_segments,
+        compute_tempo_segments_from, quarter_note_intervals,
+    };
+    use crate::audio::click_analysis::BeatGrid;
+    use crate::tempo::{TempoMap, TimeSignature};
 
     #[test]
     fn empty_or_singleton_yields_none() {
@@ -4286,11 +5042,1180 @@ mod bpm_tests {
         );
     }
 
+    /// A grid of `bars` bars at `clicks` clicks each, `spacing` seconds apart,
+    /// with `odd_bar` (if any) clicked `odd_clicks` times across the same span.
+    fn bar_grid(bars: usize, clicks: usize, spacing: f64, odd: Option<(usize, usize)>) -> BeatGrid {
+        let bar_len = clicks as f64 * spacing;
+        let mut beats = Vec::new();
+        let mut measure_starts = Vec::new();
+        for bar in 0..bars {
+            measure_starts.push(beats.len());
+            let n = match odd {
+                Some((b, n)) if b == bar => n,
+                _ => clicks,
+            };
+            for k in 0..n {
+                beats.push(bar as f64 * bar_len + k as f64 * bar_len / n as f64);
+            }
+        }
+        beats.push(bars as f64 * bar_len);
+        measure_starts.push(beats.len() - 1);
+        BeatGrid {
+            beats,
+            measure_starts,
+        }
+    }
+
+    fn twelve_eight() -> TempoMap {
+        TempoMap::new(
+            std::time::Duration::ZERO,
+            169.0,
+            TimeSignature::new(12, 8),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn a_dotted_quarter_click_reports_the_quarter_note_tempo() {
+        // 12/8 at 169: four dotted-quarter clicks a bar at 112.67 (#515).
+        let grid = bar_grid(16, 4, 60.0 / (169.0 / 1.5), None);
+        let (intervals, weights) = quarter_note_intervals(&grid, &twelve_eight()).unwrap();
+        let bpm = compute_bpm_from_intervals(&intervals).unwrap();
+        assert!((bpm - 169.0).abs() < 0.01, "{bpm}");
+        let segments = compute_tempo_segments_from(&grid.beats, &intervals, &weights);
+        assert_eq!(bpms(&segments), vec![169.0]);
+        // Read raw, the same grid is the click rate.
+        assert_eq!(
+            compute_bpm_from_beats(&grid.beats).map(f64::round),
+            Some(113.0)
+        );
+    }
+
+    #[test]
+    fn a_bar_of_eighth_clicks_is_still_the_same_tempo() {
+        // One bar clicked on the eighth (12 clicks) in a dotted-quarter song:
+        // the click rate triples, the tempo does not move.
+        let grid = bar_grid(16, 4, 60.0 / (169.0 / 1.5), Some((8, 12)));
+        let (intervals, weights) = quarter_note_intervals(&grid, &twelve_eight()).unwrap();
+        let segments = compute_tempo_segments_from(&grid.beats, &intervals, &weights);
+        assert_eq!(bpms(&segments), vec![169.0], "{segments:?}");
+    }
+
+    #[test]
+    fn a_short_jittery_fragment_joins_the_tempo_it_belongs_to() {
+        // A long 120 section, then a 160 section whose first few beats read a
+        // little fast (eighth clicks quantized by the detector). The fragment
+        // is shorter than the noise threshold and belongs to the 160, not to
+        // the longer 120 beside it — the section change stays where it is.
+        let mut beats = Vec::new();
+        let t = extend_at(&mut beats, 0.0, 120.0, 40);
+        let change = t;
+        let t = extend_at(&mut beats, t, 166.0, 4);
+        extend_at(&mut beats, t, 160.0, 12);
+        let segments = compute_tempo_segments(&beats);
+        assert_eq!(bpms(&segments), vec![120.0, 160.0], "{segments:?}");
+        let start = segments[1]["start_seconds"].as_f64().unwrap();
+        assert!(
+            (start - change).abs() < 0.6,
+            "the 160 section should start at the change ({change}), got {start}"
+        );
+    }
+
     #[test]
     fn segments_handle_too_few_beats() {
         // Anything below the smoothing window simply returns no segments
         // rather than panicking or emitting noise.
         assert!(compute_tempo_segments(&[]).is_empty());
         assert!(compute_tempo_segments(&[0.0, 0.5]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod directory_layout_tests {
+    /// A song loaded from `<dir>/song.yml` is in the directory layout, as
+    /// one from `<dir>/song.yaml` is; one from `<root>/<name>.yaml` is flat.
+    #[test]
+    fn song_yml_is_the_directory_layout() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        for (dir, file) in [("A", "song.yaml"), ("B", "song.yml")] {
+            std::fs::create_dir(root.path().join(dir))?;
+            std::fs::write(
+                root.path().join(dir).join(file),
+                format!("name: {dir}\ntracks: []\n"),
+            )?;
+        }
+        std::fs::write(root.path().join("flat.yaml"), "name: Flat\ntracks: []\n")?;
+        let songs = crate::songs::get_all_songs(root.path())?;
+        assert!(super::is_directory_layout(&*songs.get("A")?));
+        assert!(super::is_directory_layout(&*songs.get("B")?));
+        assert!(!super::is_directory_layout(&*songs.get("Flat")?));
+        Ok(())
+    }
+}
+
+/// The venue and fixture type tools, by name, by the web UI's rules
+/// ([`lighting_writes`]), in the host's profile's directories.
+#[cfg(test)]
+mod lighting_tool_tests {
+    use super::*;
+    use crate::controller::mcp::integration_test::{
+        build_standalone_player, setup_standalone_fixture, StandaloneFixture,
+    };
+    use std::path::Path;
+
+    /// A player whose config gives this host's profile `rig/venues` and
+    /// `rig/types`, after a profile for another host naming others; `files`
+    /// (path under the project, text) written first.
+    async fn server(files: &[(&str, &str)]) -> (McpServer, StandaloneFixture) {
+        let fixture = setup_standalone_fixture().expect("fixture");
+        let yaml = format!(
+            r#"songs: {songs}
+playlist: {playlist}
+profiles:
+  - hostname: not-this-host-x9
+    audio:
+      device: "mock-device"
+    dmx:
+      universes:
+        - universe: 1
+          name: other
+      lighting:
+        directories:
+          fixture_types: other/types
+          venues: other/venues
+  - audio:
+      device: "mock-device"
+    dmx:
+      universes:
+        - universe: 1
+          name: rig
+      lighting:
+        directories:
+          fixture_types: rig/types
+          venues: rig/venues
+"#,
+            songs = fixture.root.join("songs").display(),
+            playlist = fixture.root.join("playlist.yaml").display(),
+        );
+        std::fs::write(&fixture.config_path, yaml).unwrap();
+        for (path, text) in files {
+            let path = fixture.root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let player = build_standalone_player(&fixture).await.expect("player");
+        (McpServer::new(player), fixture)
+    }
+
+    /// A tool's JSON answer.
+    fn answer(result: Result<CallToolResult, McpError>) -> Value {
+        let result = result.unwrap_or_else(|e| panic!("tool failed: {e:?}"));
+        let value = serde_json::to_value(&result).unwrap();
+        serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+
+    /// A tool's refusal message.
+    fn refusal(result: Result<CallToolResult, McpError>) -> String {
+        match result {
+            Ok(ok) => panic!("expected a refusal, got {ok:?}"),
+            Err(e) => e.message.to_string(),
+        }
+    }
+
+    fn venue(name: &str, extra: &str) -> String {
+        format!("venue \"{name}\" {{\n  fixture \"A\" Par{extra} @ 1:1\n}}\n")
+    }
+
+    fn par(name: &str, channels: u8) -> String {
+        format!(
+            "fixture_type \"{name}\" {{\n  channels: {channels}\n  channel_map: {{ \"dimmer\": 1 }}\n}}\n"
+        )
+    }
+
+    fn rich(name: &str) -> String {
+        format!(
+            "fixture_type \"{name}\" {{\n  channel \"pan\" @ 1 fine 2 range -270deg..270deg\n}}\n"
+        )
+    }
+
+    fn write_venue_args(name: &str, source: String, from: Option<&str>) -> WriteVenueArgs {
+        WriteVenueArgs {
+            name: name.to_string(),
+            source,
+            from: from.map(str::to_string),
+        }
+    }
+
+    fn write_type_args(name: &str, source: String, from: Option<&str>) -> WriteFixtureTypeArgs {
+        WriteFixtureTypeArgs {
+            name: name.to_string(),
+            source,
+            from: from.map(str::to_string),
+            ext: None,
+        }
+    }
+
+    fn patch_args(name: &str, old: &str, new: &str) -> PatchLightingFileArgs {
+        PatchLightingFileArgs {
+            name: name.to_string(),
+            old_string: old.to_string(),
+            new_string: new.to_string(),
+            replace_all: false,
+        }
+    }
+
+    fn name_args(name: &str) -> LightingNameArgs {
+        LightingNameArgs {
+            name: name.to_string(),
+        }
+    }
+
+    fn read(root: &Path, path: &str) -> Option<String> {
+        std::fs::read_to_string(root.join(path)).ok()
+    }
+
+    const SHARED: &str = "venue \"A\" {\n}\nvenue \"B\" {\n}\n";
+    const SHARED_REASON: &str =
+        "Defined in tour/shared.light alongside venue \"B\"; edit that file by hand.";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_venue_listing_is_the_loaders_in_the_hosts_dir() {
+        let (server, fixture) = server(&[
+            ("rig/venues/tour/shared.light", SHARED),
+            ("rig/venues/old.light", &venue("Old", "")),
+            ("rig/venues/broken.venue", "venue \"Broken\" {"),
+            ("other/venues/ghost.venue", &venue("Ghost", "")),
+        ])
+        .await;
+        let listed = answer(server.list_venue_files().await);
+        assert!(
+            listed["dir"].as_str().unwrap().ends_with("rig/venues"),
+            "{listed}"
+        );
+        assert_eq!(
+            listed["files"],
+            json!(["broken.venue", "old.light", "tour/shared.light"]),
+            "{listed}"
+        );
+        let venues = listed["venues"].as_array().unwrap();
+        let of = |name: Option<&str>| {
+            venues
+                .iter()
+                .find(|v| v["name"].as_str() == name)
+                .unwrap_or_else(|| panic!("{name:?} in {listed}"))
+                .clone()
+        };
+        assert_eq!(of(Some("Old"))["editable"], true);
+        assert_eq!(of(Some("Old"))["file"], "old.light");
+        assert_eq!(of(Some("A"))["editable"], false);
+        assert_eq!(of(Some("A"))["reason"], SHARED_REASON);
+        assert_eq!(of(None)["file"], "broken.venue");
+        assert!(!listed.to_string().contains("Ghost"), "{listed}");
+
+        // Any file there is read by its path, nested too; nothing outside.
+        let nested = answer(
+            server
+                .read_venue(Parameters(LightingFileArgs {
+                    file: "tour/shared.light".to_string(),
+                }))
+                .await,
+        );
+        assert_eq!(nested["source"], SHARED);
+        let _ = refusal(
+            server
+                .read_venue(Parameters(LightingFileArgs {
+                    file: "../../other/venues/ghost.venue".to_string(),
+                }))
+                .await,
+        );
+        drop(fixture);
+    }
+
+    /// #689: `write_song` refuses a rename onto a name another song holds,
+    /// by the web UI's rule, and leaves the file; a save that keeps the
+    /// name, or renames onto a free one, is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_refuses_a_rename_onto_another_songs_name() {
+        let foo_yaml = "name: Foo\ntracks: []\n";
+        let (server, fixture) = server(&[("songs/foo/song.yaml", foo_yaml)]).await;
+        let foo = fixture.root.join("songs/foo/song.yaml");
+        let write = |yaml: &str| {
+            server.write_song(Parameters(WriteSongArgs {
+                name: "Foo".to_string(),
+                yaml: yaml.to_string(),
+            }))
+        };
+
+        let refused = refusal(write("name: DSL Light Show Song\ntracks: []\n").await);
+        assert!(refused.contains("already exists"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&foo).unwrap(), foo_yaml);
+
+        let kept = "name: Foo\ntracks: []\nloop_playback: true\n";
+        let _ = answer(write(kept).await);
+        assert_eq!(std::fs::read_to_string(&foo).unwrap(), kept);
+        let renamed = "name: Baz\ntracks: []\n";
+        let _ = answer(write(renamed).await);
+        assert_eq!(std::fs::read_to_string(&foo).unwrap(), renamed);
+        drop(fixture);
+    }
+
+    const FOO: &str = "name: Foo\ntracks: []\n";
+    const SHOW: &str =
+        "show \"Written\" {\n    @00:00.000\n    all_lights: static color: \"blue\", duration: 4s\n}\n";
+    const IN_VENUES: &str = "foo/lighting/show.light is in the venues directory (rig/venues): a venue is saved \
+                             by name, on the Lighting page or with MCP's venue tools; this endpoint \
+                             is for song light shows";
+
+    /// #675: `write_song` creates a new song as the web UI's create does:
+    /// a name the YAML declares that another song holds, or a body that is
+    /// not a song config, is refused before any folder is made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_creates_a_song_by_the_web_rules() {
+        let (server, fixture) = server(&[("songs/foo/song.yaml", FOO)]).await;
+        let write = |name: &str, yaml: &str| {
+            server.write_song(Parameters(WriteSongArgs {
+                name: name.to_string(),
+                yaml: yaml.to_string(),
+            }))
+        };
+
+        let taken = refusal(write("Fresh", FOO).await);
+        assert_eq!(
+            taken,
+            "a song named \"Foo\" already exists; choose another name"
+        );
+        let invalid = refusal(write("Fresh", "tracks: []\n").await);
+        assert!(!invalid.is_empty());
+        assert!(!fixture.root.join("songs/Fresh").exists(), "no folder made");
+
+        let _ = answer(write("Fresh", "name: Fresh\ntracks: []\n").await);
+        assert_eq!(
+            read(&fixture.root, "songs/Fresh/song.yaml").as_deref(),
+            Some("name: Fresh\ntracks: []\n")
+        );
+    }
+
+    /// A name that resolves to the songs root itself (`.`, ``, `Foo/..`)
+    /// is neither saved nor created: nothing is written in the songs root.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_refuses_a_name_resolving_to_the_songs_root() {
+        let (server, fixture) = server(&[("songs/foo/song.yaml", FOO)]).await;
+        for name in [".", "", "foo/.."] {
+            let _ = refusal(
+                server
+                    .write_song(Parameters(WriteSongArgs {
+                        name: name.to_string(),
+                        yaml: "name: Root\ntracks: []\n".to_string(),
+                    }))
+                    .await,
+            );
+            assert!(
+                !fixture.root.join("songs/song.yaml").exists(),
+                "{name:?} wrote the songs root's song.yaml"
+            );
+        }
+    }
+
+    /// #675: `patch_song` saves as the song editor does: a patch renaming
+    /// the song onto another's name is refused and leaves the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_song_saves_by_the_web_rules() {
+        let (server, fixture) = server(&[
+            ("songs/foo/song.yaml", FOO),
+            ("songs/bar/song.yaml", "name: Bar\ntracks: []\n"),
+        ])
+        .await;
+        let patch = |old: &str, new: &str| {
+            server.patch_song(Parameters(PatchSongArgs {
+                name: "Foo".to_string(),
+                old_string: old.to_string(),
+                new_string: new.to_string(),
+                replace_all: false,
+            }))
+        };
+
+        let taken = refusal(patch("name: Foo", "name: Bar").await);
+        assert_eq!(
+            taken,
+            "a song named \"Bar\" already exists; choose another name"
+        );
+        assert_eq!(
+            read(&fixture.root, "songs/foo/song.yaml").as_deref(),
+            Some(FOO)
+        );
+
+        let _ = answer(patch("tracks: []", "tracks: []\nloop_playback: true").await);
+        assert_eq!(
+            read(&fixture.root, "songs/foo/song.yaml").as_deref(),
+            Some("name: Foo\ntracks: []\nloop_playback: true\n")
+        );
+    }
+
+    const SET: &str = "kind: playlist\nsongs:\n- DSL Light Show Song\n";
+
+    /// #675: `write_playlist` names and finds its file as the web UI's
+    /// playlist save does: the reserved name is refused with its message,
+    /// and a playlist whose file is a `.yml` is written there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_playlist_saves_by_the_web_rules() {
+        let (server, fixture) = server(&[("playlists/set.yml", SET)]).await;
+        let write = |name: &str, yaml: &str| {
+            server.write_playlist(Parameters(WritePlaylistArgs {
+                name: Some(name.to_string()),
+                yaml: yaml.to_string(),
+            }))
+        };
+
+        assert_eq!(
+            refusal(write("all_songs", SET).await),
+            "'all_songs' is the player's own playlist and has no file"
+        );
+        let unknown = refusal(write("new", "kind: playlist\nsongs:\n- Nope\n").await);
+        assert!(unknown.contains("Nope"), "{unknown}");
+        assert_eq!(read(&fixture.root, "playlists/new.yaml"), None);
+
+        let written = format!("{SET}- DSL Light Show Song\n");
+        let _ = answer(write("set", &written).await);
+        assert_eq!(read(&fixture.root, "playlists/set.yml"), Some(written));
+        assert_eq!(read(&fixture.root, "playlists/set.yaml"), None);
+    }
+
+    /// A refused playlist save makes no playlists directory: the directory
+    /// is made only once the save is checked, as a venue save's is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_playlist_save_makes_no_directory() {
+        let (server, fixture) = server(&[]).await;
+        let dir = fixture.root.join("playlists");
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        let write = |name: &str, yaml: &str| {
+            server.write_playlist(Parameters(WritePlaylistArgs {
+                name: Some(name.to_string()),
+                yaml: yaml.to_string(),
+            }))
+        };
+
+        let _ = refusal(write("new", "kind: playlist\nsongs:\n- Nope\n").await);
+        let _ = refusal(write("all_songs", SET).await);
+        let _ = refusal(write(".hidden", SET).await);
+        assert!(!dir.exists(), "a refused save made the playlists directory");
+
+        let _ = answer(write("new", SET).await);
+        assert_eq!(
+            read(&fixture.root, "playlists/new.yaml").as_deref(),
+            Some(SET)
+        );
+    }
+
+    /// #675: `patch_playlist` checks and writes as `write_playlist` does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_playlist_saves_by_the_web_rules() {
+        let (server, fixture) = server(&[("playlists/set.yml", SET)]).await;
+        let patch = |old: &str, new: &str| {
+            server.patch_playlist(Parameters(PatchPlaylistArgs {
+                name: Some("set".to_string()),
+                old_string: old.to_string(),
+                new_string: new.to_string(),
+                replace_all: false,
+            }))
+        };
+
+        let unknown = refusal(patch("- DSL Light Show Song", "- Nope").await);
+        assert!(unknown.contains("Nope"), "{unknown}");
+        assert_eq!(
+            read(&fixture.root, "playlists/set.yml").as_deref(),
+            Some(SET)
+        );
+
+        let _ = answer(patch("songs:\n", "songs:\n- DSL Light Show Song\n").await);
+        assert_eq!(
+            read(&fixture.root, "playlists/set.yml"),
+            Some(format!("{SET}- DSL Light Show Song\n"))
+        );
+    }
+
+    /// A server whose song Foo's `lighting/` folder is the venues
+    /// directory (a link to it), and whose song Bar has none yet.
+    async fn light_show_server() -> (McpServer, StandaloneFixture) {
+        let (server, fixture) = server(&[
+            ("songs/foo/song.yaml", FOO),
+            ("songs/bar/song.yaml", "name: Bar\ntracks: []\n"),
+            ("rig/venues/show.light", SHOW),
+        ])
+        .await;
+        std::os::unix::fs::symlink(
+            fixture.root.join("rig/venues"),
+            fixture.root.join("songs/foo/lighting"),
+        )
+        .unwrap();
+        (server, fixture)
+    }
+
+    fn write_show_args(song: &str, source: &str) -> WriteSongLightingArgs {
+        WriteSongLightingArgs {
+            song: song.to_string(),
+            file: "show.light".to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    /// #675: `write_song_lighting` saves as the web UI's light show save
+    /// does: never into the venues directory, and checked first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_lighting_saves_by_the_web_rules() {
+        let (server, fixture) = light_show_server().await;
+        let root = fixture.root.clone();
+
+        let refused = refusal(
+            server
+                .write_song_lighting(Parameters(write_show_args("Foo", SHOW)))
+                .await,
+        );
+        assert_eq!(refused, IN_VENUES);
+        assert_eq!(read(&root, "songs/foo/song.yaml").as_deref(), Some(FOO));
+
+        let invalid = refusal(
+            server
+                .write_song_lighting(Parameters(write_show_args("Bar", "show {")))
+                .await,
+        );
+        assert!(!invalid.is_empty());
+        assert!(!root.join("songs/bar/lighting").exists(), "no folder made");
+
+        let wrote = answer(
+            server
+                .write_song_lighting(Parameters(write_show_args("Bar", SHOW)))
+                .await,
+        );
+        assert_eq!(wrote["registered"], true, "{wrote}");
+        assert_eq!(
+            read(&root, "songs/bar/lighting/show.light").as_deref(),
+            Some(SHOW)
+        );
+        assert!(read(&root, "songs/bar/song.yaml")
+            .unwrap()
+            .contains("lighting/show.light"));
+    }
+
+    /// #675: `patch_song_lighting` saves as `write_song_lighting` does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_song_lighting_saves_by_the_web_rules() {
+        let (server, fixture) = light_show_server().await;
+        let root = fixture.root.clone();
+        let patch = |song: &str, old: &str, new: &str| {
+            server.patch_song_lighting(Parameters(PatchSongLightingArgs {
+                song: song.to_string(),
+                file: "show.light".to_string(),
+                old_string: old.to_string(),
+                new_string: new.to_string(),
+                replace_all: false,
+            }))
+        };
+
+        assert_eq!(refusal(patch("Foo", "blue", "red").await), IN_VENUES);
+        assert_eq!(read(&root, "rig/venues/show.light").as_deref(), Some(SHOW));
+
+        let _ = answer(
+            server
+                .write_song_lighting(Parameters(write_show_args("Bar", SHOW)))
+                .await,
+        );
+        let invalid = refusal(patch("Bar", "duration: 4s", "duration: {{{").await);
+        assert!(!invalid.is_empty());
+        assert_eq!(
+            read(&root, "songs/bar/lighting/show.light").as_deref(),
+            Some(SHOW)
+        );
+        let _ = answer(patch("Bar", "blue", "red").await);
+        assert_eq!(
+            read(&root, "songs/bar/lighting/show.light"),
+            Some(SHOW.replace("blue", "red"))
+        );
+    }
+
+    /// #675: `delete_song_lighting` deletes as the web UI's light show
+    /// delete does: never a file in the venues directory, refused before
+    /// the song's config is touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_song_lighting_deletes_by_the_web_rules() {
+        let (server, fixture) = light_show_server().await;
+        let root = fixture.root.clone();
+        let delete = |song: &str| {
+            server.delete_song_lighting(Parameters(SongLightingArgs {
+                song: song.to_string(),
+                file: "show.light".to_string(),
+            }))
+        };
+
+        assert_eq!(refusal(delete("Foo").await), IN_VENUES);
+        assert_eq!(read(&root, "rig/venues/show.light").as_deref(), Some(SHOW));
+        assert_eq!(read(&root, "songs/foo/song.yaml").as_deref(), Some(FOO));
+
+        let _ = answer(
+            server
+                .write_song_lighting(Parameters(write_show_args("Bar", SHOW)))
+                .await,
+        );
+        let _ = answer(delete("Bar").await);
+        assert!(!root.join("songs/bar/lighting/show.light").exists());
+        assert!(!read(&root, "songs/bar/song.yaml")
+            .unwrap()
+            .contains("show.light"));
+    }
+
+    /// The light show tools hold a song's show to the songs root, as the
+    /// web UI's lighting endpoints do: a song whose `lighting/` is a link
+    /// out of the songs root is not written through it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_lighting_stays_inside_the_songs_root() {
+        let baz = "name: Baz\ntracks: []\n";
+        let (server, fixture) =
+            server(&[("songs/baz/song.yaml", baz), ("elsewhere/keep", "")]).await;
+        let root = fixture.root.clone();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("songs/baz/lighting"))
+            .unwrap();
+
+        let refused = refusal(
+            server
+                .write_song_lighting(Parameters(write_show_args("Baz", SHOW)))
+                .await,
+        );
+        assert_eq!(refused, "Path is outside the allowed directory");
+        assert!(
+            !root.join("elsewhere/show.light").exists(),
+            "written outside"
+        );
+        assert_eq!(read(&root, "songs/baz/song.yaml").as_deref(), Some(baz));
+    }
+
+    /// A song whose `lighting:` names a show outside the songs root
+    /// (`../../x/show.light`) loads it, but neither `patch_song_lighting`
+    /// nor `delete_song_lighting` writes or deletes it, as the web UI's
+    /// lighting endpoints would not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn song_lighting_outside_the_songs_root_is_not_patched_or_deleted() {
+        let qux = "name: Qux\ntracks: []\nlighting:\n  - file: ../../x/show.light\n";
+        let (server, fixture) =
+            server(&[("songs/qux/song.yaml", qux), ("x/show.light", SHOW)]).await;
+        let root = fixture.root.clone();
+
+        let patched = refusal(
+            server
+                .patch_song_lighting(Parameters(PatchSongLightingArgs {
+                    song: "Qux".to_string(),
+                    file: "show.light".to_string(),
+                    old_string: "blue".to_string(),
+                    new_string: "red".to_string(),
+                    replace_all: false,
+                }))
+                .await,
+        );
+        assert_eq!(patched, "Path is outside the allowed directory");
+        let deleted = refusal(
+            server
+                .delete_song_lighting(Parameters(SongLightingArgs {
+                    song: "Qux".to_string(),
+                    file: "show.light".to_string(),
+                }))
+                .await,
+        );
+        assert_eq!(deleted, "Path is outside the allowed directory");
+        assert_eq!(read(&root, "x/show.light").as_deref(), Some(SHOW));
+        assert_eq!(read(&root, "songs/qux/song.yaml").as_deref(), Some(qux));
+    }
+
+    /// `delete_song_lighting` deletes a show that is a link as the link:
+    /// one leading to the song's own config, or to another song's show,
+    /// leaves what it leads to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_song_lighting_removes_a_link_not_its_target() {
+        let b = "name: B\ntracks: []\n";
+        let (server, fixture) = server(&[
+            ("songs/a/song.yaml", "name: A\ntracks: []\n"),
+            ("songs/a/lighting/show.light", SHOW),
+            ("songs/b/song.yaml", b),
+        ])
+        .await;
+        let root = fixture.root.clone();
+        let link = root.join("songs/b/lighting/show.light");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        for target in ["../song.yaml", "../../a/lighting/show.light"] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let _ = answer(
+                server
+                    .delete_song_lighting(Parameters(SongLightingArgs {
+                        song: "B".to_string(),
+                        file: "show.light".to_string(),
+                    }))
+                    .await,
+            );
+            assert!(
+                std::fs::symlink_metadata(&link).is_err(),
+                "{target}: link left"
+            );
+            assert_eq!(read(&root, "songs/b/song.yaml").as_deref(), Some(b));
+            assert_eq!(
+                read(&root, "songs/a/lighting/show.light").as_deref(),
+                Some(SHOW)
+            );
+        }
+    }
+
+    /// `write_song_lighting` writes only `.light` files: not through a
+    /// show that is a link to the song's own config.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_lighting_refuses_a_link_to_a_config() {
+        let b = "name: B\ntracks: []\n";
+        let (server, fixture) = server(&[("songs/b/song.yaml", b)]).await;
+        let root = fixture.root.clone();
+        std::fs::create_dir_all(root.join("songs/b/lighting")).unwrap();
+        std::os::unix::fs::symlink("../song.yaml", root.join("songs/b/lighting/show.light"))
+            .unwrap();
+
+        let refused = refusal(
+            server
+                .write_song_lighting(Parameters(write_show_args("B", SHOW)))
+                .await,
+        );
+        assert_eq!(refused, "Can only write .light files");
+        assert_eq!(read(&root, "songs/b/song.yaml").as_deref(), Some(b));
+    }
+
+    /// `delete_song_lighting` removes a link leading into the venues
+    /// directory, or leading nowhere: only the link goes, so where it
+    /// leads does not matter.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_song_lighting_removes_any_link_in_the_songs_root() {
+        let (server, fixture) = light_show_server().await;
+        let root = fixture.root.clone();
+        let lighting = root.join("songs/bar/lighting");
+        std::fs::create_dir_all(&lighting).unwrap();
+        std::os::unix::fs::symlink(root.join("rig/venues/show.light"), lighting.join("v.light"))
+            .unwrap();
+        std::os::unix::fs::symlink("nowhere.light", lighting.join("gone.light")).unwrap();
+
+        for file in ["v.light", "gone.light"] {
+            let _ = answer(
+                server
+                    .delete_song_lighting(Parameters(SongLightingArgs {
+                        song: "Bar".to_string(),
+                        file: file.to_string(),
+                    }))
+                    .await,
+            );
+            assert!(
+                std::fs::symlink_metadata(lighting.join(file)).is_err(),
+                "{file}: link left"
+            );
+        }
+        assert_eq!(read(&root, "rig/venues/show.light").as_deref(), Some(SHOW));
+    }
+
+    /// `write_song_lighting` does not write through a link leading
+    /// nowhere: the write would make its target, outside the songs root.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_song_lighting_refuses_a_link_leading_nowhere() {
+        let (server, fixture) = server(&[("songs/baz/song.yaml", "name: Baz\ntracks: []\n")]).await;
+        let root = fixture.root.clone();
+        let target = root.join("elsewhere/x.light");
+        std::fs::create_dir_all(root.join("songs/baz/lighting")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("songs/baz/lighting/show.light")).unwrap();
+
+        let refused = refusal(
+            server
+                .write_song_lighting(Parameters(write_show_args("Baz", SHOW)))
+                .await,
+        );
+        assert_eq!(refused, "Path is outside the allowed directory");
+        assert!(!target.exists(), "written outside");
+    }
+
+    /// `read_song_lighting` and `patch_song_lighting` refuse a show that
+    /// is a link leading nowhere as one, saying what to do about it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn song_lighting_link_leading_nowhere_is_refused_clearly() {
+        let (server, fixture) = server(&[("songs/baz/song.yaml", "name: Baz\ntracks: []\n")]).await;
+        let root = fixture.root.clone();
+        std::fs::create_dir_all(root.join("songs/baz/lighting")).unwrap();
+        std::os::unix::fs::symlink("nowhere.light", root.join("songs/baz/lighting/show.light"))
+            .unwrap();
+        let expected = "show.light is a link that leads nowhere; delete it or point it at a show";
+
+        let read = server
+            .read_song_lighting(Parameters(SongLightingArgs {
+                song: "Baz".to_string(),
+                file: "show.light".to_string(),
+            }))
+            .await
+            .expect_err("a dangling link is refused");
+        assert_eq!(read.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(read.message, expected);
+
+        let patched = server
+            .patch_song_lighting(Parameters(PatchSongLightingArgs {
+                song: "Baz".to_string(),
+                file: "show.light".to_string(),
+                old_string: "blue".to_string(),
+                new_string: "red".to_string(),
+                replace_all: false,
+            }))
+            .await
+            .expect_err("a dangling link is refused");
+        assert_eq!(patched.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(patched.message, expected);
+        assert!(!root.join("songs/baz/lighting/nowhere.light").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_save_makes_no_directory() {
+        let (server, fixture) = server(&[]).await;
+        let root = fixture.root.clone();
+        let _ = answer(server.list_venue_files().await);
+        let _ = refusal(
+            server
+                .write_venue(Parameters(write_venue_args("New", venue("Else", ""), None)))
+                .await,
+        );
+        let _ = refusal(
+            server
+                .write_fixture_type(Parameters(write_type_args(
+                    "P",
+                    "fixture_type {".into(),
+                    None,
+                )))
+                .await,
+        );
+        assert!(!root.join("rig").exists(), "nothing made");
+        let _ = answer(
+            server
+                .write_fixture_type(Parameters(write_type_args("P", par("P", 1), None)))
+                .await,
+        );
+        assert!(root.join("rig/types/p.fixture").is_file());
+        assert!(
+            !root.join("rig/venues").exists(),
+            "a type save makes no venues dir"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn venue_tools_write_by_name_by_the_web_rules() {
+        let (server, fixture) = server(&[
+            ("rig/venues/tour/shared.light", SHARED),
+            ("rig/venues/old.light", &venue("Old", "")),
+            ("rig/venues/older.light", &venue("Older", "")),
+        ])
+        .await;
+        let root = fixture.root.clone();
+
+        // Create: at the canonical path.
+        let wrote = answer(
+            server
+                .write_venue(Parameters(write_venue_args(
+                    "Club (Main)",
+                    venue("Club (Main)", ""),
+                    None,
+                )))
+                .await,
+        );
+        assert!(wrote["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("rig/venues/club_main.venue"));
+        assert_eq!(
+            read(&root, "rig/venues/club_main.venue"),
+            Some(venue("Club (Main)", ""))
+        );
+        // A taken name, or a body that is not this one venue, is refused.
+        let taken = refusal(
+            server
+                .write_venue(Parameters(write_venue_args("OLD", venue("OLD", ""), None)))
+                .await,
+        );
+        assert_eq!(taken, "old.light is taken by \"Old\"; choose another name");
+        let other = refusal(
+            server
+                .write_venue(Parameters(write_venue_args("New", venue("Else", ""), None)))
+                .await,
+        );
+        assert!(other.contains("declares no venue named \"New\""), "{other}");
+        assert_eq!(read(&root, "rig/venues/new.venue"), None);
+
+        // Edit: in place.
+        let _ = answer(
+            server
+                .write_venue(Parameters(write_venue_args(
+                    "Club (Main)",
+                    venue("Club (Main)", "").replace("1:1", "1:1 tags [\"wash\"]"),
+                    None,
+                )))
+                .await,
+        );
+        assert!(read(&root, "rig/venues/club_main.venue")
+            .unwrap()
+            .contains("wash"));
+
+        // Patch: in place.
+        let patched = answer(
+            server
+                .patch_venue(Parameters(patch_args(
+                    "Club (Main)",
+                    "\"wash\"",
+                    "\"spot\"",
+                )))
+                .await,
+        );
+        assert!(patched["contents"].as_str().unwrap().contains("spot"));
+        assert!(read(&root, "rig/venues/club_main.venue")
+            .unwrap()
+            .contains("spot"));
+
+        // Rename: a canonical file moves to the new name's.
+        let _ = answer(
+            server
+                .write_venue(Parameters(write_venue_args(
+                    "Hall",
+                    venue("Hall", ""),
+                    Some("Club (Main)"),
+                )))
+                .await,
+        );
+        assert_eq!(read(&root, "rig/venues/club_main.venue"), None);
+        assert_eq!(
+            read(&root, "rig/venues/hall.venue"),
+            Some(venue("Hall", ""))
+        );
+
+        // Read-only: refused with the web UI's message, and nothing changes.
+        for result in [
+            server
+                .write_venue(Parameters(write_venue_args("A", venue("A", ""), None)))
+                .await,
+            server
+                .patch_venue(Parameters(patch_args(
+                    "A",
+                    "{\n}",
+                    "{\n  fixture \"X\" Par @ 1:1\n}",
+                )))
+                .await,
+            server.delete_venue(Parameters(name_args("A"))).await,
+        ] {
+            assert_eq!(refusal(result), SHARED_REASON);
+        }
+        assert_eq!(
+            read(&root, "rig/venues/tour/shared.light").as_deref(),
+            Some(SHARED)
+        );
+
+        // A `.light` whose text needs the newer format moves to its stem's
+        // `.venue`, written whole or patched.
+        let _ = answer(
+            server
+                .write_venue(Parameters(write_venue_args(
+                    "Old",
+                    venue("Old", " mode \"8ch\""),
+                    None,
+                )))
+                .await,
+        );
+        assert_eq!(read(&root, "rig/venues/old.light"), None);
+        assert_eq!(
+            read(&root, "rig/venues/old.venue"),
+            Some(venue("Old", " mode \"8ch\""))
+        );
+        let _ = answer(
+            server
+                .patch_venue(Parameters(patch_args(
+                    "Older",
+                    " Par @",
+                    " Par mode \"8ch\" @",
+                )))
+                .await,
+        );
+        assert_eq!(read(&root, "rig/venues/older.light"), None);
+        assert!(read(&root, "rig/venues/older.venue")
+            .unwrap()
+            .contains("mode \"8ch\""));
+
+        // Delete: the venue's own file; a name no file declares is not found.
+        let deleted = answer(server.delete_venue(Parameters(name_args("Hall"))).await);
+        assert!(deleted["deleted"].as_str().unwrap().ends_with("hall.venue"));
+        assert_eq!(read(&root, "rig/venues/hall.venue"), None);
+        let missing = refusal(server.delete_venue(Parameters(name_args("Hall"))).await);
+        assert_eq!(missing, "Venue not found: Hall");
+        let missing = refusal(
+            server
+                .patch_venue(Parameters(patch_args("Nowhere", "a", "b")))
+                .await,
+        );
+        assert_eq!(missing, "Venue not found: Nowhere");
+        // The other host's directory was never touched.
+        assert!(!root.join("other").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fixture_type_tools_write_by_name_by_the_web_rules() {
+        let (server, fixture) = server(&[
+            (
+                "rig/types/pars.light",
+                &format!("{}{}", par("P1", 1), par("P2", 1)),
+            ),
+            ("rig/types/old_par.light", &par("OldPar", 1)),
+            ("rig/types/older_par.light", &par("OlderPar", 1)),
+            (
+                "rig/venues/club.venue",
+                "venue \"club\" {\n  fixture \"A\" \"New Par\" @ 1:1\n}\n",
+            ),
+        ])
+        .await;
+        let root = fixture.root.clone();
+        std::fs::create_dir_all(root.join("lighting/library")).unwrap();
+        std::fs::write(
+            root.join("lighting/library/synth.gdtf"),
+            crate::testutil::lighting::synthetic_gdtf(),
+        )
+        .unwrap();
+
+        let listed = answer(server.list_fixture_type_files().await);
+        assert!(listed["dir"].as_str().unwrap().ends_with("rig/types"));
+        assert_eq!(
+            listed["files"],
+            json!(["old_par.light", "older_par.light", "pars.light"]),
+            "{listed}"
+        );
+        let p1 = listed["fixture_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "P1")
+            .unwrap()
+            .clone();
+        assert_eq!(p1["editable"], false, "{listed}");
+        let library = listed["library"][0]["name"].as_str().unwrap().to_string();
+        assert_eq!(
+            listed["library"][0]["archive"],
+            "lighting/library/synth.gdtf"
+        );
+
+        // Create: at `<stem>.fixture`; a library GDTF's name is taken.
+        let _ = answer(
+            server
+                .write_fixture_type(Parameters(write_type_args(
+                    "New Par",
+                    par("New Par", 1),
+                    None,
+                )))
+                .await,
+        );
+        assert_eq!(
+            read(&root, "rig/types/new_par.fixture"),
+            Some(par("New Par", 1))
+        );
+        let taken = refusal(
+            server
+                .write_fixture_type(Parameters(write_type_args(
+                    &library,
+                    par(&library, 1),
+                    None,
+                )))
+                .await,
+        );
+        assert!(taken.contains("GDTF library type"), "{taken}");
+
+        // Edit and patch: in place.
+        let _ = answer(
+            server
+                .write_fixture_type(Parameters(write_type_args(
+                    "New Par",
+                    par("New Par", 2),
+                    None,
+                )))
+                .await,
+        );
+        let _ = answer(
+            server
+                .patch_fixture_type(Parameters(patch_args(
+                    "New Par",
+                    "channels: 2",
+                    "channels: 3",
+                )))
+                .await,
+        );
+        assert_eq!(
+            read(&root, "rig/types/new_par.fixture"),
+            Some(par("New Par", 3))
+        );
+
+        // Rename: the file moves, and the venue using it is retyped.
+        let renamed = answer(
+            server
+                .write_fixture_type(Parameters(write_type_args(
+                    "Wash",
+                    par("Wash", 3),
+                    Some("New Par"),
+                )))
+                .await,
+        );
+        assert_eq!(renamed["rename"]["to"], "Wash", "{renamed}");
+        assert_eq!(read(&root, "rig/types/new_par.fixture"), None);
+        assert_eq!(read(&root, "rig/types/wash.fixture"), Some(par("Wash", 3)));
+        let club = read(&root, "rig/venues/club.venue").unwrap();
+        assert!(club.contains("Wash") && !club.contains("New Par"), "{club}");
+
+        // Read-only: refused with the web UI's message.
+        let reason = "Defined in pars.light alongside fixture type \"P2\"; edit that file by hand.";
+        for result in [
+            server
+                .write_fixture_type(Parameters(write_type_args("P1", par("P1", 2), None)))
+                .await,
+            server
+                .patch_fixture_type(Parameters(patch_args("P1", "channels: 1", "channels: 2")))
+                .await,
+            server
+                .delete_fixture_type(Parameters(name_args("P1")))
+                .await,
+        ] {
+            assert_eq!(refusal(result), reason);
+        }
+
+        // A `.light` whose text needs a `.fixture` moves to its stem's.
+        let _ = answer(
+            server
+                .write_fixture_type(Parameters(write_type_args("OldPar", rich("OldPar"), None)))
+                .await,
+        );
+        assert_eq!(read(&root, "rig/types/old_par.light"), None);
+        assert_eq!(
+            read(&root, "rig/types/old_par.fixture"),
+            Some(rich("OldPar"))
+        );
+        let _ = answer(
+            server
+                .patch_fixture_type(Parameters(patch_args(
+                    "OlderPar",
+                    "  channels: 1\n  channel_map: { \"dimmer\": 1 }\n",
+                    "  channel \"pan\" @ 1 fine 2 range -270deg..270deg\n",
+                )))
+                .await,
+        );
+        assert_eq!(read(&root, "rig/types/older_par.light"), None);
+        assert_eq!(
+            read(&root, "rig/types/older_par.fixture"),
+            Some(rich("OlderPar"))
+        );
+
+        // Delete: the type's own file.
+        let deleted = answer(
+            server
+                .delete_fixture_type(Parameters(name_args("Wash")))
+                .await,
+        );
+        assert!(deleted["deleted"]
+            .as_str()
+            .unwrap()
+            .ends_with("wash.fixture"));
+        assert_eq!(read(&root, "rig/types/wash.fixture"), None);
+        assert!(!root.join("other").exists());
     }
 }

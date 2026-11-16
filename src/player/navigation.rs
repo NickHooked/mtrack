@@ -24,7 +24,9 @@ use crate::{
     songs::{self, Song, Songs},
 };
 
-use super::{Player, PlaylistDirection};
+use super::{
+    LoopExit, Player, PlaylistDirection, ReloadSongsError, SongSources, SwitchPlaylistError,
+};
 
 impl Player {
     /// Plays a specific song by name, starting from the given time.
@@ -38,27 +40,48 @@ impl Player {
         song_name: &str,
         start_time: Duration,
     ) -> Result<Option<Arc<Song>>, Box<dyn Error>> {
-        // Reject playback if hardware hasn't finished initializing.
-        if !*self.init_done_tx.borrow() {
-            return Err("Hardware is still initializing".into());
-        }
-
         let mut join = self.join.lock().await;
         if join.is_some() {
             info!("Player is already playing a song.");
             return Ok(None);
         }
+        // Asked before the playlist moves, so a start turned down leaves it
+        // where it was; the start asks again, as every start does.
+        if !*self.init_done_tx.borrow() {
+            return Err("Hardware is still initializing".into());
+        }
 
-        if self.get_playlist().navigate_to(song_name).is_none() {
+        // A start the song cannot play from is turned down before the
+        // playlist moves to it (#584).
+        if let Some(song) = self.get_playlist().get_song(song_name) {
+            super::seek::check_start_position(&song, start_time, "play from")?;
+        }
+
+        // Moved as a navigation moves it, so that a reload cannot come
+        // between looking the playlist up and moving it and lose the move,
+        // and announced as a navigation announces it.
+        let (_, song) = self.move_playlist(|playlist| -> Result<Arc<Song>, String> {
+            if let Some(song) = playlist.navigate_to(song_name) {
+                return Ok(song);
+            }
             let all_songs = self
                 .get_all_songs_playlist()
-                .ok_or_else(|| -> Box<dyn Error> { "all_songs playlist not available".into() })?;
-            if all_songs.navigate_to(song_name).is_none() {
-                return Err(format!("Song '{}' not found", song_name).into());
-            }
-            *self.active_playlist.write() = "all_songs".to_string();
-        }
+                .ok_or("all_songs playlist not available")?;
+            // The registry says why it has no such song: none by that
+            // name, or one that failed to load.
+            all_songs
+                .registry()
+                .get(song_name)
+                .map_err(|e| e.to_string())?;
+            let song = all_songs.navigate_to(song_name).ok_or_else(|| {
+                crate::songs::SongLookupError::NotFound(song_name.to_string()).to_string()
+            })?;
+            *self.active_playlist.write() = crate::playlist::ALL_SONGS.to_string();
+            Ok(song)
+        });
+        let song = song?;
         self.clear_pending_start();
+        self.emit_song_change(&song);
 
         // Start playback with the lock already held.
         self.play_from_locked(start_time, &mut join).await
@@ -71,17 +94,31 @@ impl Player {
     /// `play_from()` from starting between the is-playing check and the
     /// playlist position advance.
     pub(super) async fn navigate(&self, direction: PlaylistDirection) -> Option<Arc<Song>> {
-        let join = self.join.lock().await;
+        let mut join = self.join.lock().await;
         if join.is_some() {
+            // A looping song ending: stopped a moment from now.
+            if self.loop_exit() == LoopExit::End {
+                info!("The song is ending; {} once it has.", direction);
+                return self.get_playlist().current();
+            }
+            // A looping song at the end of the list has nowhere to move to:
+            // it ends as a stop ends it, rather than starting over.
+            let back = direction == PlaylistDirection::Prev;
+            if self.is_current_song_looping() && !self.get_playlist().can_move(back) {
+                info!("Nothing to go to {}: ending the looping song.", direction);
+                if let Some(song) = self.end_looping_song(&join) {
+                    return Some(song);
+                }
+                self.cut_locked(&mut join).await;
+                return self.get_playlist().current();
+            }
             // If the current song is looping, break out immediately with crossfade.
+            // The cleanup task moves the playlist in this direction and plays
+            // what it lands on a moment later; that song is the answer, not the
+            // one still fading out (#545).
             if self.is_current_song_looping() {
                 info!("Breaking out of song loop via {} navigation.", direction);
-                self.fade_out_current_audio();
-                self.loop_break.store(true, Ordering::Relaxed);
-                if let Some(ref handles) = *join {
-                    handles.cancel.cancel();
-                }
-                return self.get_playlist().current();
+                return self.break_loop(&join, back);
             }
             let current = self.get_playlist().current();
             if let Some(ref song) = current {
@@ -92,16 +129,125 @@ impl Player {
             }
             return current;
         }
-        let playlist = self.get_playlist();
-        let song = match direction {
-            PlaylistDirection::Next => playlist.next()?,
-            PlaylistDirection::Prev => playlist.prev()?,
+        let stay = format!("Nothing to go to {}: the paused song stays.", direction);
+        let moved = self
+            .navigate_stopped(join, stay, |playlist| {
+                // A paused song an edit took off the list after the last
+                // entry has no entry to move on to: it stays paused, and
+                // current, as at the end of the list, rather than losing its
+                // pause and staying off the list (#576).
+                if playlist.entry().is_none()
+                    && !playlist.can_move(direction == PlaylistDirection::Prev)
+                {
+                    return Ok(None);
+                }
+                Ok::<_, std::convert::Infallible>(Some(match direction {
+                    PlaylistDirection::Next => playlist.next(),
+                    PlaylistDirection::Prev => playlist.prev(),
+                }))
+            })
+            .await;
+        match moved {
+            Ok(song) => song,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Makes the entry at `position` of the active playlist the current one
+    /// without playing it, as a navigation makes its song current: a pause is
+    /// called off, a song waiting to start by itself is cancelled or
+    /// scheduled, and the ambient light follows the entry. `expected`, when
+    /// given, is the song the caller believes is there; another song means the
+    /// playlist changed under the caller and nothing moves.
+    ///
+    /// The checks and the move are made under the playlist's move lock, so a
+    /// reload cannot come between them. Already being on that entry, on the
+    /// list, changes nothing: no pause is called off, no auto-play cancelled,
+    /// no song-change event. While a song plays nothing moves and the playing
+    /// song is returned, as for `next`; unlike `next`, this does not break a
+    /// section loop.
+    pub async fn navigate_to_song(
+        &self,
+        position: usize,
+        expected: Option<&str>,
+    ) -> Result<Arc<Song>, playlist::EntryError> {
+        let join = self.join.lock().await;
+        if join.is_some() {
+            let current = self.get_playlist().current();
+            info!(
+                current_song = ?current.as_ref().map(|s| s.name().to_string()),
+                "Can't go to entry {}, player is active.", position
+            );
+            return current.ok_or(playlist::EntryError::OutOfRange { position, len: 0 });
+        }
+        let stay = format!("Already on entry {}: nothing changes.", position);
+        self.navigate_stopped(join, stay, |playlist| {
+            let (song, moved) = playlist.navigate_to_entry(position, expected)?;
+            Ok(moved.then_some(Some(song)))
+        })
+        .await?
+        .ok_or(playlist::EntryError::OutOfRange { position, len: 0 })
+    }
+
+    /// The part of a navigation that runs while nothing plays: `step` moves
+    /// the playlist (`None` leaves it where it is, and the song stays, with
+    /// `stay` logged) and everything that follows a move -- the song-change
+    /// event, auto-play and ambient light -- is brought here, the same for
+    /// every kind of move. An error from `step` is the move refused, with
+    /// nothing changed.
+    async fn navigate_stopped<E>(
+        &self,
+        join: tokio::sync::MutexGuard<'_, Option<super::PlayHandles>>,
+        stay: String,
+        step: impl FnOnce(&Playlist) -> Result<Option<Option<Arc<Song>>>, E>,
+    ) -> Result<Option<Arc<Song>>, E> {
+        let (playlist, stepped) = self.move_playlist(|playlist| {
+            let from = playlist.entry();
+            let before = playlist.ambient_before(self.waiting_entry(playlist));
+            step(playlist).map(|song| (from, before, song))
+        });
+        let (from, before, song) = stepped?;
+        let Some(song) = song else {
+            info!("{}", stay);
+            return Ok(playlist.current());
         };
+        let Some(song) = song else {
+            return Ok(None);
+        };
+        // A paused song holds its lights, which a navigation leaves held.
+        let paused = self.pending_start().is_some();
         self.clear_pending_start();
+        // A pause's section loop is not resumed after a navigation.
+        self.section_loop.reset();
         self.emit_song_change(&song);
+        // Navigating onto a song with `auto_play` starts it; navigating away
+        // from one waiting to start calls it off, and the lights go to
+        // ambient as at any stop.
+        let called_off = self.cancel_auto_play();
+        // A song ending fades on out; the ambient light following it, now
+        // this navigation's to bring.
+        let ending = self.end_ending();
+        let moved = playlist.entry() != from;
+        if moved {
+            self.transport.lock().past_last_entry = false;
+        }
+        // Stopped on another entry: the gap is now before it, and its
+        // ambient light, if that is another, comes up in place of the one
+        // before.
+        let ambient_changed =
+            !paused && playlist.ambient_before(self.waiting_entry(&playlist)) != before;
+        match playlist.auto_play().filter(|_| moved) {
+            Some(gap) => self.schedule_auto_play(gap),
+            None if called_off || ending || ambient_changed => self.idle_ambient(true),
+            None => {}
+        }
+        // A pause called off here, or an ending forgotten, which then no
+        // longer runs a reload waiting for its fade: the reload looks again
+        // now.
+        self.reload_deferred_hardware();
         drop(join);
         self.load_song_samples(&song);
-        Some(song)
+        Ok(Some(song))
     }
 
     /// Next goes to the next entry in the playlist.
@@ -117,33 +263,48 @@ impl Player {
     /// Switches the active playlist by name. Returns an error if the name
     /// doesn't exist in the map or if the player is currently playing.
     /// Switching to "all_songs" is session-only (not persisted to config).
-    pub async fn switch_to_playlist(&self, name: &str) -> Result<(), String> {
-        {
-            let join = self.join.lock().await;
-            if join.is_some() {
-                if let Some(current) = self.get_playlist().current() {
-                    info!(
-                        current_song = current.name(),
-                        "Can't switch to {}, player is active.", name
-                    );
-                }
-                return Err("Cannot switch playlist while playing".to_string());
+    pub async fn switch_to_playlist(&self, name: &str) -> Result<(), SwitchPlaylistError> {
+        // Held from the check through the switch: let go between them, a
+        // play could start a song from the playlist being left, which the
+        // switch then took out from under it.
+        let join = self.join.lock().await;
+        if join.is_some() {
+            if let Some(current) = self.get_playlist().current() {
+                info!(
+                    current_song = current.name(),
+                    "Can't switch to {}, player is active.", name
+                );
             }
+            return Err(SwitchPlaylistError::Playing);
         }
 
         // Validate the name exists.
         {
             let playlists = self.playlists.read();
             if !playlists.contains_key(name) {
-                return Err(format!("Playlist '{}' not found", name));
+                return Err(SwitchPlaylistError::NotFound(name.to_string()));
             }
         }
 
+        // A paused song an edit took off the list stays current only to be
+        // resumed, which the switch calls off: the playlist left goes on to
+        // the entry that took its place.
+        self.move_playlist(|playlist| playlist.settle());
         *self.active_playlist.write() = name.to_string();
+        self.transport.lock().past_last_entry = false;
         self.clear_pending_start();
+        self.section_loop.reset();
+        self.cancel_auto_play();
+        self.end_ending();
+        // As for a navigation: a reload waiting on a pause or an ending
+        // looks again.
+        self.reload_deferred_hardware();
+        // The switch is made: saving it to the config store need not hold
+        // up playback.
+        drop(join);
 
         // Persist the choice to the config store, unless it's "all_songs" (session-only).
-        if name != "all_songs" {
+        if name != crate::playlist::ALL_SONGS {
             *self.persisted_playlist.write() = name.to_string();
             if let Some(store) = self.config_store() {
                 if let Err(e) = store.set_active_playlist(name.to_string()).await {
@@ -155,6 +316,8 @@ impl Player {
         if let Some(song) = self.get_playlist().current() {
             self.emit_song_change(&song);
         }
+        // The new playlist's ambient light, if it has its own.
+        self.idle_ambient(false);
 
         Ok(())
     }
@@ -181,7 +344,7 @@ impl Player {
     /// Gets the all-songs playlist (every song in the registry).
     pub fn get_all_songs_playlist(&self) -> Option<Arc<Playlist>> {
         let playlists = self.playlists.read();
-        let result = playlists.get("all_songs").cloned();
+        let result = playlists.get(crate::playlist::ALL_SONGS).cloned();
         if result.is_none() {
             error!("all_songs playlist missing from player state");
         }
@@ -192,7 +355,10 @@ impl Player {
     pub fn get_playlist(&self) -> Arc<Playlist> {
         let name = self.active_playlist.read().clone();
         let playlists = self.playlists.read();
-        match playlists.get(&name).or_else(|| playlists.get("all_songs")) {
+        match playlists
+            .get(&name)
+            .or_else(|| playlists.get(crate::playlist::ALL_SONGS))
+        {
             Some(playlist) => playlist.clone(),
             None => {
                 // This should never happen because all_songs is always created
@@ -205,10 +371,20 @@ impl Player {
         }
     }
 
+    /// Moves the active playlist's place with `step`, returning the playlist
+    /// and what `step` returns. A reload cannot come between looking the
+    /// playlist up and moving it, so the move is not lost to it.
+    pub(super) fn move_playlist<T>(&self, step: impl FnOnce(&Playlist) -> T) -> (Arc<Playlist>, T) {
+        let _moves = self.playlist_moves.lock();
+        let playlist = self.get_playlist();
+        let result = step(&playlist);
+        (playlist, result)
+    }
+
     /// Returns the song registry from the all-songs playlist.
     pub fn songs(&self) -> Arc<Songs> {
         let playlists = self.playlists.read();
-        match playlists.get("all_songs") {
+        match playlists.get(crate::playlist::ALL_SONGS) {
             Some(playlist) => playlist.registry().clone(),
             None => {
                 error!("all_songs playlist missing from player state");
@@ -218,41 +394,175 @@ impl Player {
     }
 
     /// Reinitializes all song-related state by rescanning songs from disk and
-    /// rebuilding all playlists. Call this after any mutation that affects songs
-    /// (import, create, config edit, etc.).
-    pub fn reload_songs(
-        &self,
-        songs_path: &std::path::Path,
-        playlists_dir: Option<&std::path::Path>,
-        legacy_playlist_path: Option<&std::path::Path>,
-    ) {
-        let new_songs =
-            match songs::get_all_songs_with_defaults(songs_path, self.default_metronome()) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to rescan songs: {}", e);
-                    return;
-                }
-            };
+    /// rebuilding all playlists, from the player's song sources. Call this
+    /// after any mutation that affects songs (import, create, config edit,
+    /// etc.). The rescan reads every song from disk, so it runs on the
+    /// blocking pool rather than on the caller's runtime worker. A rescan
+    /// or rebuild that fails leaves the songs as they were, and says why, so
+    /// the caller does not report a change the player has not taken up.
+    ///
+    /// The sources are resolved again from the config store, under the scan
+    /// lock and from the config as it is then, so a runtime change to
+    /// `songs:` or `playlists_dir:` is taken up, and become the player's
+    /// once the reload from them succeeds, still under the lock: two
+    /// rescans can neither leave the songs from one and the sources of the
+    /// other, nor an older config's rescan swap in last.
+    pub async fn reload_songs(&self) -> Result<(), ReloadSongsError> {
+        let player = self.clone();
+        tokio::task::spawn_blocking(move || player.reload_songs_now())
+            .await
+            .map_err(|e| ReloadSongsError::Interrupted(e.to_string()))?
+    }
 
-        let new_playlists =
-            match super::load_playlists(playlists_dir, legacy_playlist_path, new_songs.clone()) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("Failed to rebuild playlists: {}", e);
-                    return;
-                }
-            };
+    /// [`Player::reload_songs`], on the calling (blocking) thread.
+    fn reload_songs_now(&self) -> Result<(), ReloadSongsError> {
+        let _scan = self.song_scans.lock();
+        let sources = match self.config_store() {
+            Some(store) => SongSources::resolve(
+                &store.blocking_read_config(),
+                store.path(),
+                self.cli_playlist.read().as_deref(),
+            ),
+            None => self.song_sources().ok_or(ReloadSongsError::NoSources)?,
+        };
+        self.rescan_locked(&sources)?;
+        self.set_song_sources(sources);
+        Ok(())
+    }
+
+    /// [`Player::reload_songs`] from `sources`, on the calling thread, for
+    /// a test's player.
+    #[cfg(test)]
+    pub(crate) fn reload_songs_from(&self, sources: &SongSources) -> Result<(), ReloadSongsError> {
+        let _scan = self.song_scans.lock();
+        self.rescan_locked(sources)?;
+        self.set_song_sources(sources.clone());
+        Ok(())
+    }
+
+    /// Rescans the songs from `sources` and swaps them in, the scan lock
+    /// held by the caller: one scan at a time, from its scan to its swap.
+    fn rescan_locked(&self, sources: &SongSources) -> Result<(), ReloadSongsError> {
+        let new_songs = songs::get_all_songs_with_defaults(
+            &sources.songs,
+            self.default_metronome(),
+            &self.layers(),
+        )
+        .map_err(|e| {
+            warn!("Failed to rescan songs: {}", e);
+            ReloadSongsError::Songs(e.to_string())
+        })?;
+
+        let new_playlists = super::load_playlists(
+            sources.playlists_dir.as_deref(),
+            sources.legacy_playlist.as_deref(),
+            new_songs.clone(),
+        )
+        .map_err(|e| {
+            warn!("Failed to rebuild playlists: {}", e);
+            ReloadSongsError::Playlists(e.to_string())
+        })?;
+
+        // Copying each playlist's place and swapping the new ones in is one
+        // step to a move of the active playlist's place, such as a song's
+        // end advancing it: one made between the two would be made on the
+        // old playlist, and lost.
+        let moves = self.playlist_moves.lock();
+        // The ambient light for the gap the player is in, as the edit finds
+        // it.
+        let ambient_before = self.gap_ambient();
 
         // Preserve active playlist name if it still exists; fall back to all_songs.
-        {
+        let (was_active, active) = {
             let mut active = self.active_playlist.write();
+            let was_active = active.clone();
             if !new_playlists.contains_key(active.as_str()) {
-                *active = "all_songs".to_string();
+                *active = crate::playlist::ALL_SONGS.to_string();
+            }
+            (was_active, active.clone())
+        };
+
+        // Each playlist keeps its place by song, not by index: the song
+        // playing stays current through an edit that moves it, or takes it
+        // off the list, and the ending, loop-break and status logic, which
+        // read the active playlist's current song, keep to it (#576). A
+        // paused song counts as playing: play resumes it where it was, and
+        // the entry after it is not the song to resume. Asked of the flag
+        // kept with `join`, not of the join lock: every status poll takes
+        // that lock, and a stopped song read as playing for one would keep
+        // its place off the list.
+        let playing = self.song_playing.load(Ordering::Relaxed) || self.pending_start().is_some();
+        {
+            let old_playlists = self.playlists.read();
+            for (name, playlist) in &new_playlists {
+                // With the active playlist gone, deleted or renamed, the
+                // all_songs it falls back to takes over from it rather than
+                // from its own place, so the song playing stays current.
+                let from = if *name == active {
+                    old_playlists.get(&was_active)
+                } else {
+                    old_playlists.get(name)
+                };
+                if let Some(old) = from {
+                    playlist.follow(old, playing && *name == active);
+                }
             }
         }
 
         *self.playlists.write() = new_playlists;
+        drop(moves);
         info!("Reloaded song state");
+
+        let called_off = self.recheck_auto_play();
+        // Stopped, the gap's ambient light is the edited playlist's, as a
+        // navigation onto another entry brings that entry's: a new show, or
+        // another's settings. A song playing or paused holds its lights,
+        // and a song waiting to start by itself the one before's, as a segue.
+        let idle = !self.song_playing.load(Ordering::Relaxed)
+            && self.pending_start().is_none()
+            && self.auto_play_status().is_none();
+        if called_off || (idle && self.gap_ambient() != ambient_before) {
+            self.idle_ambient(true);
+        }
+        Ok(())
+    }
+
+    /// The ambient light for the gap the player is in, and whose settings
+    /// it plays, as [`Player::idle_ambient`] would bring it up.
+    fn gap_ambient(
+        &self,
+    ) -> (
+        Option<crate::config::ambient::PlaylistAmbient>,
+        playlist::AmbientSource,
+    ) {
+        let playlist = self.get_playlist();
+        let entry = self.waiting_entry(&playlist);
+        (
+            playlist.ambient_before(entry),
+            playlist.ambient_source(entry),
+        )
+    }
+
+    /// Calls off an auto play waiting out its gap that a playlist edit has
+    /// left with nothing to wait for: its song gone from the playlist's
+    /// place, or its entry no longer starting by itself. One still waited
+    /// for waits on, its gap as it was. Returns whether one was called off.
+    fn recheck_auto_play(&self) -> bool {
+        let Some((song, _)) = self.auto_play_status() else {
+            return false;
+        };
+        let playlist = self.get_playlist();
+        let still_waits = playlist.auto_play().is_some()
+            && playlist
+                .current()
+                .is_some_and(|current| current.name() == song);
+        if still_waits {
+            return false;
+        }
+        info!(
+            song,
+            "Auto play called off: the playlist edit took it away."
+        );
+        self.cancel_auto_play()
     }
 }

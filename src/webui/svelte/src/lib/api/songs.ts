@@ -12,287 +12,236 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-import { get, post, postYaml, putYaml, uploadFile, uploadFiles } from "./rest";
+import { Code, ConnectError } from "@connectrpc/connect";
+import type {
+  Browse,
+  BulkImport,
+  SongFile,
+  SongList,
+  TempoGuess,
+  Waveform,
+} from "../../gen/rules/mtrack_rules";
+import { configClient, playerClient } from "../grpc/client";
+import { callError, mapSongList } from "../grpc/library";
+import {
+  mapBrowse,
+  mapBulkImport,
+  mapSongConfig,
+  mapSongFiles,
+  mapTempoGuess,
+  songCallError,
+} from "../grpc/songs";
+export { SongNameTakenError } from "../grpc/songs";
+import {
+  mapTrackUploaded,
+  mapTracksUploaded,
+  type TrackUploaded,
+  type TracksUploaded,
+} from "../grpc/uploads";
+import { sendUpload } from "./upload";
+import { mapWaveform } from "../grpc/watch";
+import { UploadPurpose } from "../../gen/player/v1/player_pb";
+export type { TrackUploaded, TracksUploaded } from "../grpc/uploads";
 
-export interface SongSummary {
-  name: string;
-  duration_ms: number;
-  duration_display: string;
-  num_channels: number;
-  sample_format: string;
-  track_count: number;
-  tracks: string[];
-  has_midi: boolean;
-  has_lighting: boolean;
-  /** Song directory path relative to the songs root */
-  base_dir: string;
-  /** DSL lighting file paths relative to the songs root */
-  lighting_files: string[];
-  /** MIDI DMX file paths relative to the songs root */
-  midi_dmx_files: string[];
-  /** Beat grid, from the explicit tempo map or click track analysis */
-  beat_grid: { beats: number[]; measure_starts: number[] } | null;
-  /** Whether the song has an explicit tempo map configured */
-  has_tempo_map: boolean;
-  /** Whether this song loops when it finishes playing */
-  loop_playback: boolean;
-  /** Named sections defined by measure boundaries, optionally offset to a
-   * (possibly fractional) beat within the boundary measures. */
-  sections: {
-    name: string;
-    start_measure: number;
-    end_measure: number;
-    start_beat?: number | null;
-    end_beat?: number | null;
-    color?: string | null;
-  }[];
+/** Every song in the library, with what the song pages show, and those that
+ *  failed to load. */
+export async function fetchSongs(): Promise<SongList> {
+  try {
+    return mapSongList(await playerClient.listSongs({ detailed: true }));
+  } catch (e) {
+    throw callError(e, "Failed to fetch songs");
+  }
 }
 
-export interface WaveformTrack {
-  name: string;
-  peaks: number[];
-}
-
-export interface WaveformData {
-  song_name: string;
-  tracks: WaveformTrack[];
-}
-
-export interface SongFailure {
-  name: string;
-  error: string;
-  base_dir: string;
-  failed: true;
-}
-
-export interface FetchSongsResult {
-  songs: SongSummary[];
-  failures: SongFailure[];
-}
-
-export async function fetchSongs(): Promise<FetchSongsResult> {
-  const res = await get("/songs");
-  if (!res.ok) throw new Error(`Failed to fetch songs: ${res.status}`);
-  const data = await res.json();
-  return { songs: data.songs, failures: data.failures ?? [] };
-}
-
+/** A song's config file, as written. */
 export async function fetchSongConfig(name: string): Promise<string> {
-  const res = await get(`/songs/${encodeURIComponent(name)}`);
-  if (!res.ok) throw new Error(`Failed to fetch song: ${res.status}`);
-  return res.text();
+  try {
+    return mapSongConfig(await configClient.getSongConfig({ name }));
+  } catch (e) {
+    throw songCallError(e, "Failed to fetch song");
+  }
 }
 
-export async function createSong(
-  name: string,
-  yaml: string,
-): Promise<Response> {
-  return postYaml(`/songs/${encodeURIComponent(name)}`, yaml);
+/** Creates a song of `yaml` in the folder `name` (a nested song's has "/").
+ *  A song that exists already, or a name another song holds, is refused with
+ *  an error of `kind` "exists" (the latter a {@link SongNameTakenError}). */
+export async function createSong(name: string, yaml: string): Promise<void> {
+  try {
+    await configClient.createSong({ name, yaml });
+  } catch (e) {
+    throw songCallError(e, "Failed to create song");
+  }
 }
 
-export async function updateSong(
-  name: string,
-  yaml: string,
-): Promise<Response> {
-  return putYaml(`/songs/${encodeURIComponent(name)}`, yaml);
+/** Saves a song's config. A config that is not valid is refused with every
+ *  problem in the message. */
+export async function updateSong(name: string, yaml: string): Promise<void> {
+  try {
+    await configClient.saveSongConfig({ name, yaml });
+  } catch (e) {
+    throw songCallError(e, "Save failed");
+  }
 }
 
+/** Uploads one file into a song (the song and its config are made when it
+ *  is new): the file is announced, its bytes sent to the web server, and
+ *  the song takes it. Answers whether it replaced a file there, and the name
+ *  the song has: a new one's may not be the one asked for, when that is
+ *  taken. A refusal of the file's name or type comes before any bytes. */
 export async function uploadTrack(
   songName: string,
   file: File,
-): Promise<Response> {
-  return uploadFile(
-    `/songs/${encodeURIComponent(songName)}/tracks/${encodeURIComponent(file.name)}`,
+): Promise<TrackUploaded> {
+  const fail = (e: unknown) => songCallError(e, "Upload failed");
+  const id = await sendUpload(
+    { purpose: UploadPurpose.TRACK, song: songName },
     file,
+    fail,
   );
+  try {
+    return mapTrackUploaded(
+      await configClient.addTrackFiles({ song: songName, uploadIds: [id] }),
+    );
+  } catch (e) {
+    throw fail(e);
+  }
 }
 
+/** Uploads several files into a song at once. The song takes them together
+ *  or not at all. */
 export async function uploadTracks(
   songName: string,
   files: File[],
-): Promise<Response> {
-  return uploadFiles(`/songs/${encodeURIComponent(songName)}/tracks`, files);
+): Promise<TracksUploaded> {
+  const fail = (e: unknown) => songCallError(e, "Upload failed");
+  const ids: string[] = [];
+  for (const file of files) {
+    ids.push(
+      await sendUpload(
+        { purpose: UploadPurpose.TRACK, song: songName },
+        file,
+        fail,
+      ),
+    );
+  }
+  try {
+    return mapTracksUploaded(
+      await configClient.addTrackFiles({ song: songName, uploadIds: ids }),
+    );
+  } catch (e) {
+    throw fail(e);
+  }
 }
 
+/** Copies a file of the project into a song. Answers the name the song has:
+ *  a new one's may not be the one asked for, when that is taken. */
 export async function importFileToSong(
   songName: string,
   sourcePath: string,
   filename?: string,
-): Promise<Response> {
-  return post(
-    `/songs/${encodeURIComponent(songName)}/import`,
-    JSON.stringify({ path: sourcePath, filename }),
-  );
+): Promise<string> {
+  try {
+    const imported = await configClient.importSongFile({
+      name: songName,
+      path: sourcePath,
+      filename,
+    });
+    return imported.song;
+  } catch (e) {
+    throw songCallError(e, "Import failed");
+  }
 }
 
-export async function deleteSong(name: string): Promise<Response> {
-  return fetch(`/api/songs/${encodeURIComponent(name)}`, { method: "DELETE" });
+export async function deleteSong(name: string): Promise<void> {
+  try {
+    await configClient.deleteSong({ name });
+  } catch (e) {
+    throw songCallError(e, "Delete failed");
+  }
 }
 
-/** The song.yaml `tempo:` block — the song's explicit tempo map. */
-export interface TempoChangeConfig {
-  measure: number;
-  beat?: number;
-  bpm?: number;
-  time_signature?: string;
-  transition?: { beats: number } | { measures: number };
-}
+// The song.yaml `tempo:` and `metronome:` blocks, and the beat grid: the
+// player's own types, generated from the Rust structs with the rules module
+// (`lib/rules.ts`), so the UI holds no copy of them to drift.
+export type {
+  SongFile,
+  BeatGrid,
+  TempoConfig,
+  TempoChangeConfig,
+  TransitionConfig,
+  MetronomeConfig,
+  MetronomeChange as MetronomeChangeConfig,
+  MetronomeSounds,
+  ClickSound as ClickSoundConfig,
+  Subdivision as SubdivisionValue,
+} from "../../gen/rules/mtrack_rules";
 
-export interface TempoConfig {
-  bpm: number;
-  time_signature?: string;
-  start?: number;
-  changes?: TempoChangeConfig[];
-}
-
-/** The song.yaml `metronome:` block — a generated, routable click track. */
-export interface ClickSoundConfig {
-  file?: string;
-  freq?: number;
-  volume?: number;
-}
-
-/** Even ticks per beat (1 = none, 2 = eighths, ...) or a clave pattern. */
-export type SubdivisionValue = number | "son" | "rumba";
-
-/** A positional change to the metronome feel, anchored at a measure. */
-export interface MetronomeChangeConfig {
-  measure: number;
-  accents?: number[];
-  subdivision?: SubdivisionValue;
-}
-
-export interface MetronomeConfig {
-  /** Tri-state: absent = on (block present) / follows the player default
-   * (no block); false = explicitly off, settings preserved. */
-  enabled?: boolean;
-  track?: string;
-  accent?: number[];
-  /** Per-beat accent levels: 0 silent, 1 normal, 2 half accent, 3 accent.
-   * Padded with baseline / truncated per measure on length mismatch. */
-  accents?: number[];
-  subdivision?: SubdivisionValue;
-  /** Feel changes anchored at measures, active until the next change. */
-  changes?: MetronomeChangeConfig[];
-  /** Master click volume (0-2), scaling all sounds uniformly. */
-  volume?: number;
-  sounds?: {
-    accent?: ClickSoundConfig;
-    normal?: ClickSoundConfig;
-    half?: ClickSoundConfig;
-    sub?: ClickSoundConfig;
-  };
-}
-
-/** The song.yaml `pilot:` block — labeled voice hints at song positions. */
-export interface PilotHintConfig {
-  at: { measure: number; beat?: number } | { time: number };
-  label: string;
-  file?: string;
-  align?: "end" | "start";
-  offset?: number;
-}
-
-export interface PilotConfig {
-  track?: string;
-  hints?: PilotHintConfig[];
-}
-
-export interface GuessedTempo {
-  start_seconds: number;
-  bpm: number;
-  time_signature: [number, number];
-  changes: {
-    measure: number;
-    beat: number;
-    bpm: number;
-    time_signature: [number, number];
-    transition_beats?: number;
-  }[];
-  /** RMS alignment error in ms vs the click-track beat grid. Only present for
-   *  MIDI-sourced tempos. Values above 15ms suggest the MIDI may not match
-   *  the recorded audio. */
-  alignment_rms_ms?: number;
-}
-
-export interface TempoGuessResult {
-  source: "midi" | "beat_grid";
-  tempo: GuessedTempo;
-}
-
+/** A tempo map suggested for a song, or none when there is none to make: the
+ *  song has neither a MIDI file nor a beat grid (not found), or failed to load
+ *  (invalid), whose load error the song view already shows. Neither tempo
+ *  editor has anywhere to say more, so both leave the tempo as it is. */
 export async function fetchTempoGuess(
   name: string,
-): Promise<TempoGuessResult | null> {
-  const res = await get(`/songs/${encodeURIComponent(name)}/tempo-guess`);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`Failed to fetch tempo guess: ${res.status}`);
-  return res.json();
+): Promise<TempoGuess | null> {
+  try {
+    return mapTempoGuess(await configClient.guessSongTempo({ name }));
+  } catch (e) {
+    if (
+      e instanceof ConnectError &&
+      (e.code === Code.NotFound || e.code === Code.InvalidArgument)
+    ) {
+      return null;
+    }
+    throw songCallError(e, "Failed to fetch tempo guess");
+  }
 }
 
-export async function fetchWaveform(name: string): Promise<WaveformData> {
-  const res = await get(`/songs/${encodeURIComponent(name)}/waveform`);
-  if (!res.ok) throw new Error(`Failed to fetch waveform: ${res.status}`);
-  return res.json();
-}
-
-export interface SongFile {
-  name: string;
-  type: "audio" | "midi" | "lighting" | "other";
+export async function fetchWaveform(name: string): Promise<Waveform> {
+  try {
+    return mapWaveform(await configClient.getSongWaveform({ name }));
+  } catch (e) {
+    throw songCallError(e, "Failed to fetch waveform");
+  }
 }
 
 export async function fetchSongFiles(name: string): Promise<SongFile[]> {
-  const res = await get(`/songs/${encodeURIComponent(name)}/files`);
-  if (!res.ok) throw new Error(`Failed to fetch song files: ${res.status}`);
-  const data = await res.json();
-  return data.files;
-}
-
-export interface BrowseEntry {
-  name: string;
-  path: string;
-  type: "directory" | "audio" | "midi" | "lighting" | "other";
-  is_dir: boolean;
-}
-
-export interface BrowseResult {
-  path: string;
-  root: string;
-  entries: BrowseEntry[];
-}
-
-export async function browseDirectory(path?: string): Promise<BrowseResult> {
-  const query = path ? `?path=${encodeURIComponent(path)}` : "";
-  const res = await get(`/browse${query}`);
-  if (!res.ok) {
-    const data = await res.json().catch(() => null);
-    throw new Error(data?.error ?? `Failed to browse: ${res.status}`);
+  try {
+    return mapSongFiles(await configClient.listSongFiles({ name }));
+  } catch (e) {
+    throw songCallError(e, "Failed to fetch song files");
   }
-  return res.json();
 }
 
+export async function browseDirectory(path?: string): Promise<Browse> {
+  try {
+    return mapBrowse(await configClient.browseDirectory({ path: path ?? "" }));
+  } catch (e) {
+    throw songCallError(e, "Failed to browse");
+  }
+}
+
+/** Makes a song of a folder of the project; answers its name. A folder that
+ *  has a config, or a name another song holds, is refused with an error of
+ *  `kind` "exists" (the latter a {@link SongNameTakenError}). */
 export async function createSongInDirectory(
   dirPath: string,
   name?: string,
-): Promise<Response> {
-  return post("/browse/create-song", JSON.stringify({ path: dirPath, name }));
-}
-
-export interface BulkImportResult {
-  created: string[];
-  skipped: string[];
-  failed: { name: string; error: string }[];
-}
-
-export async function bulkImportSongs(
-  dirPath: string,
-): Promise<BulkImportResult> {
-  const res = await post(
-    "/browse/bulk-import",
-    JSON.stringify({ path: dirPath }),
-  );
-  if (!res.ok) {
-    const data = await res.json().catch(() => null);
-    throw new Error(data?.error ?? `Bulk import failed: ${res.status}`);
+): Promise<string> {
+  try {
+    const created = await configClient.createSongInDirectory({
+      path: dirPath,
+      name,
+    });
+    return created.song;
+  } catch (e) {
+    throw songCallError(e, "Failed to create song");
   }
-  return res.json();
+}
+
+export async function bulkImportSongs(dirPath: string): Promise<BulkImport> {
+  try {
+    return mapBulkImport(await configClient.bulkImportSongs({ path: dirPath }));
+  } catch (e) {
+    throw songCallError(e, "Bulk import failed");
+  }
 }

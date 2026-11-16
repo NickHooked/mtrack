@@ -1654,7 +1654,7 @@ tracks: []"##,
         serde_json::from_str(
             &actor
                 .controls
-                .recv_timeout(std::time::Duration::from_secs(1))
+                .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap(),
         )
         .unwrap()

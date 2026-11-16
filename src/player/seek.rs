@@ -13,16 +13,30 @@
 //
 
 use std::error::Error;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tracing::{info, warn};
 
-use super::{Player, ReactiveLoopState};
+use super::{LoopExit, Player};
+use crate::songs::Song;
 
 /// How long a seek waits for the previous playback to wind down before
 /// abandoning it. Normal wind-down is well under a second; this only fires
 /// when a playback thread failed to observe cancellation.
 const SEEK_WINDDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where the next play starts the current song, kept while it is stopped.
+#[derive(Clone, Copy)]
+pub(super) struct PendingStart {
+    pub(super) position: Duration,
+    /// Whether a pause kept it, as against a seek while stopped. A paused
+    /// song is a show in progress, its lights held, and holds off a
+    /// hardware reload and a config save until it resumes or is stopped. A
+    /// position cued while stopped is not: nothing plays, and nothing is
+    /// held.
+    pub(super) paused: bool,
+}
 
 impl Player {
     /// Pauses playback and stores the exact song position for the next play.
@@ -31,13 +45,82 @@ impl Player {
     /// than a native paused state. Capture elapsed first, stop all synchronized
     /// subsystems, then persist that position through the normal stopped seek
     /// path so the next `play()` resumes from it.
+    ///
+    /// During a loop break, before it has moved on, the player stops on the
+    /// break's target instead, as a stop does, and `None` is returned: there
+    /// is nothing of that song to resume.
     pub async fn pause(&self) -> Result<Option<Duration>, Box<dyn Error>> {
+        // The position is read under the join lock, from the playback the
+        // pause stops: read before it, a loop break's cleanup queued ahead
+        // could start the next song in between, and that song would be kept
+        // at the one before's position.
+        let mut join = self.join.lock().await;
+        // A looping song ending is one the operator has ended: there is
+        // nothing to resume, and a pause stops it as a stop does. Kept
+        // paused, the song was ending and paused at once, and the next play
+        // resumed it.
+        if (join.is_some() && self.loop_exit() == LoopExit::End) || self.ending_status().is_some() {
+            info!("The song is ending: a pause stops it.");
+            self.cut_locked(&mut join).await;
+            return Ok(None);
+        }
+        // A song just started, its clock not yet running, is where it
+        // started (`elapsed` says so), which after a seek or a resume is not
+        // its beginning.
         let Some(position) = self.elapsed().await? else {
             return Ok(None);
         };
-        self.stop().await;
-        self.seek_to(position).await?;
+        // The stop and the position kept for the next play are one step
+        // under the join lock, and the song counts as playing throughout,
+        // even one already paused, whose position the stop clears before
+        // it is kept again. A playlist edit between them would find neither
+        // playing nor paused, and give an off-list song's place to the
+        // entry after it, which play would then start at this song's
+        // position (#576).
+        self.song_playing.store(true, Ordering::Relaxed);
+        if !self.stop_for_pause(&mut join).await {
+            // A loop break had the player on its way to the next song: the
+            // pause stops it there, with nothing to resume, and the lights
+            // go to ambient as after a stop.
+            self.song_playing.store(false, Ordering::Relaxed);
+            self.idle_ambient(true);
+            self.reload_deferred_hardware();
+            return Ok(None);
+        }
+        let position = self.keep_paused_position(position);
+        self.song_playing.store(false, Ordering::Relaxed);
+        // Not idle: a paused song is a show in progress, its lights held,
+        // and must resume at once. A hardware reload waits on, for a stop or
+        // a move off the song. A pause on a song's very end keeps nothing to
+        // resume, though, and that is idle.
+        if !self.is_paused() {
+            self.reload_deferred_hardware();
+        }
         Ok(Some(position))
+    }
+
+    /// Keeps `position` in the current song for the next play to resume
+    /// from, and returns it as a position in the pass it is on.
+    pub(super) fn keep_paused_position(&self, position: Duration) -> Duration {
+        let Some(song) = self.get_playlist().current() else {
+            self.section_loop.reset();
+            return position;
+        };
+        // The position is already the place in the pass playing: the log's
+        // passes put it back as they fell due.
+        // Paused on the song's very end: there is nothing left to resume,
+        // so the next play starts it over, and the player is stopped, not
+        // paused: the section loop kept for a resume goes, as at a stop.
+        if check_start_position(&song, position, "").is_err() {
+            self.section_loop.reset();
+            return position;
+        }
+        info!(song = song.name(), position = ?position, "Paused; play resumes here");
+        self.transport.lock().pending_start = Some(PendingStart {
+            position,
+            paused: true,
+        });
+        position
     }
 
     /// Seeks to an absolute position within the current song.
@@ -47,7 +130,10 @@ impl Player {
     /// at the target position fully re-synchronized. While stopped, the
     /// position is stored and consumed by the next `play()`.
     ///
-    /// Seeking clears any active section loop.
+    /// Seeking clears any active section loop. A seek during a loop break,
+    /// before the break has moved on, calls the break off and seeks in the
+    /// looping song still playing: a seek is asked of the song it can see,
+    /// unlike a stop or pause, which stop on the break's target.
     pub async fn seek_to(&self, position: Duration) -> Result<(), Box<dyn Error>> {
         let mut join = self.join.lock().await;
 
@@ -55,30 +141,36 @@ impl Player {
             .get_playlist()
             .current()
             .ok_or("Cannot seek: playlist is empty")?;
-        if position > song.length() {
-            return Err(format!(
-                "Cannot seek to {:?}: beyond song length {:?}",
-                position,
-                song.length()
-            )
-            .into());
+        check_start_position(&song, position, "seek to")?;
+
+        // A looping song ending: stopped a moment from now, and nothing to
+        // restart.
+        if join.is_some() && self.loop_exit() == LoopExit::End {
+            return Err("Cannot seek: the song is ending".into());
         }
 
         let handles = match join.take() {
             None => {
                 // Not playing: remember the position for the next play().
                 info!(song = song.name(), position = ?position, "Seek stored as pending start position");
-                *self.pending_start.lock() = Some(position);
+                // A seek while paused moves the paused song, which stays
+                // paused.
+                // It exits any section loop, as a seek while playing does.
+                self.section_loop.reset();
+                let pending = &mut self.transport.lock().pending_start;
+                let paused = pending.is_some_and(|p| p.paused);
+                *pending = Some(PendingStart { position, paused });
                 return Ok(());
             }
             Some(handles) => handles,
         };
+        // A seek restarts this song: a break asked of it is called off.
+        self.forget_loop_break();
 
         info!(song = song.name(), position = ?position, "Seeking");
 
         // Seeking exits any section loop.
-        *self.active_section.write() = None;
-        *self.reactive_loop_state.write() = ReactiveLoopState::Idle;
+        self.section_loop.reset();
 
         // Fade the audio to avoid a click, then cancel playback. The cleanup
         // task observes the cancellation and takes the StopCancelled path,
@@ -87,10 +179,16 @@ impl Player {
         // startup stamps play_start_time under that lock and skips the stamp
         // when cancelled, so this ordering keeps it from writing the pre-seek
         // position back after we clear it.
-        self.fade_out_current_audio();
         {
             let mut play_start_time = self.play_start_time.lock().await;
+            // Between the playback's loop jumps, as a loop break: one
+            // already scheduled fades with the rest, and none is scheduled
+            // between the fade and the cancel, to be cut without one.
+            let jumps = handles.cancel.hold_jumps();
+            self.fade_out_current_audio(&handles.cancel);
+            self.cut_break_fade();
             handles.cancel.cancel();
+            drop(jumps);
             *play_start_time = None;
         }
 
@@ -109,6 +207,10 @@ impl Player {
                 warn!(err = %e, "Error waiting for playback to wind down during seek");
             }
             Err(_) => {
+                // The song a seek takes out of `join` counts as playing
+                // until it restarts; abandoned, it is not.
+                self.song_playing.store(false, Ordering::Relaxed);
+                self.reload_deferred_hardware();
                 warn!(
                     timeout = ?SEEK_WINDDOWN_TIMEOUT,
                     "Playback did not wind down in time during seek; abandoning it"
@@ -142,19 +244,62 @@ impl Player {
         self.seek_to(start_time).await
     }
 
-    /// Returns the pending start position set by seeking while stopped, if any.
+    /// Returns the pending start position set by a pause or by seeking while
+    /// stopped, if any.
     pub fn pending_start(&self) -> Option<Duration> {
-        *self.pending_start.lock()
+        self.transport.lock().pending_start.map(|p| p.position)
     }
 
-    /// Takes (consumes) the pending start position.
-    pub(super) fn take_pending_start(&self) -> Option<Duration> {
-        self.pending_start.lock().take()
+    /// Whether a song is paused: stopped by a pause, with a position to
+    /// resume from, until a play, a stop or a move off the song.
+    pub fn is_paused(&self) -> bool {
+        self.transport.lock().is_paused()
+    }
+
+    /// Leaves the current song paused at `position`, as a pause leaves it,
+    /// for a test whose song cannot play.
+    #[cfg(test)]
+    pub(crate) fn pause_at_for_test(&self, position: Duration) {
+        self.transport.lock().pending_start = Some(PendingStart {
+            position,
+            paused: true,
+        });
     }
 
     /// Clears the pending start position. Called when the playlist position
     /// changes so a stale seek doesn't apply to a different song.
     pub(super) fn clear_pending_start(&self) {
-        *self.pending_start.lock() = None;
+        self.transport.lock().pending_start = None;
+    }
+}
+
+/// Turns down a start position at or past the song's end: audio has nothing
+/// to play there, so playback would fail and the playlist skip the song
+/// (#584). A song with no length to go by -- no audio and no DSL show, a MIDI
+/// file or a MIDI DMX show alone -- takes any start, as it always has.
+pub(super) fn check_start_position(
+    song: &Song,
+    position: Duration,
+    action: &str,
+) -> Result<(), String> {
+    let length = song.length();
+    if !length.is_zero() && position >= length {
+        return Err(format!(
+            "Cannot {} {:?}: at or beyond song length {:?}",
+            action, position, length
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_song_with_no_length_takes_any_start() {
+        // A song with no audio and no DSL show has no length to go by.
+        let song = Song::default();
+        assert!(check_start_position(&song, Duration::from_secs(30), "play from").is_ok());
     }
 }

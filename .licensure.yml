@@ -27,6 +27,7 @@ excludes:
   - .*\.venue
   - .*/node_modules/.*
   - .*/dist/.*
+  - .*/dist-stage/.*
   - .*/gen/.*
   - .*\.json
   - .*\.prettierignore
@@ -34,7 +35,12 @@ excludes:
   - .*\.md
   - .*\.png
   - .*\.glb
+  - .*\.ttf
   - .*\.svg
+  # The phone app's platform projects are the Flutter template's own files
+  # (Gradle, Xcode, Kotlin and Swift stubs); only its Dart is ours.
+  - ^app/(android|ios)/
+  - ^app/\.metadata$
 licenses:
   - files: any
     ident: GPL-3.0
@@ -61,6 +67,7 @@ comments:
       - rs
       - proto
       - pest
+      - dart
       - ts
       - js
     commenter:

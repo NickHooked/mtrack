@@ -12,435 +12,211 @@
 // this program. If not, see <https://www.gnu.org/licenses/>.
 //
 
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use crate::config;
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;
 
 use super::super::config_io;
-use super::super::server::WebUiState;
-use super::helpers::{require_configured_dir, resolve_resource_path, validate_resource_name};
-use crate::config;
+use super::helpers::{validate_resource_name, validate_resource_name_to_write};
 
 // ---------------------------------------------------------------------------
-// Playlist CRUD endpoints
+// Playlist file helpers, shared by the gRPC service and MCP
 // ---------------------------------------------------------------------------
 
 /// Validates a playlist name for use in file paths.
+/// The player's own playlist is refused (400) saying so.
 #[allow(clippy::result_large_err)]
-fn validate_playlist_name(name: &str) -> Result<(), axum::response::Response> {
-    validate_resource_name(name, "playlist", Some("all_songs"))
-}
-
-/// GET /api/playlists — list all playlists with name, song count, and active status.
-pub(super) async fn get_playlists(State(state): State<WebUiState>) -> impl IntoResponse {
-    let playlists = state.player.list_playlists();
-    let active = {
-        let active_playlist = state.player.get_playlist();
-        active_playlist.name().to_string()
-    };
-    let items: Vec<serde_json::Value> = playlists
-        .iter()
-        .map(|name| {
-            let playlist_map = state.player.playlists_snapshot();
-            let song_count = playlist_map.get(name).map(|p| p.songs().len()).unwrap_or(0);
-            json!({
-                "name": name,
-                "song_count": song_count,
-                "is_active": name == &active,
-            })
-        })
-        .collect();
-    (StatusCode::OK, Json(json!(items))).into_response()
-}
-
-/// GET /api/playlists/:name — get a playlist's songs and available songs.
-pub(super) async fn get_playlist_by_name(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    let playlists = state.player.playlists_snapshot();
-    let Some(pl) = playlists.get(&name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": format!("Playlist '{}' not found", name)})),
+pub(crate) fn validate_playlist_name(name: &str) -> Result<(), axum::response::Response> {
+    if crate::playlist::is_reserved_name(name) {
+        let reserved = crate::playlist::PlaylistFileError::Reserved(name.to_string());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": reserved.to_string()})),
         )
-            .into_response();
-    };
-    let all_songs: Vec<String> = state
-        .player
-        .songs()
-        .sorted_list()
-        .iter()
-        .map(|s| s.name().to_string())
-        .collect();
-    (
-        StatusCode::OK,
-        Json(json!({
-            "name": name,
-            "songs": pl.songs(),
-            "available_songs": all_songs,
-        })),
-    )
-        .into_response()
+            .into_response());
+    }
+    validate_resource_name(name, "playlist", false)
 }
 
-#[derive(serde::Deserialize)]
-pub(super) struct PlaylistBody {
-    songs: Vec<String>,
-}
-
-/// PUT /api/playlists/:name — create or update a playlist.
-pub(super) async fn put_playlist_by_name(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-    Json(body): Json<PlaylistBody>,
-) -> impl IntoResponse {
-    validate_playlist_name(&name)?;
-    let playlists_dir =
-        require_configured_dir(&state.playlists_dir, "playlists", StatusCode::NOT_FOUND)?;
-
-    // Write the playlist YAML file.
-    let playlist_config = config::Playlist::new(&body.songs);
-    let yaml = match crate::util::to_yaml_string(&playlist_config) {
-        Ok(y) => y,
-        Err(e) => {
+/// The file that holds the playlist `name` in `dir` (`playlist::playlist_file`:
+/// its `.yaml`, else its `.yml`, as listed, else a new `.yaml`), checked to
+/// be inside `dir`. The reserved name is refused (400), and a new file named
+/// as one there but for case (409).
+#[allow(clippy::result_large_err)]
+fn playlist_path(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<crate::util::NamedFile, axum::response::Response> {
+    use crate::playlist::PlaylistFileError;
+    let file = match crate::playlist::playlist_file(dir, name) {
+        Ok(file) => Ok(file),
+        Err(PlaylistFileError::CaseClash(clash)) => Err(clash),
+        Err(e @ PlaylistFileError::Reserved(_)) => {
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to serialize playlist: {}", e)})),
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
             )
-                .into_response());
+                .into_response())
         }
     };
-
-    // Before `resolve_resource_path`, which canonicalizes the directory and
-    // fails if it is missing -- a creation after that call can never run.
-    // Created only when it is inside the project: a `playlists_dir:` pointing
-    // elsewhere is the operator's to set up, like `songs` and the rest.
-    let playlists_dir = super::helpers::ensure_configured_dir(&playlists_dir, &state).await?;
-
-    // codeql[rust/path-injection] name is validated by validate_playlist_name; path is
-    // verified via canonicalize + starts_with containment in resolve_resource_path.
-    let file_path = resolve_resource_path(&playlists_dir, &name, "yaml")?;
-
-    // Write atomically, off the async runtime.
-    let fp = file_path.clone();
-    let yaml_owned = yaml;
-    super::helpers::spawn_blocking_io("write playlist", move || {
-        config_io::staged_write(&fp, &yaml_owned)
-    })
-    .await?;
-
-    // Reload songs to pick up the new playlist.
-    state.player.reload_songs(
-        &state.songs_path,
-        state.playlists_dir.as_deref(),
-        state.legacy_playlist_path.as_deref(),
-    );
-
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({"status": "saved", "name": name})),
-        )
-            .into_response(),
-    )
+    super::helpers::resolve_named_file(dir, file)
 }
 
-/// DELETE /api/playlists/:name — delete a playlist.
-pub(super) async fn delete_playlist_by_name(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    validate_playlist_name(&name)?;
-    let playlists_dir =
-        require_configured_dir(&state.playlists_dir, "playlists", StatusCode::NOT_FOUND)?;
-
-    // codeql[rust/path-injection] name is validated by validate_playlist_name; path is
-    // verified via canonicalize + starts_with containment in resolve_resource_path.
-    let file_path = resolve_resource_path(&playlists_dir, &name, "yaml")?;
-    let yml_path = resolve_resource_path(&playlists_dir, &name, "yml")?;
-
-    // Determine which file to delete, then remove it off the async runtime.
-    let target = if file_path.is_file() {
-        file_path
-    } else if yml_path.is_file() {
-        yml_path
+/// A gap as written in a playlist: whole seconds as `2s`, else `1500ms`.
+/// The gRPC playlist read's and MCP's.
+pub(crate) fn format_gap(gap: std::time::Duration) -> String {
+    let ms = gap.as_millis();
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
     } else {
+        format!("{ms}ms")
+    }
+}
+
+/// Held by each playlist save and delete from reading the file to reloading
+/// the player, here and over MCP, so two at once (two editor tabs, say) take
+/// turns: a save reads the file to keep what the editor does not send, and
+/// one reading it while another rewrote it found it short and refused (#578).
+pub(crate) static PLAYLIST_WRITES: super::write_lock::WriteLock =
+    super::write_lock::WriteLock::new();
+
+/// The file a save of the playlist `name` writes, in the playlists
+/// directory `dir`, by the one rule of the gRPC `SavePlaylist` and MCP's
+/// `write_playlist` and `patch_playlist`: the name checked
+/// (`validate_playlist_name`; a new one by the rules for new names); the
+/// playlist's file as the directory lists it (`playlist_path`), or a new
+/// `<name>.yaml` when the directory is not there yet. Nothing is made:
+/// [`write_playlist_file`] makes the directory, once the save is checked,
+/// so a refused save leaves none behind.
+pub(crate) async fn playlist_file_to_write(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<crate::util::NamedFile, axum::response::Response> {
+    validate_playlist_name(name)?;
+    let dir_exists = tokio::fs::try_exists(dir).await.unwrap_or(false);
+    // codeql[rust/path-injection] name is validated by validate_playlist_name; path is
+    // verified via canonicalize + starts_with containment in playlist_path, and
+    // a missing directory's by `ensure_dir_within` when it is made.
+    let file = if dir_exists {
+        playlist_path(dir, name)?
+    } else {
+        // No directory, no files: a new `<name>.yaml`.
+        crate::playlist::playlist_file(dir, name).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        })?
+    };
+    validate_resource_name_to_write(name, "playlist", file.exists())?;
+    Ok(file)
+}
+
+/// A playlist as the text of its file, which ends with a newline: the web
+/// UI's, MCP's and gRPC's saves.
+#[allow(clippy::result_large_err)]
+pub(crate) fn playlist_yaml(
+    playlist: &config::Playlist,
+) -> Result<String, axum::response::Response> {
+    match crate::util::to_yaml_string(playlist) {
+        Ok(y) if y.ends_with('\n') => Ok(y),
+        Ok(y) => Ok(y + "\n"),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to serialize playlist: {}", e)})),
+        )
+            .into_response()),
+    }
+}
+
+/// Refuses (422) a playlist the player would refuse to load, before it is
+/// written: a song it does not have, a bad fade or ambient, or a fade
+/// leaving out a track its song does not have. So is a fade the player
+/// would cut short, longer than the song it plays under, and an ambient
+/// show outside the project. The gRPC and MCP playlist saves.
+#[allow(clippy::result_large_err)]
+pub(crate) fn check_playlist(
+    playlist: &config::Playlist,
+    player: &crate::player::Player,
+) -> Result<(), axum::response::Response> {
+    crate::playlist::validate_for_write(playlist, &player.songs()).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response()
+    })
+}
+
+/// Writes a playlist's `yaml` to its `file`, atomically, off the async
+/// runtime: the gRPC and MCP playlist saves, once checked. The
+/// file's directory is made first if missing, only inside `project`: a
+/// `playlists_dir:` (or `playlist:`) pointing elsewhere is the operator's
+/// to set up, like `songs` and the rest. The file is written under the
+/// directory as made, not as spelled -- those differ when the setting
+/// holds a `..`. A new playlist is created as new (`config_io::write`): a
+/// file made since the lookup, or one the filesystem takes for this name,
+/// is refused (409), never written over. Answers the path written.
+pub(crate) async fn write_playlist_file(
+    file: &crate::util::NamedFile,
+    yaml: String,
+    project: &std::path::Path,
+) -> Result<std::path::PathBuf, axum::response::Response> {
+    let file_path = match (file.path().parent(), file.path().file_name()) {
+        (Some(parent), Some(file_name)) if !parent.as_os_str().is_empty() => {
+            super::helpers::ensure_dir_within(parent, project)
+                .await?
+                .join(file_name)
+        }
+        _ => file.path().to_path_buf(),
+    };
+    let fp = file_path.clone();
+    let new = !file.exists();
+    let result = super::helpers::spawn_blocking_io("write playlist", move || {
+        Ok::<_, String>(config_io::write(&fp, &yaml, new))
+    })
+    .await?;
+    super::helpers::written(result, &file_path, "playlist")?;
+    Ok(file_path)
+}
+
+/// Deletes the file of the playlist `name` (already checked by
+/// [`validate_playlist_name`]) in `dir`, off the async runtime; 404 when
+/// there is none. The caller holds [`PLAYLIST_WRITES`] and reloads the
+/// player: the gRPC delete.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn remove_playlist_file(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<(), axum::response::Response> {
+    // codeql[rust/path-injection] name is validated by validate_playlist_name; path is
+    // verified via canonicalize + starts_with containment in playlist_path.
+    let target = playlist_path(dir, name)?;
+    if !target.exists() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("Playlist '{}' not found", name)})),
         )
             .into_response());
-    };
-    super::helpers::spawn_blocking_io("delete playlist", move || std::fs::remove_file(&target))
-        .await?;
-
-    // Reload songs to remove the playlist.
-    state.player.reload_songs(
-        &state.songs_path,
-        state.playlists_dir.as_deref(),
-        state.legacy_playlist_path.as_deref(),
-    );
-
-    Ok::<_, axum::response::Response>(
-        (
-            StatusCode::OK,
-            Json(json!({"status": "deleted", "name": name})),
-        )
-            .into_response(),
-    )
-}
-
-/// POST /api/playlists/:name/activate — switch the active playlist.
-pub(super) async fn activate_playlist(
-    State(state): State<WebUiState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
-    match state.player.switch_to_playlist(&name).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({"status": "activated", "name": name})),
-        )
-            .into_response(),
-        Err(e) => {
-            let status = if e.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::CONFLICT
-            };
-            (status, Json(json!({"error": e}))).into_response()
-        }
     }
+    // Remove it off the async runtime.
+    super::helpers::spawn_blocking_io("delete playlist", move || {
+        std::fs::remove_file(target.path())
+    })
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod test {
-    use super::super::router;
-    use super::super::test_helpers::*;
-    use axum::body::Body;
-    use axum::http::StatusCode;
-    use tower::ServiceExt;
+    use super::format_gap;
 
-    #[tokio::test]
-    async fn get_playlists_returns_list() {
-        let (state, _dir) = test_state();
-        // Create a playlist file with an empty songs list so it loads without
-        // requiring actual song directories on disk.
-        let playlists_dir = state.playlists_dir.clone().unwrap();
-        std::fs::write(playlists_dir.join("mylist.yaml"), "songs: []\n").unwrap();
-        // Reload songs so the player picks up the new playlist.
-        state.player.reload_songs(
-            &state.songs_path,
-            state.playlists_dir.as_deref(),
-            state.legacy_playlist_path.as_deref(),
-        );
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/playlists")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(parsed.is_array());
-        let arr = parsed.as_array().unwrap();
-        // Should contain at least the playlist we created.
-        assert!(arr.iter().any(|v| v["name"] == "mylist"));
-    }
-
-    #[tokio::test]
-    async fn get_playlist_by_name_not_found() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/playlists/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn put_playlist_by_name_creates_file() {
-        let (state, _dir) = test_state();
-        let playlists_dir = state.playlists_dir.clone().unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/playlists/mylist")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"songs": ["Song A"]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(playlists_dir.join("mylist.yaml").exists());
-    }
-
-    #[tokio::test]
-    async fn put_playlist_by_name_invalid_name_rejected() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/playlists/all_songs")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"songs": ["Song A"]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn put_playlist_by_name_path_traversal_rejected() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("PUT")
-                    .uri("/playlists/..%2Fevil")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"songs": ["Song A"]}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn delete_playlist_by_name_success() {
-        let (state, _dir) = test_state();
-        let playlists_dir = state.playlists_dir.clone().unwrap();
-        // Create a playlist file first.
-        std::fs::write(
-            playlists_dir.join("mylist.yaml"),
-            "songs:\n  - \"Song A\"\n",
-        )
-        .unwrap();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri("/playlists/mylist")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(!playlists_dir.join("mylist.yaml").exists());
-    }
-
-    #[tokio::test]
-    async fn delete_playlist_by_name_all_songs_rejected() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri("/playlists/all_songs")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn delete_playlist_by_name_not_found() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("DELETE")
-                    .uri("/playlists/nonexistent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn activate_playlist_success() {
-        let (state, _dir) = test_state();
-        // "all_songs" is always present in the player's playlists map.
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/playlists/all_songs/activate")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn activate_playlist_not_found() {
-        let (state, _dir) = test_state();
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/playlists/nonexistent/activate")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    #[test]
+    fn gaps_are_written_as_a_playlist_would() {
+        use std::time::Duration;
+        assert_eq!(format_gap(Duration::from_secs(2)), "2s");
+        assert_eq!(format_gap(Duration::from_millis(1500)), "1500ms");
     }
 
     #[test]
@@ -453,95 +229,5 @@ mod test {
         assert!(super::validate_playlist_name("..").is_err());
         assert!(super::validate_playlist_name("foo/..").is_err());
         assert!(super::validate_playlist_name("a\\b").is_err());
-    }
-
-    #[tokio::test]
-    async fn get_playlist_by_name_success() {
-        let (state, _dir) = test_state();
-        let playlists_dir = state.playlists_dir.clone().unwrap();
-        // Use an empty song list so the playlist loads without requiring actual songs on disk.
-        std::fs::write(playlists_dir.join("testlist.yaml"), "songs: []\n").unwrap();
-
-        state.player.reload_songs(
-            &state.songs_path,
-            state.playlists_dir.as_deref(),
-            state.legacy_playlist_path.as_deref(),
-        );
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/playlists/testlist")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["name"], "testlist");
-        assert!(parsed["songs"].is_array());
-        assert!(parsed["available_songs"].is_array());
-    }
-
-    #[tokio::test]
-    async fn get_playlist_by_name_yml_extension() {
-        let (state, _dir) = test_state();
-        let playlists_dir = state.playlists_dir.clone().unwrap();
-        // Write a .yml file (not .yaml) with an empty song list.
-        std::fs::write(playlists_dir.join("ymllist.yml"), "songs: []\n").unwrap();
-
-        state.player.reload_songs(
-            &state.songs_path,
-            state.playlists_dir.as_deref(),
-            state.legacy_playlist_path.as_deref(),
-        );
-
-        let app = router().with_state(state);
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/playlists/ymllist")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["name"], "ymllist");
-    }
-
-    #[tokio::test]
-    async fn get_playlists_with_active() {
-        let (state, _dir) = test_state();
-        // all_songs should be the active playlist by default.
-        let app = router().with_state(state);
-
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .uri("/playlists")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_body(response).await;
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let arr = parsed.as_array().unwrap();
-        // Find the all_songs entry and verify it's marked active.
-        let all_songs = arr
-            .iter()
-            .find(|v| v["name"] == "all_songs")
-            .expect("all_songs should be present");
-        assert_eq!(all_songs["is_active"], true);
     }
 }

@@ -1,0 +1,500 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+// Main file rule - can contain any combination of fixture types, venues, light shows, sequences, tempo, and a palette
+file = { SOI ~ (include | fixture_type | venue | light_show | sequence | tempo | palette)* ~ EOI }
+
+// `include "common.light"`: the sequences another file defines, its path
+// relative to this file's folder.
+include = { "include" ~ string }
+
+// A palette: named colour slots, each with the default colour the show plays
+// in. A slot is separated from the next by a comma or a line break. At most
+// one block per file (the parser enforces it).
+//
+//   palette {
+//     primary: "#C01020"
+//     accent: rgb(255, 240, 200)
+//   }
+palette = { "palette" ~ "{" ~ palette_slot* ~ "}" }
+
+palette_slot = { identifier ~ ":" ~ color_parameter ~ ","? }
+
+// `palette.accent`: a colour that is whichever the slot is when the song plays.
+// Atomic, so nothing is skipped around the dot.
+palette_ref = @{ "palette" ~ "." ~ identifier }
+
+// A whole value that is a palette reference: what the web UI's document
+// layer asks of text typed into a colour form. The player never invokes it.
+palette_ref_only = @{ SOI ~ palette_ref ~ EOI }
+
+// Light show rules
+// Allow optional show names so a single unnamed show per file is valid.
+// When multiple shows are present, the parser will enforce that each has a name.
+light_show = { "show" ~ show_name? ~ show_content }
+
+show_name = @{ quoted }
+
+show_content = { "{" ~ (tempo | cue)* ~ "}" }
+
+cue = { cue_body }
+
+// A show's cue and a sequence's alike; each keeps its name for the errors.
+cue_body = _{ cue_time ~ (loop_cue_command | sequence_reference | inline_loop)* }
+
+cue_time = _{ time_string | measure_time }
+
+// Sequence definition rules
+// `length:` fixes how long one pass lasts, so a loop restarts on time however
+// long its last effect runs.
+// Parameters, `(hit, bed: "#1E6FE0")`, are written `$hit` in the body and bound
+// where the sequence is used; one without a default must be bound there.
+sequence = { "sequence" ~ sequence_name ~ sequence_param_decls? ~ ("," ~ sequence_length)? ~ sequence_content }
+
+// One sequence definition alone, for re-parsing it with its parameters bound.
+sequence_source = { SOI ~ sequence ~ EOI }
+
+sequence_param_decls = { "(" ~ (sequence_param_decl ~ ("," ~ sequence_param_decl)*)? ~ ")" }
+
+sequence_param_decl = { identifier ~ (":" ~ sequence_arg_value)? }
+
+sequence_length = { "length" ~ ":" ~ time_parameter }
+
+sequence_name = @{ quoted }
+
+sequence_content = { "{" ~ (tempo | sequence_cue)* ~ "}" }
+
+sequence_cue = { cue_body }
+
+// Sequence reference in a cue
+sequence_reference = { "sequence" ~ sequence_name ~ sequence_args? ~ (","? ~ sequence_params)? }
+
+sequence_args = { "(" ~ (sequence_arg ~ ("," ~ sequence_arg)*)? ~ ")" }
+
+sequence_arg = { identifier ~ ":" ~ sequence_arg_value }
+
+// Substituted as written wherever the body says `$name`: a quoted string (a
+// colour), a `$name` passed through from an enclosing sequence, or a bare
+// token such as a group, number, percentage or duration.
+sequence_arg_value = @{ string | param_ref | (!("," | ")" | "(" | "\"" | "#" | WHITESPACE | NEWLINE) ~ ANY)+ }
+
+// A sequence parameter, replaced by its bound value before the body is parsed.
+param_ref = @{ "$" ~ identifier }
+
+sequence_params = { sequence_param ~ ("," ~ sequence_param)* }
+
+sequence_param = { sequence_param_name ~ ":" ~ sequence_param_value }
+
+sequence_param_name = { "loop" }
+
+sequence_param_value = { param_ref | loop_parameter | number_value }
+
+// Stop sequence command
+stop_sequence_command = { "stop" ~ "sequence" ~ sequence_name }
+
+// Inline loop - allows repeating a block of cues inline
+inline_loop = { "loop" ~ "{" ~ inline_loop_cue* ~ "}" ~ ","? ~ "repeats" ~ ":" ~ number_value }
+
+// Cues inside an inline loop (timing is relative to loop start)
+inline_loop_cue = { cue_time ~ loop_cue_command* }
+
+loop_cue_command = _{ effect | layer_command | stop_sequence_command | offset_command | reset_measures_command }
+
+// Measure offset commands
+offset_command = { "offset" ~ number_value ~ "measures" }
+reset_measures_command = { "reset_measures" }
+
+// Layer control commands (grandMA-inspired)
+layer_command = { layer_command_type ~ "(" ~ layer_command_params? ~ ")" }
+
+layer_command_type = { "clear" | "freeze" | "unfreeze" | "master" }
+
+layer_command_params = { layer_command_param ~ ("," ~ layer_command_param)* }
+
+layer_command_param = { layer_command_param_name ~ ":" ~ layer_command_param_value }
+
+layer_command_param_name = { "layer" | "intensity" | "speed" }
+
+layer_command_param_value = { param_ref | layer_parameter | percentage | number_value }
+
+time_string = @{ "@" ~ (time_mm_ss_mmm | time_ss_mmm) }
+
+measure_time = @{ "@" ~ ASCII_DIGIT+ ~ "/" ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+time_mm_ss_mmm = @{ ASCII_DIGIT+ ~ ":" ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+time_ss_mmm = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+
+// Parameters are optional; support both `effect_type param: v` and `effect_type, param: v`
+effect = { group_list ~ ":" ~ effect_type ~ (","? ~ parameters)? }
+
+group_list = { group_name ~ ("," ~ group_name)* }
+
+// Compound-atomic for the same reason as `identifier`: without it pest
+// inserts implicit WHITESPACE between the characters, so a directive on
+// the line before an effect -- `offset 1 measures` then `all_wash: ...`
+// -- ran into it as one long group name (#549). `$` rather than `@` keeps
+// the `param_ref` pair inside.
+group_name = ${ param_ref | (ASCII_ALPHANUMERIC | "_" | "-")+ }
+
+effect_type = { "static" | "cycle" | "strobe" | "pulse" | "chase" | "dimmer" | "rainbow" | "move" }
+
+parameters = { parameter ~ ("," ~ parameter)* }
+
+parameter = { layer_entry | parameter_name ~ ":" ~ parameter_value }
+
+// `layer: <name>`: any identifier, checked against the player's layers
+// after parsing. Matched by its key rather than as one more value kind, so
+// a name that begins like a keyword (`addons`, `snap_lights`) is read whole
+// instead of stopping at the keyword. Silent: the pair holds `parameter_name`
+// and the value, as for any other parameter.
+layer_entry = _{ &("layer" ~ ":") ~ parameter_name ~ ":" ~ (param_ref | layer_parameter) }
+
+// Prefer identifiers for names; allow quoted names when needed
+parameter_name = { identifier | string }
+
+parameter_value = { 
+    param_ref |
+    palette_ref |
+    degrees_parameter |
+    percentage |
+    time_parameter |
+    direction_parameter |
+    chase_pattern_parameter |
+    loop_parameter |
+    step_parameter |
+    transition_parameter |
+    blend_mode_parameter |
+    color_parameter |
+    number_value |
+    string |
+    bare_identifier
+}
+
+// An angle for `move`: `45deg`, `-20.5deg`. Before the number rules so the
+// unit is part of the value rather than a stray token.
+degrees_parameter = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ "deg" }
+
+// Restrictive bare identifier to avoid swallowing typos
+// Atomic to prevent backtracking issues when it's the last parameter
+bare_identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+color_parameter = { 
+    quoted_hex_color |
+    quoted_rgb_color |
+    quoted_cmyk_color |
+    quoted_cmy_color |
+    hex_color | 
+    rgb_color | 
+    cmyk_color |
+    cmy_color |
+    named_color
+}
+
+hex_color = @{ "#" ~ ASCII_HEX_DIGIT{6} }
+
+// RGB color with optional spaces after commas - make atomic to control whitespace
+rgb_color = @{ "rgb(" ~ ASCII_DIGIT+ ~ "," ~ " "? ~ ASCII_DIGIT+ ~ "," ~ " "? ~ ASCII_DIGIT+ ~ ")" }
+
+// Subtractive colour, each component a percentage of ink: `cmy(0%, 25%, 20%)`
+// is pink. `cmyk` adds black, which darkens all three. Read as the RGB it
+// prints as, so it is the same colour on every fixture.
+cmy_percent = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ "%" }
+cmy_color = @{ "cmy(" ~ cmy_percent ~ "," ~ " "? ~ cmy_percent ~ "," ~ " "? ~ cmy_percent ~ ")" }
+cmyk_color = @{ "cmyk(" ~ cmy_percent ~ "," ~ " "? ~ cmy_percent ~ "," ~ " "? ~ cmy_percent ~ "," ~ " "? ~ cmy_percent ~ ")" }
+
+named_color = { "\"" ~ ("red" | "green" | "blue" | "white" | "black" | "yellow" | "cyan" | "magenta" | "orange" | "purple" | "pink") ~ "\"" }
+
+quoted_hex_color = @{ "\"" ~ hex_color ~ "\"" }
+
+quoted_rgb_color = @{ "\"" ~ rgb_color ~ "\"" }
+
+quoted_cmy_color = @{ "\"" ~ cmy_color ~ "\"" }
+
+quoted_cmyk_color = @{ "\"" ~ cmyk_color ~ "\"" }
+
+// Time-based parameters (duration, fade, etc.) all use the same format
+// Supports absolute time (ms, s) and musical time (beats, measures)
+time_parameter = @{ time_value ~ time_unit }
+
+// `cycle` accepts the first three, `chase` the last six. No effect accepts
+// both sets, and nothing accepts `random` — that value belongs to
+// chase_pattern_parameter and loop_parameter, not here.
+direction_parameter = {
+    "forward" | "backward" | "pingpong" |
+    "left_to_right" | "right_to_left" |
+    "top_to_bottom" | "bottom_to_top" |
+    "clockwise" | "counter_clockwise"
+}
+
+chase_pattern_parameter = { "linear" | "snake" | "random" }
+
+loop_parameter = { "once" | "loop" | "pingpong" | "random" }
+
+step_parameter = { "[" ~ step_list ~ "]" }
+
+step_list = { step ~ ("," ~ step)* }
+
+step = { "{" ~ step_content ~ "}" }
+
+step_content = { step_param ~ ("," ~ step_param)* }
+
+step_param = { parameter_name ~ ":" ~ parameter_value }
+
+transition_parameter = { "snap" | "fade" | "crossfade" | "hue" }
+
+// A layer's name: an identifier. Which names exist is the player's
+// configuration, not the grammar's.
+layer_parameter = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+blend_mode_parameter = { "replace" | "multiply" | "add" | "overlay" | "screen" }
+
+percentage = @{ ASCII_DIGIT+ ~ "%" }
+
+// Canonical number form reused across numeric parameters
+// Atomic: implicit whitespace (which includes comments) must not be allowed
+// between the digits, or a comment after `repeats: 11` becomes part of the number.
+number_value = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+time_value = { number_value }
+
+time_unit = @{ "measures" | "measure" | "beats" | "beat" | "ms" | "s" }
+
+// Atomic so nothing is implicitly skipped inside the quotes: a non-atomic
+// rule let `#` start a COMMENT mid-string, so a name like "Truss #3"
+// swallowed the rest of its line.
+string = @{ quoted }
+
+// Every quoted name's form; silent, so each name keeps its rule for errors.
+quoted = _{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+
+// Atomic for the same reason bare_identifier is: without it pest inserts
+// implicit WHITESPACE inside the trailing repetition, so a venue's
+// `group "a" = P1` swallows the newline and the next line's `group` keyword
+// as further identifier characters.
+identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+
+// Tempo section rules
+tempo = { "tempo" ~ "{" ~ tempo_content ~ "}" }
+
+tempo_content = { (tempo_start | tempo_bpm | tempo_time_signature | tempo_changes)* }
+
+tempo_start = { "start" ~ ":" ~ time_parameter }
+
+tempo_bpm = { "bpm" ~ ":" ~ number_value }
+
+tempo_time_signature = { "time_signature" ~ ":" ~ time_sig_value }
+
+time_sig_value = @{ ASCII_DIGIT+ ~ "/" ~ ASCII_DIGIT+ }
+
+tempo_changes = { "changes" ~ ":" ~ "[" ~ tempo_change_list? ~ "]" }
+
+tempo_change_list = { tempo_change ~ ("," ~ tempo_change)* }
+
+tempo_change = { cue_time ~ "{" ~ tempo_change_content ~ "}" }
+
+tempo_change_content = { tempo_change_param ~ ("," ~ tempo_change_param)* }
+
+tempo_change_param = { 
+    tempo_bpm | tempo_time_signature | tempo_change_transition
+}
+
+tempo_change_transition = { "transition" ~ ":" ~ tempo_transition_duration }
+
+tempo_transition_duration = { tempo_transition_measures | tempo_transition_beats | tempo_transition_snap }
+
+tempo_transition_measures = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ "m" }
+
+tempo_transition_beats = { number_value }
+
+tempo_transition_snap = { "snap" }
+
+// A comment, to the end of its line: `# …` or `// …`. The one rule that
+// says what a comment is. The grammar skips comments as whitespace
+// (`COMMENT`, silent and atomic, so a parse and its errors are exactly as
+// they were without this rule); the web UI's document model reads the
+// comments of a file by parsing the text between a rule's children with
+// `gap`, whose `comment_tok` leaves a pair behind. The player never
+// invokes `gap`.
+comment_body = { ("//" | "#") ~ (!"\n" ~ ANY)* }
+
+COMMENT = _{ comment_body }
+
+comment_tok = @{ comment_body }
+
+gap = ${ SOI ~ (comment_tok | !comment_tok ~ ANY)* ~ EOI }
+
+// A whole value that is a sequence parameter reference: what the web UI
+// asks of text typed into a form. Atomic, so nothing is skipped around the
+// reference: `$x # c` is a reference and a comment, not a reference. The
+// player never invokes it.
+param_ref_only = @{ SOI ~ param_ref ~ EOI }
+
+// Fixture type rules
+fixture_type = { "fixture_type" ~ fixture_type_name ~ gdtf_source? ~ "{" ~ fixture_type_content ~ "}" }
+
+fixture_type_name = @{ quoted }
+
+// Referential fixture types name the GDTF archive they are distilled from;
+// the file body carries only human additions (movement limits), which apply
+// to every mode. The type is the whole archive and names no mode: each venue
+// fixture states its own. A `mode` here is still matched, only so the parser
+// can say what to do instead of failing on a bare syntax error.
+gdtf_source = { "from" ~ "gdtf" ~ "(" ~ string ~ ("," ~ "mode" ~ string)? ~ ")" }
+
+fixture_type_content = {
+    (channels | channel_map | channel_def | cell_def | movement_block | strobe_curve | max_strobe_frequency | min_strobe_frequency | strobe_dmx_offset | special_cases)*
+}
+
+// A cell of a pixel fixture (design §17.2): its channels, and where it
+// sits in the fixture's frame (meters). The fixture-level channels are
+// derived: the first cell's, mirroring the rest.
+//
+//   cell "1" at (-0.3, 0, 0) { channel "red" @ 2  channel "green" @ 3 }
+cell_def = { "cell" ~ string ~ cell_offset? ~ "{" ~ channel_def* ~ "}" }
+
+cell_offset = { "at" ~ vec3 }
+
+// Rich channel definitions (design §15.6), the v2 DSL for hand-authored
+// fixture types in `.fixture` files: a one-liner per channel, with the
+// fine byte, a physical range, and a block only where the channel has
+// functions. `channels`/`channel_map` must come first in the alternation
+// above: their keywords share a prefix with this one.
+//
+//   channel "pan" @ 1 fine 2 range -270deg..270deg
+//   channel "strobe" @ 6 {
+//     function "open" 0..15
+//     function "strobe" 16..255 0.5hz..20hz
+//   }
+channel_def = { "channel" ~ string ~ "@" ~ offset_value ~ channel_fine? ~ channel_range? ~ channel_block? }
+
+channel_fine = { "fine" ~ offset_value }
+
+// Atomic: the shared `number_value` is not, and pest then lets whitespace
+// sit between its digits, so `255 0.5hz` read as one number.
+offset_value = @{ ASCII_DIGIT+ }
+
+channel_range = { "range" ~ phys_range }
+
+channel_block = { "{" ~ function_def* ~ "}" }
+
+function_def = { "function" ~ string ~ dmx_range ~ phys_range? }
+
+dmx_range = { offset_value ~ ".." ~ offset_value }
+
+phys_range = { phys_value ~ ".." ~ phys_value }
+
+// A physical value with its unit: degrees or hertz.
+phys_value = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ ("deg" | "hz") }
+
+// Movement limits — not in GDTF; measured or taken from the datasheet.
+movement_block = { "movement" ~ "{" ~ movement_param* ~ "}" }
+
+movement_param = { movement_param_name ~ ":" ~ speed_value }
+
+movement_param_name = { "max_pan_speed" | "max_tilt_speed" }
+
+speed_value = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ "deg/s" }
+
+channels = { "channels" ~ ":" ~ number_value }
+
+max_strobe_frequency = { "max_strobe_frequency" ~ ":" ~ number_value }
+
+// How a strobe rate maps onto the strobe function's DMX range: linear in
+// the flash period, linear in hertz between the endpoints, or the GDTF's
+// own step table. Absent is automatic (the table when it has one, else
+// period). A setting of the unit, so a GDTF type's record may carry it.
+strobe_curve = { "strobe_curve" ~ ":" ~ strobe_curve_value }
+
+strobe_curve_value = { "period" | "linear" | "declared" }
+
+min_strobe_frequency = { "min_strobe_frequency" ~ ":" ~ number_value }
+
+strobe_dmx_offset = { "strobe_dmx_offset" ~ ":" ~ number_value }
+
+channel_map = { "channel_map" ~ ":" ~ "{" ~ channel_mapping_list ~ "}" }
+
+channel_mapping_list = { channel_mapping ~ ("," ~ channel_mapping)* }
+
+channel_mapping = { channel_name ~ ":" ~ channel_number }
+
+channel_name = @{ quoted }
+
+channel_number = { number_value }
+
+special_cases = { "special_cases" ~ ":" ~ "[" ~ special_case_list ~ "]" }
+
+special_case_list = { special_case ~ ("," ~ special_case)* }
+
+special_case = @{ quoted }
+
+// Venue rules - support both simple and complex formats
+venue = { "venue" ~ string ~ "{" ~ venue_content ~ "}" }
+
+// Provenance and geometry are body statements, not a header reference: an
+// MVR *seeds* a venue (the tags and focus names are yours afterwards), it does
+// not resolve one the way `from gdtf(...)` resolves a fixture type.
+venue_content = { (venue_source | fixture | focus_point | group)* }
+
+// The MVR this venue was seeded from, project-relative, and the MVR-space
+// point (meters) that became the stage origin — re-import reapplies it.
+venue_source = { "imported" ~ "from" ~ "mvr" ~ "(" ~ string ~ ")" ~ venue_origin? }
+
+venue_origin = { "origin" ~ vec3 }
+
+// A named stage point shows can aim at; the positional analog of a tag.
+focus_point = { "focus" ~ string ~ vec3 }
+
+// The type may be quoted. `identifier` is atomic, so a type whose declared
+// name is not a bare word — `fixture_type "Moving Head"` — has no other way to
+// be referenced. It used to work only because a non-atomic `identifier`
+// silently swallowed the space.
+//
+// `mode` picks one of a GDTF-sourced type's modes for this fixture, and every
+// fixture of a GDTF type states one (a load error otherwise; a native type
+// with one is an error too — the loader says which). It follows the type because the
+// type is matched first: `identifier` is atomic and greedy, so a type named
+// `mode` or `mode-x` is still a type, and `mode` is a keyword only after it.
+fixture = { "fixture" ~ string ~ (string | identifier) ~ fixture_mode? ~ "@" ~ universe_num ~ ":" ~ address_num ~ (tags | position | rotation | beam_angle)* }
+
+fixture_mode = { "mode" ~ string }
+
+// Stage coordinates: meters, right-handed Z-up, origin downstage-center on
+// the deck, +x stage-left, +y upstage, +z up. Rotation is degrees about the
+// stage X, Y and Z axes, applied in that order.
+position = { "position" ~ vec3 }
+rotation = { "rotation" ~ vec3 }
+
+// The beam angle this unit really has on stage, in degrees (a diffuser or
+// filter makes it wider than its type says). A drawing hint for the web UI's
+// 3D view only; the parser enforces the range.
+beam_angle = { "beam_angle" ~ signed_number }
+
+vec3 = { "(" ~ signed_number ~ "," ~ signed_number ~ "," ~ signed_number ~ ")" }
+
+signed_number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+// Atomic: non-atomic, pest put implicit WHITESPACE (which includes a
+// COMMENT) inside the digit run, so a one-digit address followed by a
+// trailing comment captured the comment as part of the number.
+universe_num = @{ ASCII_DIGIT+ }
+address_num = @{ ASCII_DIGIT+ }
+
+tags = { "tags" ~ tag_list }
+tag_list = { "[" ~ string ~ ("," ~ string)* ~ "]" }
+
+group = { "group" ~ string ~ "=" ~ identifier_list }
+
+identifier_list = { identifier ~ ("," ~ identifier)* }
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" | COMMENT }

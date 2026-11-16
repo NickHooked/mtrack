@@ -22,14 +22,14 @@ use std::time::Duration;
 #[test]
 fn test_channel_state_blending() {
     // Test the ChannelState blending logic directly
-    let base_state = ChannelState::new(0.8, EffectLayer::Background, BlendMode::Replace);
-    let overlay_state = ChannelState::new(0.5, EffectLayer::Foreground, BlendMode::Multiply);
+    let base_state = ChannelState::new(0.8, EffectLayer::BACKGROUND, BlendMode::Replace);
+    let overlay_state = ChannelState::new(0.5, EffectLayer::FOREGROUND, BlendMode::Multiply);
 
     let blended = base_state.blend_with(overlay_state);
 
     // Multiply: 0.8 * 0.5 = 0.4
     assert!((blended.value - 0.4).abs() < 0.01);
-    assert_eq!(blended.layer, EffectLayer::Foreground); // Higher layer wins
+    assert_eq!(blended.layer, EffectLayer::FOREGROUND); // Higher layer wins
     assert_eq!(blended.blend_mode, BlendMode::Multiply); // Higher layer's blend mode
 }
 #[test]
@@ -37,24 +37,30 @@ fn test_fixture_state_blending() {
     let mut fixture1 = FixtureState::new();
     fixture1.set_channel(
         "red".to_string(),
-        ChannelState::new(1.0, EffectLayer::Background, BlendMode::Replace),
+        ChannelState::new(1.0, EffectLayer::BACKGROUND, BlendMode::Replace),
     );
     fixture1.set_channel(
         "green".to_string(),
-        ChannelState::new(0.5, EffectLayer::Background, BlendMode::Replace),
+        ChannelState::new(0.5, EffectLayer::BACKGROUND, BlendMode::Replace),
     );
 
     let mut fixture2 = FixtureState::new();
     fixture2.set_channel(
         "green".to_string(),
-        ChannelState::new(0.8, EffectLayer::Foreground, BlendMode::Multiply),
+        ChannelState::new(0.8, EffectLayer::FOREGROUND, BlendMode::Multiply),
     );
     fixture2.set_channel(
         "blue".to_string(),
-        ChannelState::new(0.3, EffectLayer::Foreground, BlendMode::Replace),
+        ChannelState::new(0.3, EffectLayer::FOREGROUND, BlendMode::Replace),
     );
 
     fixture1.blend_with(&fixture2);
+    // Colour is composited when the frame is resolved.
+    let channels: HashMap<String, u16> = [("red", 1), ("green", 2), ("blue", 3)]
+        .into_iter()
+        .map(|(n, o)| (n.to_string(), o))
+        .collect();
+    fixture1.resolve(&channels);
 
     // Green should be blended: 0.5 * 0.8 = 0.4
     let green_state = fixture1.channels.get("green").unwrap();
@@ -141,7 +147,7 @@ fn test_blend_mode_loss_debug() {
             duration: Duration::from_secs(10),
         },
         vec!["front_wash".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -154,7 +160,7 @@ fn test_blend_mode_loss_debug() {
             curve: DimmerCurve::Linear,
         },
         vec!["front_wash".to_string()],
-        EffectLayer::Midground,
+        EffectLayer::MIDGROUND,
         BlendMode::Multiply,
     );
 
@@ -254,8 +260,11 @@ fn test_timeline_blend_mode_loss() {
 
     // Update timeline to get effects at different times
     let result_at_0s = timeline.update(Duration::from_secs(0));
-    println!("✅ Timeline at 0s: {} effects", result_at_0s.effects.len());
-    for effect in &result_at_0s.effects {
+    println!(
+        "✅ Timeline at 0s: {} effects",
+        result_at_0s.effects().count()
+    );
+    for effect in result_at_0s.effects() {
         println!(
             "  Effect: {} blend_mode = {:?}",
             effect.id, effect.blend_mode
@@ -263,8 +272,11 @@ fn test_timeline_blend_mode_loss() {
     }
 
     let result_at_2s = timeline.update(Duration::from_secs(2));
-    println!("✅ Timeline at 2s: {} effects", result_at_2s.effects.len());
-    for effect in &result_at_2s.effects {
+    println!(
+        "✅ Timeline at 2s: {} effects",
+        result_at_2s.effects().count()
+    );
+    for effect in result_at_2s.effects() {
         println!(
             "  Effect: {} blend_mode = {:?}",
             effect.id, effect.blend_mode
@@ -272,7 +284,7 @@ fn test_timeline_blend_mode_loss() {
     }
 
     // Start the effects from timeline
-    for effect in result_at_0s.effects {
+    for effect in result_at_0s.effects().cloned() {
         engine.start_effect(effect).unwrap();
     }
 
@@ -281,7 +293,7 @@ fn test_timeline_blend_mode_loss() {
     println!("✅ Applied static effect from timeline");
 
     // Start the dimmer effect from timeline
-    for effect in result_at_2s.effects {
+    for effect in result_at_2s.effects().cloned() {
         engine.start_effect(effect).unwrap();
     }
 
@@ -323,7 +335,7 @@ fn test_blend_mode_compatibility_matrix() {
             duration: Duration::from_secs(10),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Replace,
     );
 
@@ -338,7 +350,7 @@ fn test_blend_mode_compatibility_matrix() {
             duration: Duration::from_secs(10),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background, // Same layer
+        EffectLayer::BACKGROUND, // Same layer
         BlendMode::Multiply,
     );
 
@@ -360,7 +372,7 @@ fn test_blend_mode_compatibility_matrix() {
             curve: DimmerCurve::Linear,
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background,
+        EffectLayer::BACKGROUND,
         BlendMode::Add,
     );
 
@@ -373,7 +385,7 @@ fn test_blend_mode_compatibility_matrix() {
             duration: Duration::from_secs(10),
         },
         vec!["test_fixture".to_string()],
-        EffectLayer::Background, // Same layer
+        EffectLayer::BACKGROUND, // Same layer
         BlendMode::Overlay,
     );
 

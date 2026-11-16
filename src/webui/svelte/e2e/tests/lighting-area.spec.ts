@@ -1,0 +1,458 @@
+// Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
+//
+// This program is free software: you can redistribute it and/or modify it under
+// the terms of the GNU General Public License as published by the Free Software
+// Foundation, version 3.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program. If not, see <https://www.gnu.org/licenses/>.
+//
+
+import { test, expect, type Page } from "@playwright/test";
+import { Code, ConnectError } from "@connectrpc/connect";
+import {
+  ConfigService,
+  PlayerService,
+} from "../../src/gen/player/v1/player_pb";
+import {
+  getConfigReply,
+  getProfileFileReply,
+  listProfileFilesReply,
+  profileFileSavedReply,
+  savedReply,
+} from "../support/config-rpc";
+import { mockRpc } from "../support/rpc";
+import { sendStage } from "../support/stage";
+import { setWatchOpening } from "../support/watch";
+import type { ProfileFileInfo } from "../../src/gen/rules/mtrack_rules";
+
+let testCounter = 0;
+
+/** Two profiles, both with lighting, so the Groups picker has a choice. The
+ *  mock reports `test-host` as the running profile. Each test routes its own
+ *  copy: nothing here is shared between tests. */
+const TWO_PROFILES_YAML = `songs: songs
+profiles:
+  - hostname: other-host
+    dmx:
+      universes: []
+      lighting:
+        current_venue: test-venue
+  - hostname: test-host
+    dmx:
+      universes: []
+      lighting:
+        groups:
+          wash:
+            name: wash
+            constraints: []
+`;
+
+async function routeTwoProfiles(page: Page) {
+  const rpc = await mockRpc(page);
+  rpc.unary(
+    PlayerService.method.getConfig,
+    getConfigReply({ yaml: TWO_PROFILES_YAML, checksum: "two" }),
+  );
+  return rpc;
+}
+
+test.describe("Lighting area: routes and navigation", () => {
+  test("the nav has a Lighting item between Playlists and Config", async ({
+    page,
+  }) => {
+    await page.goto("/#/");
+    // evaluateAll reads the nav as it is, without waiting: wait for it to
+    // have rendered, or a slow start reads no tabs at all.
+    await expect(page.locator('.topnav__tab[href="#/lighting"]')).toBeVisible();
+    const hrefs = await page
+      .locator(".topnav__tab")
+      .evaluateAll((els) => els.map((e) => e.getAttribute("href")));
+    const lighting = hrefs.indexOf("#/lighting");
+    expect(lighting).toBeGreaterThan(-1);
+    expect(hrefs.indexOf("#/playlists")).toBe(lighting - 1);
+    expect(hrefs.indexOf("#/config")).toBe(lighting + 1);
+  });
+
+  test("the nav item opens the overview and is active", async ({ page }) => {
+    await page.goto("/#/");
+    await page.locator('.topnav__tab[href="#/lighting"]').click();
+    await expect(page).toHaveURL(/#\/lighting$/);
+    await expect(page.locator(".topnav__tab--active")).toHaveAttribute(
+      "href",
+      "#/lighting",
+    );
+    await expect(page.getByTestId("lighting-overview")).toBeVisible();
+    await expect(page).toHaveTitle(/^Lighting - mtrack/);
+  });
+
+  for (const [hash, tab, title] of [
+    ["/#/lighting/fixtures", "Fixture types", /Lighting - Fixture types/],
+    ["/#/lighting/venues", "Venues", /Lighting - Venues/],
+    ["/#/lighting/groups", "Groups", /Lighting - Groups/],
+    ["/#/lighting/fit", "Fit shows", /Lighting - Fit shows/],
+  ] as const) {
+    test(`${hash} renders with its tab current and its title`, async ({
+      page,
+    }) => {
+      await routeTwoProfiles(page);
+      await page.goto(hash);
+      const nav = page.getByRole("navigation", { name: "Lighting sections" });
+      await expect(nav.locator('[aria-current="page"]')).toHaveText(tab);
+      await expect(page).toHaveTitle(title);
+    });
+  }
+
+  test("the sub-navigation is made of links a keyboard can reach", async ({
+    page,
+  }) => {
+    await page.goto("/#/lighting");
+    const nav = page.getByRole("navigation", { name: "Lighting sections" });
+    await expect(nav.getByRole("link")).toHaveCount(5);
+    await nav.getByRole("link", { name: "Venues" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/#\/lighting\/venues$/);
+  });
+
+  test("an old Stage 3D address lands on Venues in 3D, and Back skips it", async ({
+    page,
+  }) => {
+    await page.goto("/#/");
+    await page.evaluate(() => {
+      window.location.hash = "#/lighting/stage";
+    });
+    await expect(page).toHaveURL(/#\/lighting\/venues\?view=3d$/);
+    const nav = page.getByRole("navigation", { name: "Lighting sections" });
+    await expect(nav.locator('[aria-current="page"]')).toHaveText("Venues");
+    await expect(
+      nav.getByRole("link", { name: "3D", exact: true }),
+    ).toHaveCount(0);
+    await page.goBack();
+    await expect(page).toHaveURL(/#\/$/);
+  });
+
+  test("a bookmarked #/stage preview keeps its song and time", async ({
+    page,
+  }) => {
+    await page.goto("/#/stage?mode=preview&song=Test%20Song%20Alpha&t=12.5");
+    await expect(page).toHaveURL(
+      /#\/lighting\/venues\?view=3d&mode=preview&song=Test\+Song\+Alpha&t=12\.5$/,
+    );
+  });
+
+  test("the area works at phone width", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 667 });
+    await page.goto("/#/lighting");
+    await expect(page.getByTestId("lighting-overview")).toBeVisible();
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth,
+    );
+    expect(overflow).toBe(false);
+    await page.locator(".topnav__hamburger").click();
+    await expect(page.locator('.drawer a[href="#/lighting"]')).toBeVisible();
+  });
+});
+
+test.describe("Lighting area: Groups", () => {
+  test("the picker defaults to the running profile", async ({ page }) => {
+    await routeTwoProfiles(page);
+    await page.goto("/#/lighting/groups");
+    const picker = page.locator("#groups-profile");
+    await expect(picker).toHaveValue("test-host");
+    // Its current venue and group are what the panel shows.
+    await expect(page.locator(".group-card")).toHaveCount(1);
+    await expect(page.locator("#lighting-venue")).toHaveValue("");
+  });
+
+  test("?profile= picks the profile", async ({ page }) => {
+    await routeTwoProfiles(page);
+    await page.goto("/#/lighting/groups?profile=other-host");
+    await expect(page.locator("#groups-profile")).toHaveValue("other-host");
+    await expect(page.locator("#lighting-venue")).toHaveValue("test-venue");
+    await expect(page.locator(".group-card")).toHaveCount(0);
+  });
+
+  test("choosing another profile updates the URL and the panel", async ({
+    page,
+  }) => {
+    await routeTwoProfiles(page);
+    await page.goto("/#/lighting/groups");
+    await page.locator("#groups-profile").selectOption("other-host");
+    await expect(page).toHaveURL(/#\/lighting\/groups\?profile=other-host$/);
+    await expect(page.locator("#lighting-venue")).toHaveValue("test-venue");
+    await expect(page.locator(".group-card")).toHaveCount(0);
+  });
+
+  test("saving writes the selected inline profile by index", async ({
+    page,
+  }) => {
+    const rpc = await routeTwoProfiles(page);
+    rpc.unary(
+      PlayerService.method.updateProfile,
+      savedReply({ yaml: TWO_PROFILES_YAML, checksum: "after" }),
+    );
+    await page.goto("/#/lighting/groups");
+    await expect(page.locator(".group-card")).toHaveCount(1);
+    const save = page.getByRole("button", { name: "Save", exact: true });
+    await expect(save).toBeDisabled();
+    await page.locator("#lighting-venue").selectOption("test-venue");
+    await expect(save).toBeEnabled();
+    await save.click();
+    await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+    const puts = rpc.calls(PlayerService.method.updateProfile);
+    expect(puts).toHaveLength(1);
+    expect(puts[0].index).toBe(1);
+    expect(puts[0].expectedChecksum).toBe("two");
+    expect(JSON.parse(puts[0].profileJson).dmx.lighting.current_venue).toBe(
+      "test-venue",
+    );
+  });
+
+  test("unsaved edits are guarded when leaving the page", async ({ page }) => {
+    await routeTwoProfiles(page);
+    await page.goto("/#/lighting/groups");
+    await expect(page.locator(".group-card")).toHaveCount(1);
+    await page.locator("#lighting-venue").selectOption("test-venue");
+    await page.locator('.topnav__tab[href="#/songs"]').click();
+    await expect(page.getByText("Discard unsaved changes?")).toBeVisible();
+  });
+
+  test("no profile matching this host: nothing is preselected and Save waits for a choice", async ({
+    page,
+  }) => {
+    await routeTwoProfiles(page);
+    // The player runs a profile that none of these is (or status is down).
+    const id = `groups-${test.info().parallelIndex}-${Date.now()}`;
+    await setWatchOpening(page, id, {
+      type: "hardware",
+      hardware: { profile: "some-other-machine" },
+    });
+    await page.goto(`/?wsId=${id}#/lighting/groups`);
+    await expect(page.getByTestId("groups-no-match")).toBeVisible();
+    const picker = page.locator("#groups-profile");
+    await expect(picker).toHaveValue("");
+    await expect(picker.locator("option:checked")).toHaveText(
+      "Choose a profile...",
+    );
+    await expect(page.locator(".group-card")).toHaveCount(0);
+    await expect(
+      page.getByRole("button", { name: "Save", exact: true }),
+    ).toBeDisabled();
+
+    // An explicit choice opens that profile.
+    await picker.selectOption("other-host");
+    await expect(page.getByTestId("groups-no-match")).toHaveCount(0);
+    await expect(page.locator("#lighting-venue")).toHaveValue("test-venue");
+  });
+
+  test("a status that cannot be read selects nothing either", async ({
+    page,
+  }) => {
+    await routeTwoProfiles(page);
+    // The Watch stream never opens, so the page never has a status.
+    await page.route("**/player.v1.PlayerService/Watch", (route) =>
+      route.abort(),
+    );
+    await page.goto("/#/lighting/groups");
+    await expect(page.getByTestId("groups-no-match")).toBeVisible();
+    await expect(page.locator("#groups-profile")).toHaveValue("");
+  });
+
+  test("a file profile changed elsewhere is refused, reloaded, and the note says comments are not kept", async ({
+    page,
+  }) => {
+    const yaml = "songs: songs\nprofiles_dir: profiles\n";
+    const rpc = await mockRpc(page);
+    rpc.unary(
+      PlayerService.method.getConfig,
+      getConfigReply({ yaml, checksum: "c" }),
+    );
+    rpc.unary(
+      ConfigService.method.listProfileFiles,
+      listProfileFilesReply([
+        {
+          file: "test-host.yaml",
+          filename: "test-host",
+          addressable: true,
+          error: null,
+          hostname: "test-host",
+          has_audio: false,
+          has_midi: false,
+          has_dmx: true,
+          has_trigger: false,
+          has_controllers: false,
+        },
+      ] satisfies ProfileFileInfo[]),
+    );
+    let version = "v1";
+    const puts: { ifMatch: string | undefined }[] = [];
+    rpc.unary(ConfigService.method.getProfileFile, () =>
+      getProfileFileReply({
+        profile: {
+          hostname: "test-host",
+          dmx: { universes: [], lighting: {} },
+        },
+        yaml: "",
+        version,
+      }),
+    );
+    rpc.unary(ConfigService.method.saveProfileFile, (req) => {
+      if (req.expectedVersion !== version) {
+        throw new ConnectError("changed since you loaded it", Code.Aborted);
+      }
+      puts.push({ ifMatch: req.expectedVersion });
+      version = "v3";
+      return profileFileSavedReply({ filename: req.filename, version });
+    });
+    await page.goto("/#/lighting/groups");
+    await expect(page.getByTestId("groups-rewrite-note")).toContainText(
+      "comments in it are not kept",
+    );
+    // Another tab saves the file first.
+    version = "v2";
+    await page.locator("#lighting-venue").selectOption("test-venue");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(page.getByText(/changed since you opened it/)).toBeVisible();
+    expect(puts).toHaveLength(0);
+    // Reloaded at the new version: reapplying saves.
+    await page.locator("#lighting-venue").selectOption("test-venue");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+    expect(puts).toEqual([{ ifMatch: "v2" }]);
+  });
+
+  test("a profile without lighting points to Config", async ({ page }) => {
+    // The default mock profile (test-host) has no `dmx` block.
+    await page.goto("/#/lighting/groups");
+    await expect(page.getByTestId("groups-no-dmx")).toBeVisible();
+    await expect(
+      page.getByRole("link", { name: "Enable lighting in Config" }),
+    ).toHaveAttribute("href", "#/config/test-host/lighting");
+  });
+});
+
+test.describe("Lighting area: Config and the dashboard link across", () => {
+  test("Config's profile editor shows a summary and a link, not an editor", async ({
+    page,
+  }) => {
+    await page.goto("/#/config");
+    await page.locator(".profile-row", { hasText: "test-host" }).click();
+    await page.locator(".tab", { hasText: "Lighting" }).click();
+    await page.getByRole("button", { name: "Enable Lighting" }).click();
+
+    const summary = page.getByTestId("lighting-summary");
+    await expect(summary).toBeVisible();
+    await expect(
+      summary.getByRole("link", { name: "Edit in Lighting" }),
+    ).toHaveAttribute("href", "#/lighting/groups?profile=test-host");
+    // DMX hardware stays; the lighting editor is gone.
+    await expect(page.locator("#dmx-ola-port")).toBeVisible();
+    await expect(page.locator(".sub-tab")).toHaveCount(0);
+    await expect(page.locator("#lighting-venue")).toHaveCount(0);
+  });
+
+  test("the dashboard's stage card is a live view that links to Venues", async ({
+    page,
+  }) => {
+    const wsId = `lighting-dash-${test.info().parallelIndex}-${++testCounter}-${Date.now()}`;
+    await page.goto(`/?wsId=${wsId}#/`);
+    await expect(page.locator(".playback-card__title")).toContainText(
+      "Test Song Alpha",
+    );
+    await sendStage(page, wsId, {
+      type: "metadata",
+      fixtures: {
+        "front-left": {
+          tags: ["front"],
+          type: "par",
+          position: [-2, 0.5, 3],
+          rotation: [0, 0, 0],
+        },
+      },
+      venue: {
+        name: `venue-${wsId}`,
+        focus_points: { drummer: [0, 2.8, 1.4] },
+      },
+    });
+    await expect(page.locator(".stage-card--geometry")).toBeVisible();
+    await expect(page.locator(".stage-card__add-focus")).toHaveCount(0);
+    await expect(page.locator(".stage-card__focus")).toHaveCount(0);
+    await expect(page.locator(".stage-card__viewport canvas")).toBeVisible();
+
+    await page.locator(".stage-card__edit").click();
+    await expect(page).toHaveURL(/#\/lighting\/venues$/);
+    // There, the same plot is editable.
+    await expect(page.locator(".stage-card__add-focus")).toBeVisible();
+  });
+});
+
+test.describe("Lighting area: Venues stage plot", () => {
+  const GEOMETRY = (name: string) => ({
+    type: "metadata",
+    fixtures: {
+      "front-left": {
+        tags: ["front"],
+        type: "par",
+        position: [-2, 0.5, 3],
+        rotation: [0, 0, 0],
+      },
+      spare: { tags: [], type: "par", position: null },
+    },
+    venue: { name, focus_points: { drummer: [0, 2.8, 1.4] } },
+  });
+
+  test("with no current venue it says so instead of drawing a stage", async ({
+    page,
+  }) => {
+    await page.goto("/#/lighting/venues");
+    await expect(page.getByTestId("stage-no-venue")).toBeVisible();
+    await expect(page.locator(".stage-card__viewport")).toHaveCount(0);
+  });
+
+  for (const [label, size] of [
+    ["desktop", { width: 1440, height: 900 }],
+    ["phone", { width: 375, height: 667 }],
+  ] as const) {
+    test(`the whole plot fits inside its card at ${label} width`, async ({
+      page,
+    }) => {
+      const wsId = `lighting-fit-${test.info().parallelIndex}-${++testCounter}-${Date.now()}`;
+      await page.setViewportSize(size);
+      await page.goto(`/?wsId=${wsId}#/lighting/venues`);
+      const name = `venue-${wsId}`;
+      await sendStage(page, wsId, GEOMETRY(name));
+      await expect(page.locator(".stage-card--geometry")).toBeVisible();
+      await expect(page.getByTestId("stage-venue-label")).toHaveText(
+        `Current venue: ${name} · live`,
+      );
+      const box = async (sel: string) => {
+        const b = await page.locator(sel).boundingBox();
+        expect(b, sel).not.toBeNull();
+        return b!;
+      };
+      const card = await box(".stage-card");
+      const viewport = await box(".stage-card__viewport");
+      const canvas = await box(".stage-card__viewport canvas");
+      for (const inner of [viewport, canvas]) {
+        expect(inner.x).toBeGreaterThanOrEqual(card.x - 0.5);
+        expect(inner.y).toBeGreaterThanOrEqual(card.y - 0.5);
+        expect(inner.x + inner.width).toBeLessThanOrEqual(
+          card.x + card.width + 0.5,
+        );
+        expect(inner.y + inner.height).toBeLessThanOrEqual(
+          card.y + card.height + 0.5,
+        );
+      }
+      // The canvas is drawn at the size it is shown at.
+      const drawn = await page
+        .locator(".stage-card__viewport canvas")
+        .evaluate((c: HTMLCanvasElement) => [c.clientWidth, c.clientHeight]);
+      expect(drawn[0]).toBeCloseTo(canvas.width, 0);
+      expect(drawn[1]).toBeCloseTo(canvas.height, 0);
+    });
+  }
+});
