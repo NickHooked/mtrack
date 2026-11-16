@@ -1,3 +1,4 @@
+import { automationError, trimAutomation } from "./automation.svelte";
 // Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
 //
 // This program is free software: you can redistribute it and/or modify it under
@@ -63,6 +64,16 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
   }
 
   return {
+    ...(raw.compounds && typeof raw.compounds === "object"
+      ? {
+          compounds: Object.fromEntries(
+            Object.entries(raw.compounds).map(([id, c]) => [
+              id,
+              parseVideoConfig(c) ?? createVideoConfig(),
+            ]),
+          ),
+        }
+      : {}),
     canvas: {
       ...canvas,
       width: positiveNumber(canvas.width, DEFAULT_VIDEO_CANVAS.width),
@@ -96,6 +107,23 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
               : {};
           return {
             ...clip,
+            automation: Object.fromEntries(
+              Object.entries(
+                (clip.automation ??
+                  {}) as import("./automation.svelte").Automation,
+              ).map(([path, lane]) => [
+                path,
+                {
+                  ...lane,
+                  enabled: lane.enabled ?? true,
+                  points: lane.points.map((p) => ({
+                    ...p,
+                    curve: p.curve ?? 0,
+                    hold: p.hold ?? false,
+                  })),
+                },
+              ]),
+            ),
             masks: Array.isArray(clip.masks)
               ? clip.masks.map((m) => ({
                   shape: "rectangle",
@@ -140,6 +168,44 @@ function isSafeRelativePath(value: string): boolean {
 }
 
 export function videoConfigError(config: VideoConfig): string | null {
+  const library = config.compounds ?? {};
+  if (Object.keys(library).length > 32)
+    return "At most 32 compound sources are supported.";
+  for (const [id, c] of Object.entries(library)) {
+    if (!id.trim() || id.length > 128 || Object.keys(c.compounds ?? {}).length)
+      return "Compound definitions must live in the main source library.";
+    const error = timelineError(c);
+    if (error) return `${id}: ${error}`;
+  }
+  function visit(
+    c: VideoConfig,
+    stack: string[],
+    count: { value: number },
+  ): string | null {
+    for (const clip of c.tracks.flatMap((t) => t.clips)) {
+      if (++count.value > 512)
+        return "Expanded compound graph exceeds 512 clips.";
+      if (clip.source?.type === "compound") {
+        const id = clip.source.id;
+        if (!library[id]) return `Missing compound: ${id}`;
+        if (stack.length >= 8 || stack.includes(id))
+          return "Compound reference cycle or nesting deeper than 8.";
+        const error = visit(library[id], [...stack, id], count);
+        if (error) return error;
+      }
+    }
+    return null;
+  }
+  for (const [id, c] of [["", config], ...Object.entries(library)] as [
+    string,
+    VideoConfig,
+  ][]) {
+    const error = visit(c, id ? [id] : [], { value: 0 });
+    if (error) return error;
+  }
+  return timelineError(config);
+}
+function timelineError(config: VideoConfig): string | null {
   const ids = new Set<string>();
   for (const track of config.tracks) {
     if (!track.name.trim()) return "Name every video track before saving.";
@@ -190,6 +256,8 @@ export function videoConfigError(config: VideoConfig): string | null {
         )
       )
         return "Fade durations must be non-negative.";
+      const automationIssue = automationError(clip, config.canvas);
+      if (automationIssue) return automationIssue;
       if ((clip.masks?.length ?? 0) > 8)
         return "A clip supports up to eight masks.";
       for (const mask of clip.masks ?? []) {
@@ -233,7 +301,10 @@ export function videoConfigError(config: VideoConfig): string | null {
           return "Mask bounds must fit inside the clip; feather must be 0..4096 pixels and opacity 0..1.";
       }
       if (clip.source) {
-        if (clip.file || clip.source_in !== 0)
+        if (
+          clip.file ||
+          (clip.source.type !== "compound" && clip.source_in !== 0)
+        )
           return "Live clips cannot have a file or source offset.";
         if (
           clip.source.type === "v4l2" &&
@@ -310,9 +381,10 @@ export function moveClip(clip: VideoClip, start: number): VideoClip {
 }
 
 export function trimClipLeft(clip: VideoClip, newStart: number): VideoClip {
-  const minimumStart = clip.source
-    ? 0
-    : Math.max(0, clip.start - clip.source_in);
+  const minimumStart =
+    clip.source && clip.source.type !== "compound"
+      ? 0
+      : Math.max(0, clip.start - clip.source_in);
   const maximumStart = clip.start + clip.duration - MIN_CLIP_DURATION;
   const start = roundTimelineValue(
     Math.min(maximumStart, Math.max(minimumStart, newStart)),
@@ -321,18 +393,29 @@ export function trimClipLeft(clip: VideoClip, newStart: number): VideoClip {
   return {
     ...clip,
     start,
+    automation: trimAutomation(
+      clip.automation,
+      delta,
+      Math.max(MIN_CLIP_DURATION, clip.duration - delta),
+    ),
     duration: roundTimelineValue(
       Math.max(MIN_CLIP_DURATION, clip.duration - delta),
     ),
-    source_in: clip.source
-      ? 0
-      : roundTimelineValue(Math.max(0, clip.source_in + delta)),
+    source_in:
+      clip.source && clip.source.type !== "compound"
+        ? 0
+        : roundTimelineValue(Math.max(0, clip.source_in + delta)),
   };
 }
 
 export function trimClipRight(clip: VideoClip, newEnd: number): VideoClip {
   return {
     ...clip,
+    automation: trimAutomation(
+      clip.automation,
+      0,
+      Math.max(MIN_CLIP_DURATION, newEnd - clip.start),
+    ),
     duration: roundTimelineValue(
       Math.max(MIN_CLIP_DURATION, newEnd - clip.start),
     ),
@@ -346,6 +429,15 @@ export function normalizeClipPatch(
   return {
     ...clip,
     ...patch,
+    automation:
+      patch.automation ??
+      (patch.duration !== undefined
+        ? trimAutomation(
+            clip.automation,
+            0,
+            Math.max(MIN_CLIP_DURATION, patch.duration),
+          )
+        : clip.automation),
     start: Math.max(0, finiteNumber(patch.start ?? clip.start, clip.start)),
     duration: Math.max(
       MIN_CLIP_DURATION,

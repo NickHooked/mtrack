@@ -483,3 +483,61 @@ The existing preview engine should not be mistaken for complete live Player inte
 ```
 
 The branch is intentionally published from Nick's fork without an upstream pull request, leaving Michael free to continue directly, reorganize the commits, or open one or more draft PRs when appropriate.
+
+## Automation and compound sources (November 2026)
+
+The video editor now has a clip-local automation envelope editor below the tracks.
+Select a clip, choose a property, enable **Read**, then double-click the graph to
+add points. Drag the points to edit time/value or the orange segment handles to
+bend the interpolation. Selected points expose precise time/value, curvature,
+and Hold controls. **Off** keeps the saved envelope but uses the static value.
+Editing an automated composition property at the playhead writes a point there.
+The renderer evaluates envelopes for each video frame, including after seeks.
+Left/right trimming preserves the visible envelope; moving a clip keeps local
+point times. Removing/restructuring masks clears mask automation to avoid applying
+an indexed curve to the wrong mask or polygon vertex.
+
+Supported automation paths are opacity, x/y, width/height, fade durations, and
+mask position/size/feather/opacity/invert/polygon-point coordinates. Source choice,
+clip timing, and mask topology are structural edits, not automation targets.
+Lanes are saved as `automation: {"/opacity": {enabled: true, points: [...]}}`;
+points contain seconds, value, outgoing curvature (-1..1), and optional Hold.
+Interpolation uses `expm1(6*curve*t)/expm1(6*curve)` with a linear zero limit.
+
+The **Compounds** source tab creates named compositions with their own internal
+timeline. The breadcrumb returns to the main timeline. Add files or live inputs
+on separate internal tracks and position them with the existing canvas/property
+controls; drag the resulting source onto any track, or click to append it.
+Definitions live in the root `video.compounds` map and instances use
+`source: {type: compound, id: name}`. Their source-in offset drives the internal
+file timeline; cameras remain live. Internal gaps are transparent. Nested
+compounds are supported with cycle/depth/expanded-size validation. A compound's
+opacity and masks apply **after** its internal layers are composited, including
+overlapping layers. Physical capture devices share one decoder/frame across
+main and nested layers; file playback remains independent per instance. All
+nested file paths use the existing confined-path and open-descriptor binding.
+
+This is an initial envelope/compound implementation, not a full DAW automation
+system. MIDI mapping, armed recording, Touch/Latch/Write modes, automation take
+reduction, multiple simultaneously visible lanes, compound rename/delete UI,
+and real hardware performance validation remain follow-up work. Nested
+composition currently uses CPU RGBA blending and nearest-neighbor scaling;
+large multi-camera compositions need profiling and a GPU implementation before
+production claims. Existing Player/program-output integration limitations above
+still apply. No capture hardware was attached during development.
+
+Design references: [Studio One reference manual](https://pae-web.presonusmusic.com/downloads/products/pdf/StudioOne3ReferenceManual_12102015.pdf)
+(Read/Touch/Latch separation) and [DaVinci Resolve editing](https://www.blackmagicdesign.com/products/davinciresolve/edit/)
+(compound clips). A future MIDI recorder should feed the same property paths,
+use transport-local timestamps, buffer a gesture into one undo transaction, and
+make Read/Touch/Latch explicit; it must not send controller work into the audio
+callback.
+
+Validation for this increment: 34 core video tests with the video feature, 75
+backend video tests, 31 GStreamer integration tests, and 47 browser/protocol tests
+passed (including targeted reruns after fixes). Svelte check reported no errors
+or warnings; the focused ESLint check and frontend/backend builds passed. The
+browser tests include point/curve dragging with undo, trimmed envelope reload,
+and dragging a compound with simultaneous live/file tracks onto a new track.
+The real local demo renders a live test pattern beside a recorded video; this
+is test-source validation, not USB/DeckLink hardware validation.

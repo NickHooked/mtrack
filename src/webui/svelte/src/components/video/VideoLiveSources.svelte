@@ -42,7 +42,10 @@
   }
 </script>
 
-<section aria-label="Live video sources">
+<section
+  aria-label="Live video sources"
+  title="Drag a source onto a track or click to append. Capture runs on the Mtrack host while the clip is active."
+>
   <header>
     <strong>Live sources</strong><button
       class="btn btn-sm"
@@ -50,10 +53,6 @@
       disabled={busy}>Refresh cameras</button
     >
   </header>
-  <p>
-    Drag a source onto the timeline, or click to append it. The clip duration
-    controls when the live input is visible. Capture runs on the Mtrack host.
-  </p>
   {#if message}<p role="status">{message}</p>{/if}
   {#each devices as camera (camera.device)}
     <button

@@ -71,7 +71,7 @@
       type="number"
       min="0"
       step="0.01"
-      disabled={!!clip.source}
+      disabled={!!clip.source && clip.source.type !== "compound"}
       data-testid="video-clip-source-in"
       value={clip.source_in}
       onchange={(event) =>
@@ -85,7 +85,13 @@
     />
   </label>
   <label class="file-field">
-    <span>{clip.source ? "Live source" : "File"}</span>
+    <span
+      >{clip.source?.type === "compound"
+        ? "Compound source"
+        : clip.source
+          ? "Live source"
+          : "File"}</span
+    >
     <input
       type="text"
       data-testid="video-clip-file"

@@ -14,6 +14,8 @@
 use std::{collections::HashSet, path::Path};
 
 use serde::{Deserialize, Serialize};
+pub mod automation;
+use automation::Automation;
 
 /// Timeline comparisons tolerate one nanosecond so ordinary decimal seconds
 /// (for example, `0.1 + 0.2`) do not create a spurious overlap.
@@ -37,6 +39,8 @@ pub const MAX_VIDEO_CLIPS: usize = 512;
 /// A song's linear video timeline.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct VideoConfig {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    compounds: std::collections::BTreeMap<String, VideoConfig>,
     /// Output canvas shared by every video track.
     #[serde(default)]
     canvas: VideoCanvas,
@@ -46,6 +50,82 @@ pub struct VideoConfig {
 }
 
 impl VideoConfig {
+    pub fn compounds(&self) -> &std::collections::BTreeMap<String, VideoConfig> {
+        &self.compounds
+    }
+    pub fn scoped_clips(&self) -> impl Iterator<Item = (&str, &VideoClip)> {
+        std::iter::once(("", self))
+            .chain(self.compounds.iter().map(|(id, c)| (id.as_str(), c)))
+            .flat_map(|(scope, c)| {
+                c.tracks
+                    .iter()
+                    .flat_map(move |t| t.clips.iter().map(move |clip| (scope, clip)))
+            })
+    }
+    pub fn all_clips(&self) -> impl Iterator<Item = &VideoClip> {
+        self.scoped_clips().map(|(_, c)| c)
+    }
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = self.validate_timeline().err().unwrap_or_default();
+        if self.compounds.len() > 32 || self.all_clips().count() > MAX_VIDEO_CLIPS {
+            errors.push("compound library exceeds 32 sources or 512 total clips".into());
+        }
+        for (id, c) in &self.compounds {
+            if id.trim().is_empty() || id.len() > 128 || !c.compounds.is_empty() {
+                errors.push("compound ids must be nonempty, at most 128 bytes; definitions belong in the root library".into());
+            }
+            if let Err(e) = c.validate_timeline() {
+                errors.extend(e.into_iter().map(|e| format!("compound {id}: {e}")));
+            }
+        }
+        fn visit(
+            config: &VideoConfig,
+            library: &std::collections::BTreeMap<String, VideoConfig>,
+            stack: &mut Vec<String>,
+            count: &mut usize,
+        ) -> Result<(), String> {
+            for clip in config.tracks.iter().flat_map(|t| &t.clips) {
+                *count += 1;
+                if *count > 512 {
+                    return Err("expanded compound graph exceeds 512 clips".into());
+                }
+                if let Some(VideoSource::Compound { id }) = &clip.source {
+                    if stack.len() >= 8 || stack.contains(id) {
+                        return Err("compound reference cycle or nesting deeper than 8".into());
+                    }
+                    let child = library
+                        .get(id)
+                        .ok_or_else(|| format!("missing compound {id}"))?;
+                    stack.push(id.clone());
+                    visit(child, library, stack, count)?;
+                    stack.pop();
+                }
+            }
+            Ok(())
+        }
+        for (id, c) in
+            std::iter::once(("", self)).chain(self.compounds.iter().map(|(id, c)| (id.as_str(), c)))
+        {
+            if let Err(e) = visit(
+                c,
+                &self.compounds,
+                &mut if id.is_empty() {
+                    vec![]
+                } else {
+                    vec![id.into()]
+                },
+                &mut 0,
+            ) {
+                errors.push(e);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Gets the output canvas configuration.
     pub fn canvas(&self) -> &VideoCanvas {
         &self.canvas
@@ -63,17 +143,7 @@ impl VideoConfig {
     /// the same filesystem targets.
     #[cfg(feature = "video")]
     pub fn replace_clip_files(&mut self, files: Vec<String>) -> Result<(), String> {
-        let expected = self
-            .tracks
-            .iter()
-            .map(|track| {
-                track
-                    .clips
-                    .iter()
-                    .filter(|clip| clip.source.is_none())
-                    .count()
-            })
-            .sum::<usize>();
+        let expected = self.all_clips().filter(|c| c.source.is_none()).count();
         if files.len() != expected {
             return Err(format!(
                 "expected {expected} clip files, got {}",
@@ -84,6 +154,11 @@ impl VideoConfig {
             .tracks
             .iter_mut()
             .flat_map(|track| track.clips.iter_mut())
+            .chain(
+                self.compounds
+                    .values_mut()
+                    .flat_map(|c| c.tracks.iter_mut().flat_map(|t| t.clips.iter_mut())),
+            )
             .filter(|clip| clip.source.is_none())
             .zip(files)
         {
@@ -93,7 +168,7 @@ impl VideoConfig {
     }
 
     /// Validates the canvas and timeline structure.
-    pub fn validate(&self) -> Result<(), Vec<String>> {
+    fn validate_timeline(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         let mut ids = HashSet::new();
 
@@ -230,6 +305,11 @@ impl VideoConfig {
                         ));
                     }
                 }
+                if let Err(error) =
+                    automation::validate(&clip.automation, &clip.masks, clip.duration)
+                {
+                    errors.push(format!("{clip_label}: {error}"));
+                }
                 if clip.masks.len() > 8 {
                     errors.push(format!("{clip_label}: at most 8 masks are supported"));
                 }
@@ -270,7 +350,10 @@ impl VideoConfig {
                     }
                 }
                 if let Some(source) = &clip.source {
-                    if !clip.file.is_empty() || clip.source_in != 0.0 {
+                    if !clip.file.is_empty()
+                        || (clip.source_in != 0.0
+                            && !matches!(source, VideoSource::Compound { .. }))
+                    {
                         errors.push(format!(
                             "{clip_label}: live sources require no file and source_in = 0"
                         ));
@@ -390,6 +473,7 @@ impl VideoTrack {
 pub enum VideoSource {
     V4l2 { device: String },
     TestPattern,
+    Compound { id: String },
 }
 
 impl VideoSource {
@@ -462,6 +546,8 @@ pub struct MaskPoint {
 /// A file or live clip placed on a video track.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VideoClip {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    automation: Automation,
     id: String,
     start: f64,
     duration: f64,
@@ -500,6 +586,50 @@ pub struct VideoClip {
 }
 
 impl VideoClip {
+    pub fn automation(&self) -> &Automation {
+        &self.automation
+    }
+    pub fn evaluated_at(&self, time: f64, canvas: &VideoCanvas) -> Self {
+        if self.automation.is_empty() {
+            return self.clone();
+        }
+        let mut value = serde_json::to_value(self).expect("validated clip");
+        value["width"] = serde_json::json!(self.width.unwrap_or(canvas.width));
+        value["height"] = serde_json::json!(self.height.unwrap_or(canvas.height));
+        // Defaults omitted by serialization must still be addressable.
+        value["opacity"] = serde_json::json!(self.opacity);
+        value["fade_in"] = serde_json::json!(self.fade_in);
+        value["fade_out"] = serde_json::json!(self.fade_out);
+        for (path, lane) in &self.automation {
+            if let Some(v) = lane.value_at(time) {
+                if let Some(target) = value.pointer_mut(path) {
+                    *target = if path.ends_with("/invert") {
+                        serde_json::json!(v >= 0.5)
+                    } else if matches!(path.as_str(), "/x" | "/y" | "/width" | "/height") {
+                        serde_json::json!(v.round() as i64)
+                    } else {
+                        serde_json::json!(v)
+                    };
+                }
+            }
+        }
+        let mut result: Self = serde_json::from_value(value).expect("validated automation");
+        let width = result.width.unwrap_or(canvas.width);
+        result.height = Some(
+            result
+                .height
+                .unwrap_or(canvas.height)
+                .min((MAX_CANVAS_PIXELS / u64::from(width)) as u32),
+        );
+        for mask in &mut result.masks {
+            mask.x = mask.x.min(1.0 - 0.000001);
+            mask.y = mask.y.min(1.0 - 0.000001);
+            mask.width = mask.width.min(1.0 - mask.x);
+            mask.height = mask.height.min(1.0 - mask.y);
+        }
+        result
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -1038,5 +1168,35 @@ tracks: [{tracks}]"##
             let invalid = from_yaml(&format!("tracks: [{{name: screen, clips: [{{id: a, start: 0, duration: 1, file: a.mkv, masks: [{{{fields}}}]}}]}}]"));
             assert!(invalid.validate().is_err(), "{fields}");
         }
+    }
+    #[test]
+    fn compound_video_graph_validation_and_file_binding() {
+        let cfg = from_yaml("compounds: {duo: {tracks: [{name: internal, clips: [{id: a, file: child.mkv, start: 0, duration: 2}]}]}}\ntracks: [{name: main, clips: [{id: a, source: {type: compound, id: duo}, source_in: 1, start: 0, duration: 1}]}]");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.all_clips().count(), 2);
+        #[cfg(feature = "video")]
+        {
+            let mut bound = cfg.clone();
+            bound.replace_clip_files(vec!["bound.mkv".into()]).unwrap();
+            assert_eq!(
+                bound.compounds()["duo"].tracks()[0].clips()[0].file(),
+                "bound.mkv"
+            );
+        }
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        assert!(from_yaml(&serialized).validate().is_ok());
+        for source in ["duo", "missing"] {
+            let bad = from_yaml(&format!("compounds: {{duo: {{tracks: [{{name: inner, clips: [{{id: a, source: {{type: compound, id: {source}}}, start: 0, duration: 1}}]}}]}}}}"));
+            assert!(bad.validate().is_err());
+        }
+    }
+    #[test]
+    fn video_automation_evaluates_visual_defaults_and_mask_properties() {
+        let cfg = from_yaml("tracks: [{name: main, clips: [{id: a, file: a.mkv, start: 0, duration: 10, masks: [{}], automation: {'/opacity': {points: [{time: 0, value: 0}, {time: 10, value: 1}]}, '/x': {points: [{time: 0, value: -20}]}, '/masks/0/opacity': {points: [{time: 0, value: 0.3}]}}}]}]");
+        assert!(cfg.validate().is_ok());
+        let clip = cfg.tracks()[0].clips()[0].evaluated_at(5.0, cfg.canvas());
+        assert_eq!(clip.opacity(), 0.5);
+        assert_eq!(clip.x(), -20);
+        assert_eq!(clip.masks()[0].opacity, 0.3);
     }
 }

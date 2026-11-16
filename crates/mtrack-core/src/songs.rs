@@ -970,8 +970,7 @@ impl Song {
             .chain(self.light_shows.iter().map(LightShow::dmx_file_path))
             .chain(self.video_timeline.iter().flat_map(|timeline| {
                 timeline
-                    .clips()
-                    .iter()
+                    .all_clips()
                     .filter(|clip| clip.source().is_none())
                     .map(|clip| clip.file())
             }))

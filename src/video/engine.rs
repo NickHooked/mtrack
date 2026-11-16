@@ -6,6 +6,8 @@
 
 //! Optional, worker-threaded GStreamer file-video output.
 
+mod compound;
+
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -181,9 +183,7 @@ impl GstVideoEngine {
     ) -> Result<Self, VideoError> {
         let mut runtime_config = config.clone();
         let runtime_files = config
-            .tracks()
-            .iter()
-            .flat_map(|track| track.clips())
+            .all_clips()
             .filter(|clip| clip.source().is_none())
             .map(|clip| {
                 let target = Path::new(clip.file()).canonicalize().map_err(|error| {
@@ -567,9 +567,7 @@ fn clone_bound_media(
             })
             .collect::<std::collections::HashMap<_, _>>();
         let files = worker_config
-            .tracks()
-            .iter()
-            .flat_map(|track| track.clips())
+            .all_clips()
             .filter(|clip| clip.source().is_none())
             .map(|clip| {
                 descriptor_paths
@@ -655,6 +653,7 @@ fn live_source_key(source: &crate::config::video::VideoSource) -> String {
             .to_string_lossy()
             .into_owned(),
         VideoSource::TestPattern => "test-pattern".into(),
+        VideoSource::Compound { id } => format!("compound:{id}"),
     }
 }
 
@@ -695,6 +694,7 @@ fn render_timeline(
     let mut live_decoders = std::collections::HashMap::<String, ClipDecoder>::new();
     let mut masks: Vec<Option<(String, Vec<u8>)>> =
         (0..request.config.tracks().len()).map(|_| None).collect();
+    let mut compounds = compound::CompoundRenderer::default();
     let mut frame_index = 0u64;
 
     'render: while !request.cancel.load(Ordering::Acquire) {
@@ -718,13 +718,7 @@ fn render_timeline(
         )?;
         // One capture pipeline per physical source, even when several layers use it.
         // Inactive inputs are released immediately, including on timeline gaps.
-        let active_sources: std::collections::HashSet<_> = request
-            .timeline
-            .active_clips_at(song_position)
-            .iter()
-            .filter_map(|clip| clip.source().map(live_source_key))
-            .collect();
-        live_decoders.retain(|key, _| active_sources.contains(key));
+        compounds.begin_frame();
         let mut live_frames = std::collections::HashMap::<String, Vec<u8>>::new();
         for (track_index, track) in request.config.tracks().iter().enumerate() {
             let active = request
@@ -732,6 +726,8 @@ fn render_timeline(
                 .active_clips_at(song_position)
                 .into_iter()
                 .find(|clip| clip.z_order() == track_index);
+            let evaluated = active.map(|clip| clip.evaluated_at(song_position));
+            let active = evaluated.as_ref();
             let mut pixels = if let Some(runtime_clip) = active {
                 let clip = track
                     .clips()
@@ -745,7 +741,25 @@ fn render_timeline(
                     width,
                     height,
                 );
-                if let Some(source) = clip.source() {
+                if let Some(crate::config::video::VideoSource::Compound { id }) = clip.source() {
+                    decoders[track_index] = None;
+                    active_ids[track_index] = None;
+                    match compounds.render(
+                        id,
+                        clip.id(),
+                        runtime_clip.source_position_at(song_position),
+                        request,
+                        width,
+                        height,
+                        fps_n,
+                        fps_d,
+                        &mut live_decoders,
+                        &mut live_frames,
+                    )? {
+                        DecoderPoll::Ready(frame) => frame,
+                        DecoderPoll::Cancelled => break 'render,
+                    }
+                } else if let Some(source) = clip.source() {
                     decoders[track_index] = None;
                     active_ids[track_index] = None;
                     let key = live_source_key(source);
@@ -821,7 +835,15 @@ fn render_timeline(
                 transparent.clone()
             };
             if let Some(clip) = active.filter(|clip| !clip.masks().is_empty()) {
-                if masks[track_index].as_ref().map(|(id, _)| id.as_str()) != Some(clip.id()) {
+                let mask_key = format!(
+                    "{}:{}:{}:{}",
+                    clip.id(),
+                    clip.width().unwrap_or(width),
+                    clip.height().unwrap_or(height),
+                    serde_json::to_string(clip.masks()).expect("validated masks")
+                );
+                if masks[track_index].as_ref().map(|(id, _)| id.as_str()) != Some(mask_key.as_str())
+                {
                     let Some(alpha) = crate::video::mask::rasterize(
                         clip.masks(),
                         width,
@@ -832,7 +854,7 @@ fn render_timeline(
                     ) else {
                         break 'render;
                     };
-                    masks[track_index] = Some((clip.id().into(), alpha));
+                    masks[track_index] = Some((mask_key, alpha));
                 }
                 crate::video::mask::apply(
                     &mut pixels,
@@ -848,6 +870,9 @@ fn render_timeline(
                 period,
             )?;
         }
+
+        compounds.end_frame();
+        live_decoders.retain(|key, _| live_frames.contains_key(key));
 
         if let Some(sink) = &output_pipeline.appsink {
             let Some(sample) = pull_composed_sample(request, pipeline, sink, period)? else {
@@ -1287,6 +1312,9 @@ impl ClipDecoder {
         let path = match clip.source() {
             Some(VideoSource::V4l2 { device }) => PathBuf::from(device),
             Some(VideoSource::TestPattern) => PathBuf::from("live-test-pattern"),
+            Some(VideoSource::Compound { .. }) => {
+                unreachable!("compound sources use the nested renderer")
+            }
             None => runtime_clip.file().to_path_buf(),
         };
         let caps = format!(
@@ -1297,6 +1325,9 @@ impl ClipDecoder {
                 "v4l2src name=capture do-timestamp=true ! decodebin".to_string()
             }
             Some(VideoSource::TestPattern) => "videotestsrc is-live=true".to_string(),
+            Some(VideoSource::Compound { .. }) => {
+                unreachable!("compound sources use the nested renderer")
+            }
             None => {
                 let uri = gst::glib::filename_to_uri(base_path.join(clip.file()), None).map_err(
                     |error| VideoError::PipelineBuild {

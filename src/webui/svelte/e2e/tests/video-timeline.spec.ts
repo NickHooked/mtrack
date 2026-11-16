@@ -972,3 +972,122 @@ test.describe("Freeform masks", () => {
     expect(mask.feather).toBe(35);
   });
 });
+
+test.describe("Automation and compounds", () => {
+  test.use({ viewport: { width: 1440, height: 1100 } });
+  test("draws, bends, trims and persists a clip-local automation envelope", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByTestId("video-clip").click();
+    const graph = page.getByTestId("video-automation");
+    await graph.getByRole("button", { name: "Off", exact: true }).click();
+    await page.getByTestId("automation-point-0").press("Enter");
+    const value = page.getByLabel("Automation point value", { exact: true });
+    await value.fill("0");
+    await value.dispatchEvent("change");
+    const curve = page.getByLabel("Automation curvature");
+    await curve.fill("0.6");
+    await curve.dispatchEvent("change");
+    await page.getByTestId("video-clip-duration").fill("5");
+    await page.getByTestId("video-clip-duration").dispatchEvent("change");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const lane = parse(state.currentYaml()).video.tracks[0].clips[0].automation[
+      "/opacity"
+    ];
+    expect(lane.enabled).toBe(true);
+    expect(lane.points[1].time).toBe(5);
+    expect(lane.points[1].value).toBeGreaterThan(0);
+    expect(lane.points[1].value).toBeLessThan(0.5);
+    expect(lane.points[0].curve).toBeCloseTo(0.3);
+    await page.reload();
+    await page.getByTestId("video-clip").click();
+    await expect(
+      graph.getByRole("button", { name: "Read", exact: true }),
+    ).toBeVisible();
+  });
+  test("drags envelope points and curve handles with undo", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByTestId("video-clip").click();
+    const graph = page.getByTestId("video-automation");
+    await graph.getByRole("button", { name: "Off", exact: true }).click();
+    async function dragDown(locator: Locator, pixels: number) {
+      await locator.scrollIntoViewIfNeeded();
+      const b = (await locator.boundingBox())!;
+      await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2 + pixels, {
+        steps: 8,
+      });
+      await page.mouse.up();
+    }
+    await dragDown(page.getByTestId("automation-point-0"), 60);
+    await dragDown(
+      page.getByRole("button", { name: "Curve segment 1", exact: true }),
+      25,
+    );
+    await page.getByRole("button", { name: "Undo video edit" }).click();
+    await page.getByRole("button", { name: "Redo video edit" }).click();
+    await graph.getByRole("button", { name: "Read", exact: true }).click();
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const lane = parse(state.currentYaml()).video.tracks[0].clips[0].automation[
+      "/opacity"
+    ];
+    expect(lane.enabled).toBe(false);
+    expect(lane.points[0].value).toBeLessThan(0.9);
+    expect(lane.points[0].value).toBeGreaterThan(0);
+    expect(lane.points[0].curve).toBeGreaterThan(0.1);
+  });
+  test("creates a reusable compound source with its own file and live tracks", async ({
+    page,
+  }) => {
+    await page.route("**/api/video/sources", (route) =>
+      route.fulfill({ json: { live_capture: true, devices: [] } }),
+    );
+    const state = await openVideo(page);
+    await page.getByRole("tab", { name: "Compounds", exact: true }).click();
+    await page.getByLabel("New compound name").fill("Camera duo");
+    await page
+      .getByRole("button", { name: "＋ New compound", exact: true })
+      .click();
+    await page.getByRole("tab", { name: "Media files", exact: true }).click();
+    await page.getByRole("button", { name: /camera-b.mp4/ }).click();
+    await page.getByRole("tab", { name: "Live sources", exact: true }).click();
+    // Camera sources use the same internal timeline and persistence as files.
+    const live = page.getByRole("button", { name: /Live test pattern/ });
+    const drop = page.getByTestId("video-new-track-drop");
+    await drop.scrollIntoViewIfNeeded();
+    await live.dragTo(drop);
+    await page.getByTestId("video-composition-x").fill("960");
+    await page.getByTestId("video-composition-x").dispatchEvent("change");
+    await page.getByTestId("video-composition-width").fill("960");
+    await page.getByTestId("video-composition-width").dispatchEvent("change");
+    await page
+      .getByRole("button", { name: "← Main timeline", exact: true })
+      .click();
+    await page.getByRole("tab", { name: "Compounds", exact: true }).click();
+    await drop.scrollIntoViewIfNeeded();
+    await page.getByRole("button", { name: /^Camera duo ·/ }).dragTo(drop);
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const video = parse(state.currentYaml()).video;
+    expect(
+      video.compounds["Camera duo"].tracks.flatMap(
+        (t: { clips: unknown[] }) => t.clips,
+      ),
+    ).toHaveLength(2);
+    expect(video.compounds["Camera duo"].tracks[1].clips[0]).toMatchObject({
+      start: 0,
+      x: 960,
+      width: 960,
+    });
+    expect(video.tracks[1].clips[0].source).toEqual({
+      type: "compound",
+      id: "Camera duo",
+    });
+  });
+});

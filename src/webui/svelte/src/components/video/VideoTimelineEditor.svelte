@@ -28,6 +28,12 @@
     videoConfigError,
     videoEnd,
   } from "../../lib/video/timeline-state";
+  import VideoAutomation from "./VideoAutomation.svelte";
+  import {
+    evaluatedClip,
+    insertPoint,
+    propertyValue,
+  } from "../../lib/video/automation.svelte";
   import VideoCompositionPanel from "./VideoCompositionPanel.svelte";
   import VideoPropertiesPanel from "./VideoPropertiesPanel.svelte";
   import VideoPreview from "./VideoPreview.svelte";
@@ -57,7 +63,53 @@
     onvaliditychange,
   }: Props = $props();
 
-  let config = $derived(video ?? createVideoConfig());
+  let editingCompound = $state<string | null>(null);
+  let compoundName = $state("");
+  let rootConfig = $derived(video ?? createVideoConfig());
+  let config = $derived(
+    editingCompound && rootConfig.compounds?.[editingCompound]
+      ? {
+          ...rootConfig.compounds[editingCompound],
+          compounds: rootConfig.compounds,
+        }
+      : rootConfig,
+  );
+  function publish(next: VideoConfig) {
+    if (editingCompound) {
+      const { compounds: library, ...definition } = next;
+      onchange?.({
+        ...rootConfig,
+        compounds: { ...library, [editingCompound]: definition },
+      });
+    } else onchange?.(next);
+  }
+  function openCompound(id: string | null) {
+    editingCompound = id;
+    selectedClipId = null;
+    playhead = 0;
+    undoStack = [];
+    redoStack = [];
+    previewStale = true;
+  }
+  function createCompound() {
+    const id =
+      compoundName.trim() ||
+      `Compound ${Object.keys(rootConfig.compounds ?? {}).length + 1}`;
+    if (rootConfig.compounds?.[id]) {
+      error = "Choose a unique compound name.";
+      return;
+    }
+    onchange?.({
+      ...rootConfig,
+      compounds: {
+        ...rootConfig.compounds,
+        [id]: { canvas: { ...config.canvas }, tracks: [] },
+      },
+    });
+    compoundName = "";
+    openCompound(id);
+  }
+
   let error = $state("");
   let playhead = $state(0);
   let selectedMask = $state(-1);
@@ -67,8 +119,8 @@
     selectedMask = -1;
     drawingMask = false;
   });
-  let libraryTab = $state<"media" | "live">("media");
-  let previewControl: VideoPreview;
+  let libraryTab = $state<"media" | "live" | "compounds">("media");
+  let previewControl = $state<VideoPreview>();
   onMount(() => {
     let active = true;
     fetchSongFiles(songName)
@@ -114,7 +166,7 @@
     undoStack = undoStack.slice(0, -1);
     error = "";
     previewStale = true;
-    onchange?.(previous);
+    publish(previous);
   }
   function redo() {
     const next = redoStack.at(-1);
@@ -123,7 +175,7 @@
     redoStack = redoStack.slice(0, -1);
     error = "";
     previewStale = true;
-    onchange?.(next);
+    publish(next);
   }
   function historyKey(event: KeyboardEvent) {
     if (
@@ -200,6 +252,11 @@
   function placeMedia(file: string, trackIndex: number, start?: number) {
     const source = parseLiveMedia(file);
     if (locked || (!source && !media.includes(file))) return;
+    if (
+      source?.type === "compound" &&
+      (!rootConfig.compounds?.[source.id] || source.id === editingCompound)
+    )
+      return;
     const track = config.tracks[trackIndex] ?? {
       name: nextTrackName(),
       clips: [],
@@ -213,13 +270,21 @@
     const clip: VideoClip = {
       id: uniqueClipId(
         config,
-        source?.type === "v4l2" ? source.device : source ? "live-test" : file,
+        source?.type === "compound"
+          ? source.id
+          : source?.type === "v4l2"
+            ? source.device
+            : source
+              ? "live-test"
+              : file,
       ),
       file: source ? "" : file,
       ...(source ? { source } : {}),
       start: position,
       duration:
-        mediaDurations[file] ?? Math.max(0.01, Number(addDuration) || 10),
+        (source?.type === "compound"
+          ? Math.max(0.01, videoEnd(rootConfig.compounds![source.id]))
+          : mediaDurations[file]) ?? Math.max(0.01, Number(addDuration) || 10),
       source_in: 0,
     };
     const overlap = overlapError(track, clip);
@@ -319,7 +384,7 @@
     redoStack = [];
     error = "";
     previewStale = true;
-    onchange?.(next);
+    publish(next);
   }
 
   function replaceTrack(trackIndex: number, track: VideoTrack): VideoConfig {
@@ -426,6 +491,38 @@
   }
 
   function patchComposition(patch: Partial<VideoClip>) {
+    if (selected && !patch.automation) {
+      const clip = selected.clip;
+      const automation = { ...clip.automation };
+      // Topology changes invalidate mask-index paths; never redirect a curve to another point.
+      if (
+        patch.masks &&
+        JSON.stringify(patch.masks.map((m) => [m.shape, m.points?.length])) !==
+          JSON.stringify(
+            (clip.masks ?? []).map((m) => [m.shape, m.points?.length]),
+          )
+      ) {
+        for (const path of Object.keys(automation))
+          if (path.startsWith("/masks/")) delete automation[path];
+      }
+      const candidate = { ...clip, ...patch };
+      for (const [path, lane] of Object.entries(automation)) {
+        if (lane.enabled && path.slice(1).split("/")[0] in patch) {
+          const value = propertyValue(candidate, path);
+          const current = propertyValue(
+            evaluatedClip(clip, config.canvas, playhead - clip.start),
+            path,
+          );
+          if (value !== current)
+            automation[path] = insertPoint(
+              lane,
+              Math.max(0, Math.min(clip.duration, playhead - clip.start)),
+              value,
+            );
+        }
+      }
+      patch = { ...patch, automation };
+    }
     patchSelected(patch);
     previewControl?.refreshComposition();
   }
@@ -451,6 +548,11 @@
 
 <svelte:window onkeydown={historyKey} />
 <div class="video-editor" data-testid="video-timeline-editor">
+  {#if editingCompound}<div class="compound-navigation">
+      <button class="btn btn-sm" onclick={() => openCompound(null)}
+        >← Main timeline</button
+      ><strong>Compound · {editingCompound}</strong>
+    </div>{/if}
   <div class="workspace">
     <div class="source-library">
       <div class="library-tabs" role="tablist" aria-label="Video sources">
@@ -464,6 +566,49 @@
           aria-selected={libraryTab === "live"}
           onclick={() => (libraryTab = "live")}>Live sources</button
         >
+        <button
+          role="tab"
+          aria-selected={libraryTab === "compounds"}
+          onclick={() => (libraryTab = "compounds")}>Compounds</button
+        >
+      </div>
+      <div hidden={libraryTab !== "compounds"} class="compound-library">
+        <input
+          aria-label="New compound name"
+          placeholder="Compound name"
+          bind:value={compoundName}
+          disabled={locked}
+        />
+        <button class="btn btn-sm" disabled={locked} onclick={createCompound}
+          >＋ New compound</button
+        >
+        {#each Object.entries(rootConfig.compounds ?? {}) as [id, compound] (id)}
+          <div class="compound-source">
+            <button
+              class="btn btn-sm"
+              disabled={locked || id === editingCompound}
+              draggable={!locked && id !== editingCompound}
+              title="Drag onto a video track or click to append."
+              ondragstart={(e) => {
+                e.dataTransfer?.setData(
+                  VIDEO_MEDIA_TYPE,
+                  `mtrack-live:${JSON.stringify({ type: "compound", id })}`,
+                );
+                if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+              }}
+              onclick={() =>
+                placeMedia(
+                  `mtrack-live:${JSON.stringify({ type: "compound", id })}`,
+                  selected?.trackIndex ?? 0,
+                )}>{id} · {videoEnd(compound).toFixed(1)}s</button
+            ><button
+              class="btn btn-sm"
+              disabled={locked}
+              aria-label={`Edit compound ${id}`}
+              onclick={() => openCompound(id)}>Edit</button
+            >
+          </div>
+        {/each}
       </div>
       <div hidden={libraryTab !== "media"}>
         <VideoMediaPool
@@ -482,25 +627,38 @@
       </div>
     </div>
     <div class="viewer">
-      <VideoPreview
-        bind:this={previewControl}
-        editingClip={locked ? null : (selected?.clip ?? null)}
-        bind:selectedMask
-        bind:drawingMask
-        onpatch={patchComposition}
-        onposition={(ms) => (playhead = ms / 1000)}
-        {songName}
-        {config}
-        durationMs={Math.max(songDurationSeconds, videoEnd(config)) * 1000}
-        stale={previewStale}
-        available={previewAvailable}
-        onreloaded={() => (previewStale = false)}
-      />
+      {#key editingCompound}<VideoPreview
+          bind:this={previewControl}
+          editingClip={locked || !selected
+            ? null
+            : evaluatedClip(
+                selected.clip,
+                config.canvas,
+                Math.max(0, playhead - selected.clip.start),
+              )}
+          bind:selectedMask
+          bind:drawingMask
+          onpatch={patchComposition}
+          onposition={(ms) => (playhead = ms / 1000)}
+          {songName}
+          {config}
+          durationMs={Math.max(
+            editingCompound ? 0 : songDurationSeconds,
+            videoEnd(config),
+          ) * 1000}
+          stale={previewStale}
+          available={previewAvailable}
+          onreloaded={() => (previewStale = false)}
+        />{/key}
     </div>
     <aside class="inspector" aria-label="Video properties" inert={locked}>
       {#if selected}
         <VideoCompositionPanel
-          clip={selected.clip}
+          clip={evaluatedClip(
+            selected.clip,
+            config.canvas,
+            Math.max(0, playhead - selected.clip.start),
+          )}
           canvas={config.canvas}
           bind:selectedMask
           bind:drawingMask
@@ -718,6 +876,14 @@
       </div>
     {/if}
 
+    {#if selected}{#key selected.clip.id}<VideoAutomation
+          clip={selected.clip}
+          canvas={config.canvas}
+          position={playhead}
+          onpatch={patchComposition}
+          onseek={(time) => previewControl?.seekTo(time * 1000)}
+        />{/key}{/if}
+
     <button
       type="button"
       class="new-track-drop"
@@ -738,11 +904,36 @@
 </div>
 
 <style>
+  .compound-navigation,
+  .compound-source {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .compound-library {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .compound-library[hidden] {
+    display: none;
+  }
+  .compound-library input {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--nc-bg-1);
+    color: var(--nc-fg-1);
+    border: 1px solid var(--card-border);
+    padding: 6px;
+  }
+
   .source-library {
     min-width: 0;
   }
   .library-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
     margin-bottom: 6px;
   }

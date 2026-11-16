@@ -988,3 +988,95 @@ fn feathered_masks_render_in_output_and_combine_with_opacity() {
         }
     }
 }
+
+#[test]
+fn compound_mixes_file_and_live_with_group_automation_and_seek() {
+    let directory = tempfile::tempdir().unwrap();
+    make_video(directory.path(), "red.mkv", "red");
+    let config = video_config(
+        r##"
+canvas: {width: 16, height: 16, frame_rate: 10}
+compounds:
+  duo:
+    canvas: {width: 16, height: 16, frame_rate: 10}
+    tracks:
+      - name: recorded
+        clips: [{id: a, file: red.mkv, start: 0, duration: 2}]
+      - name: camera
+        clips: [{id: b, source: {type: test_pattern}, start: 0, duration: 2, x: 8, width: 8}]
+tracks:
+  - name: group
+    clips:
+      - id: duo-instance
+        source: {type: compound, id: duo}
+        start: 0
+        duration: 2
+        automation:
+          /opacity: {points: [{time: 0, value: 0}, {time: 2, value: 1}]}
+"##,
+    );
+    let mut engine = GstVideoEngine::preview(config, directory.path()).unwrap();
+    let frames = engine.frame_receiver();
+    engine.start(Duration::from_secs(1)).unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    let left = pixel(&frame.rgba, 16, 3, 8);
+    let right = pixel(&frame.rgba, 16, 12, 8);
+    assert!(left[0] > 245 && left[1] < 5, "recorded layer: {left:?}");
+    assert!(left[3].abs_diff(128) <= 2, "group alpha: {left:?}");
+    assert!(
+        right[3].abs_diff(128) <= 2,
+        "overlap must fade as one group: {right:?}"
+    );
+    engine.seek(Duration::ZERO).unwrap();
+    loop {
+        let f = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        if f.song_position == Duration::ZERO {
+            assert_eq!(pixel(&f.rgba, 16, 3, 8)[3], 0);
+            break;
+        }
+    }
+    engine.stop().unwrap();
+}
+
+#[test]
+fn nested_compound_instances_have_independent_file_offsets() {
+    let directory = tempfile::tempdir().unwrap();
+    make_sequence_video(
+        directory.path(),
+        "sequence.mkv",
+        &[
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ],
+    );
+    let config = video_config(
+        r##"
+canvas: {width: 8, height: 4, frame_rate: 2}
+compounds:
+  inner:
+    canvas: {width: 4, height: 4, frame_rate: 2}
+    tracks:
+      - name: file
+        clips: [{id: a, file: sequence.mkv, start: 0.5, source_in: 0.5, duration: 1.5}]
+  outer:
+    canvas: {width: 4, height: 4, frame_rate: 2}
+    tracks:
+      - name: nested
+        clips: [{id: a, source: {type: compound, id: inner}, start: 0, duration: 2}]
+tracks:
+  - name: left
+    clips: [{id: left, source: {type: compound, id: outer}, source_in: 0.5, start: 0, duration: 1, width: 4}]
+  - name: right
+    clips: [{id: right, source: {type: compound, id: outer}, source_in: 1, start: 0, duration: 1, x: 4, width: 4}]
+"##,
+    );
+    let mut engine = GstVideoEngine::headless(config, directory.path()).unwrap();
+    let frames = engine.frame_receiver();
+    engine.start(Duration::ZERO).unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_opaque_color(pixel(&frame.rgba, 8, 1, 1), [0, 255, 0]);
+    assert_opaque_color(pixel(&frame.rgba, 8, 6, 1), [0, 0, 255]);
+    engine.stop().unwrap();
+}

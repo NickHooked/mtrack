@@ -42,6 +42,8 @@ export function parseLiveMedia(
   if (!value.startsWith("mtrack-live:")) return null;
   try {
     const source = JSON.parse(value.slice(12));
+    if (source.type === "compound" && typeof source.id === "string")
+      return { type: "compound", id: source.id };
     if (source.type === "test_pattern") return { type: "test_pattern" };
     if (source.type === "v4l2" && typeof source.device === "string")
       return { type: "v4l2", device: source.device };
@@ -51,6 +53,7 @@ export function parseLiveMedia(
   return null;
 }
 export function videoSourceLabel(clip: import("./types").VideoClip): string {
+  if (clip.source?.type === "compound") return `COMPOUND ${clip.source.id}`;
   return clip.source?.type === "v4l2"
     ? `LIVE ${clip.source.device}`
     : clip.source

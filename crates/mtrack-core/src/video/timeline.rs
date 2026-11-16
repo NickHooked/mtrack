@@ -25,6 +25,7 @@ pub struct RuntimeVideoTimeline {
     root: PathBuf,
     clips: Vec<RuntimeVideoClip>,
     end: Duration,
+    compounds: std::collections::BTreeMap<String, RuntimeVideoTimeline>,
 }
 
 /// One resolved file or live clip. `z_order` orders tracks back-to-front.
@@ -46,6 +47,8 @@ pub struct RuntimeVideoClip {
     fade_in: Duration,
     fade_out: Duration,
     masks: Vec<VideoMask>,
+    configured: crate::config::video::VideoClip,
+    canvas: crate::config::video::VideoCanvas,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +106,7 @@ impl RuntimeVideoTimeline {
             root: PathBuf::from("/"),
             clips: Vec::new(),
             end: Duration::ZERO,
+            compounds: Default::default(),
         }
     }
 
@@ -117,6 +121,19 @@ impl RuntimeVideoTimeline {
                 song: song.to_string(),
                 message: errors.join("; "),
             })?;
+        let mut result = Self::resolve_inner(song, base_path, config)?;
+        for (id, compound) in config.compounds() {
+            result
+                .compounds
+                .insert(id.clone(), Self::resolve_inner(song, base_path, compound)?);
+        }
+        Ok(result)
+    }
+    fn resolve_inner(
+        song: &str,
+        base_path: &Path,
+        config: &VideoConfig,
+    ) -> Result<Self, TimelineError> {
         let root = base_path
             .canonicalize()
             .map_err(|source| TimelineError::SongDirectory {
@@ -195,13 +212,36 @@ impl RuntimeVideoTimeline {
                     fade_in,
                     fade_out,
                     masks: clip.masks().to_vec(),
+                    configured: clip.clone(),
+                    canvas: config.canvas().clone(),
                 });
             }
         }
         clips.sort_by_key(|clip| clip.start);
-        Ok(Self { root, clips, end })
+        Ok(Self {
+            root,
+            clips,
+            end,
+            compounds: Default::default(),
+        })
     }
 
+    pub fn compounds(&self) -> &std::collections::BTreeMap<String, Self> {
+        &self.compounds
+    }
+    pub fn all_clips(&self) -> impl Iterator<Item = &RuntimeVideoClip> {
+        self.clips
+            .iter()
+            .chain(self.compounds.values().flat_map(|c| c.clips.iter()))
+    }
+    pub fn scoped_clip(&self, scope: &str, id: &str) -> Option<&RuntimeVideoClip> {
+        let timeline = if scope.is_empty() {
+            self
+        } else {
+            self.compounds.get(scope)?
+        };
+        timeline.clips.iter().find(|c| c.id() == id)
+    }
     pub fn clips(&self) -> &[RuntimeVideoClip] {
         &self.clips
     }
@@ -228,6 +268,23 @@ impl RuntimeVideoTimeline {
 }
 
 impl RuntimeVideoClip {
+    pub fn evaluated_at(&self, position: Duration) -> Self {
+        let c = self.configured.evaluated_at(
+            position.saturating_sub(self.start).as_secs_f64(),
+            &self.canvas,
+        );
+        let mut result = self.clone();
+        result.x = c.x();
+        result.y = c.y();
+        result.width = c.width();
+        result.height = c.height();
+        result.opacity = c.opacity();
+        result.fade_in = Duration::from_secs_f64(c.fade_in());
+        result.fade_out = Duration::from_secs_f64(c.fade_out());
+        result.masks = c.masks().to_vec();
+        result
+    }
+
     pub fn masks(&self) -> &[VideoMask] {
         &self.masks
     }

@@ -34,8 +34,7 @@ pub(crate) fn bind_timeline(
         use std::os::fd::AsRawFd;
 
         let unique = timeline
-            .clips()
-            .iter()
+            .all_clips()
             .filter(|clip| clip.source().is_none())
             .map(|clip| clip.file())
             .collect::<std::collections::HashSet<_>>();
@@ -51,14 +50,12 @@ pub(crate) fn bind_timeline(
         // Replacement order must match VideoConfig's track/clip order. The
         // runtime timeline is sorted by clip start and cannot be zipped back
         // onto the source config without swapping media between tracks.
-        for configured_clip in config.tracks().iter().flat_map(|track| track.clips()) {
+        for (scope, configured_clip) in config.scoped_clips() {
             if configured_clip.source().is_some() {
                 continue;
             }
             let clip = timeline
-                .clips()
-                .iter()
-                .find(|clip| clip.id() == configured_clip.id())
+                .scoped_clip(scope, configured_clip.id())
                 .expect("validated runtime timeline retains every configured clip");
             if let Some(bound) = opened.get(clip.file()) {
                 replacements.push(bound.clone());

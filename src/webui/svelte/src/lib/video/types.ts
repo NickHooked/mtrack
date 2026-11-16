@@ -13,7 +13,8 @@ export interface VideoCanvas {
 
 export type VideoSource =
   | { type: "v4l2"; device: string }
-  | { type: "test_pattern" };
+  | { type: "test_pattern" }
+  | { type: "compound"; id: string };
 
 export interface VideoMask {
   shape: "rectangle" | "ellipse" | "polygon";
@@ -27,6 +28,7 @@ export interface VideoMask {
   opacity: number;
 }
 export interface VideoClip {
+  automation?: import("./automation.svelte").Automation;
   x?: number;
   y?: number;
   width?: number;
@@ -49,6 +51,7 @@ export interface VideoTrack {
 }
 
 export interface VideoConfig {
+  compounds?: Record<string, VideoConfig>;
   canvas: VideoCanvas;
   tracks: VideoTrack[];
 }
