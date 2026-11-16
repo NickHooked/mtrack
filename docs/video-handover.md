@@ -144,6 +144,75 @@ the production frontend build also passed. The video backend build and a
 no-default-features check passed. The running demo was verified through the
 real preview WebSocket: initial frame, play and pause all rendered live input.
 
+## Canvas positioning and masks — 2026-11-16
+
+Previously clip `x`, `y`, `width`, `height`, opacity and fades could be specified
+in YAML but not edited visually. The editor now has a **Canvas & masks** panel
+for the selected timeline clip. Drag its preview outline to position it, or any
+of its four corner handles to resize. Shift keeps the aspect ratio. Arrow keys
+nudge the selection (Shift gives ten-pixel steps); the panel also accepts exact
+values. Positions can now be negative, within -4096..4096 output pixels, so a
+clip can extend beyond the canvas. Existing on-canvas positive-position configs remain
+compatible. Fill canvas restores the full canvas rectangle.
+
+Canvas/mask edits commit once per completed drag and participate in the existing
+undo/redo history. The outline follows the pointer; after release the backend
+refreshes the composed frame and pauses preview playback. Select **Show selected
+clip** if the playhead is outside the clip's visible interval. Timeline edits
+retain the existing explicit stale-preview/reload behavior. Save persists the
+configuration as before.
+
+The reference was Millumin's [Move and Mask tools](https://help.millumin.com/v4/playback/workspace/)
+and [mask/feather controls](https://help.millumin.com/docs/playback/masks/).
+This implementation supports up to eight rectangular or elliptical masks **per
+clip**, rather than Millumin's layer-level masks. Each has normalized local
+bounds, feather in output pixels, strength (opacity) and inversion. Select Edit
+mask to move/resize its outline on the canvas. Percentage fields provide exact
+bounds. Masks follow clip position/size, and apply to both files and live inputs.
+
+```yaml
+- id: camera
+  start: 0
+  duration: 60
+  source: { type: v4l2, device: /dev/video0 }
+  x: -20
+  y: 40
+  width: 640
+  height: 360
+  opacity: 0.9
+  fade_in: 1
+  fade_out: 2
+  masks:
+    - shape: ellipse
+      x: 0.1
+      y: 0.1
+      width: 0.8
+      height: 0.8
+      feather: 30
+      invert: false
+      opacity: 1
+```
+
+A normal mask keeps the interior; an inverted one cuts a hole. Multiple masks
+multiply/intersect. Strength zero leaves the input untouched. Feather is a
+smooth inward alpha ramp; ellipse distance uses an approximation. This is not
+Millumin's GPU blur implementation. Mask alpha multiplies existing source alpha
+before the compositor, so masks, clip opacity and temporal fades combine. Each
+active clip caches a raster until the clip changes; rasterization polls
+cancellation. Real multi-camera/high-resolution throughput still needs hardware
+profiling. Freeform/Bézier masks, rotation, animated masks, alpha/luma video
+mattes and projection mapping are not included in this iteration.
+
+The work also fixes the properties panel's file-required guard for live clips.
+Validation: 43 video browser cases (including targeted reruns after fixing a
+scrolling test), 74 backend video unit tests, 28 core video tests and 29
+GStreamer integration tests passed. Real pixel assertions cover feather plus
+opacity on file and live sources, including negative clip positioning. Frontend
+type checking/lint/build, the video backend build and no-default-features check
+passed. In the running app a live ellipse mask was edited, saved and rendered
+with 50-pixel feather; the demo config and screenshots are in the sibling
+`mtrack-video-demo` directory.
+
 ## Repository and branch
 
 The work is published in Nick Haakman's fork:

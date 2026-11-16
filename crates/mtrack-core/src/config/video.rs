@@ -187,10 +187,10 @@ impl VideoConfig {
                         "{clip_label}: source_in must be finite and non-negative"
                     ));
                 }
-                if clip.x > i32::MAX as u32 {
+                if clip.x.unsigned_abs() > MAX_CANVAS_DIMENSION {
                     errors.push(format!("{clip_label}: x is too large"));
                 }
-                if clip.y > i32::MAX as u32 {
+                if clip.y.unsigned_abs() > MAX_CANVAS_DIMENSION {
                     errors.push(format!("{clip_label}: y is too large"));
                 }
                 if clip.width == Some(0) {
@@ -227,6 +227,33 @@ impl VideoConfig {
                     if !fade.is_finite() || fade < 0.0 {
                         errors.push(format!(
                             "{clip_label}: {field} must be finite and non-negative"
+                        ));
+                    }
+                }
+                if clip.masks.len() > 8 {
+                    errors.push(format!("{clip_label}: at most 8 masks are supported"));
+                }
+                for mask in &clip.masks {
+                    if !mask.x.is_finite()
+                        || !mask.y.is_finite()
+                        || !mask.width.is_finite()
+                        || !mask.height.is_finite()
+                        || mask.x < 0.0
+                        || mask.y < 0.0
+                        || mask.width <= 0.0
+                        || mask.height <= 0.0
+                        || mask.x + mask.width > 1.000001
+                        || mask.y + mask.height > 1.000001
+                    {
+                        errors.push(format!("{clip_label}: mask bounds must lie within normalized clip coordinates 0..1"));
+                    }
+                    if !mask.feather.is_finite()
+                        || !(0.0..=4096.0).contains(&mask.feather)
+                        || !mask.opacity.is_finite()
+                        || !(0.0..=1.0).contains(&mask.opacity)
+                    {
+                        errors.push(format!(
+                            "{clip_label}: mask feather must be 0..4096 pixels and opacity 0..1"
                         ));
                     }
                 }
@@ -379,6 +406,36 @@ impl VideoSource {
     }
 }
 
+/// Masks use normalized clip-local bounds; feather is measured in output pixels.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoMask {
+    #[serde(default)]
+    pub shape: MaskShape,
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default = "default_opacity")]
+    pub width: f64,
+    #[serde(default = "default_opacity")]
+    pub height: f64,
+    #[serde(default)]
+    pub feather: f64,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default = "default_opacity")]
+    pub opacity: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskShape {
+    #[default]
+    Rectangle,
+    Ellipse,
+}
+
 /// A file or live clip placed on a video track.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VideoClip {
@@ -393,10 +450,10 @@ pub struct VideoClip {
     source_in: f64,
     #[serde(default)]
     /// Horizontal position in output-canvas pixels (not a normalized value).
-    x: u32,
+    x: i32,
     #[serde(default)]
     /// Vertical position in output-canvas pixels (not a normalized value).
-    y: u32,
+    y: i32,
     #[serde(default)]
     /// Optional output width in pixels; omitted uses the canvas width.
     width: Option<u32>,
@@ -415,6 +472,8 @@ pub struct VideoClip {
     #[serde(default, skip_serializing_if = "is_zero")]
     /// Linear fade-out duration in seconds.
     fade_out: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    masks: Vec<VideoMask>,
 }
 
 impl VideoClip {
@@ -442,11 +501,11 @@ impl VideoClip {
         self.source_in
     }
 
-    pub fn x(&self) -> u32 {
+    pub fn x(&self) -> i32 {
         self.x
     }
 
-    pub fn y(&self) -> u32 {
+    pub fn y(&self) -> i32 {
         self.y
     }
 
@@ -456,6 +515,10 @@ impl VideoClip {
 
     pub fn height(&self) -> Option<u32> {
         self.height
+    }
+
+    pub fn masks(&self) -> &[VideoMask] {
+        &self.masks
     }
 
     pub fn opacity(&self) -> f64 {
@@ -726,7 +789,7 @@ tracks:
 tracks:
   - name: overlay
     clips:
-      - { id: title, start: 0, duration: 1, file: title.mkv, x: 4294967295, y: 4294967295, width: 0, height: 0 }
+      - { id: title, start: 0, duration: 1, file: title.mkv, x: 4097, y: -4097, width: 0, height: 0 }
 "#,
         );
 
@@ -918,6 +981,23 @@ tracks: [{tracks}]"##
             assert_eq!(clip["source"]["device"], device);
             let restored: VideoConfig = serde_json::from_value(serialized).unwrap();
             assert!(restored.validate().is_ok());
+        }
+    }
+    #[test]
+    fn masks_validate_bounds_and_keep_signed_positions() {
+        let valid = from_yaml("tracks: [{name: screen, clips: [{id: a, start: 0, duration: 1, file: a.mkv, x: -25, masks: [{shape: ellipse, feather: 30}]}]}]");
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid.tracks()[0].clips()[0].x(), -25);
+        for fields in [
+            "x: -0.1",
+            "width: 0",
+            "x: 0.5, width: 1",
+            "feather: -1",
+            "feather: 4097",
+            "opacity: 2",
+        ] {
+            let invalid = from_yaml(&format!("tracks: [{{name: screen, clips: [{{id: a, start: 0, duration: 1, file: a.mkv, masks: [{{{fields}}}]}}]}}]"));
+            assert!(invalid.validate().is_err(), "{fields}");
         }
     }
 }

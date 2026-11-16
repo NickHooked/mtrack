@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::config::video::{VideoConfig, VideoSource};
+use crate::config::video::{VideoConfig, VideoMask, VideoSource};
 
 /// A validated video timeline whose media paths are canonical and contained in
 /// the song directory. It has no dependency on a playback backend.
@@ -38,13 +38,14 @@ pub struct RuntimeVideoClip {
     start: Duration,
     duration: Duration,
     source_in: Duration,
-    x: u32,
-    y: u32,
+    x: i32,
+    y: i32,
     width: Option<u32>,
     height: Option<u32>,
     opacity: f64,
     fade_in: Duration,
     fade_out: Duration,
+    masks: Vec<VideoMask>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -193,6 +194,7 @@ impl RuntimeVideoTimeline {
                     opacity: clip.opacity(),
                     fade_in,
                     fade_out,
+                    masks: clip.masks().to_vec(),
                 });
             }
         }
@@ -226,6 +228,9 @@ impl RuntimeVideoTimeline {
 }
 
 impl RuntimeVideoClip {
+    pub fn masks(&self) -> &[VideoMask] {
+        &self.masks
+    }
     pub fn source(&self) -> Option<&VideoSource> {
         self.source.as_ref()
     }
@@ -280,10 +285,10 @@ impl RuntimeVideoClip {
         };
         (self.opacity * in_factor * out_factor).clamp(0.0, 1.0)
     }
-    pub fn x(&self) -> u32 {
+    pub fn x(&self) -> i32 {
         self.x
     }
-    pub fn y(&self) -> u32 {
+    pub fn y(&self) -> i32 {
         self.y
     }
     pub fn width(&self) -> Option<u32> {

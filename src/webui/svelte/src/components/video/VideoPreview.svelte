@@ -1,7 +1,9 @@
 <!-- Copyright (C) 2026 Michael Wilson <mike@mdwn.dev> -->
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import type { VideoConfig } from "../../lib/video/types";
+  import { videoConfigError } from "../../lib/video/timeline-state";
+  import VideoCanvasOverlay from "./VideoCanvasOverlay.svelte";
+  import type { VideoClip, VideoConfig } from "../../lib/video/types";
   import {
     VideoPreviewClient,
     type PreviewConnectionLevelState,
@@ -10,6 +12,9 @@
   } from "../../lib/video/preview";
 
   interface Props {
+    editingClip?: VideoClip | null;
+    selectedMask?: number;
+    onpatch?: (patch: Partial<VideoClip>) => void;
     songName: string;
     config: VideoConfig;
     durationMs?: number;
@@ -20,6 +25,9 @@
   }
 
   let {
+    editingClip = null,
+    selectedMask = $bindable(-1),
+    onpatch,
     songName,
     config,
     durationMs = 0,
@@ -164,6 +172,21 @@
     }
   }
 
+  let compositionTimer: ReturnType<typeof setTimeout> | undefined;
+  export function refreshComposition() {
+    clearTimeout(compositionTimer);
+    compositionTimer = setTimeout(() => {
+      if (unavailable || connection !== "connected" || videoConfigError(config))
+        return;
+      if (controlsDisabled) {
+        refreshComposition();
+        return;
+      }
+      reload();
+    }, 200);
+  }
+  onDestroy(() => clearTimeout(compositionTimer));
+
   function reload() {
     run(() => {
       const requestId = client?.start(config, positionMs, false);
@@ -283,6 +306,14 @@
           : "Reload to render a frame"}
       </div>
     {/if}
+    {#if editingClip && onpatch && positionMs / 1000 >= editingClip.start && positionMs / 1000 < editingClip.start + editingClip.duration}
+      <VideoCanvasOverlay
+        clip={editingClip}
+        canvas={config.canvas}
+        {selectedMask}
+        {onpatch}
+      />
+    {/if}
     <button
       type="button"
       class="btn btn-sm fullscreen-button"
@@ -295,6 +326,21 @@
     >
   </div>
 
+  <div class="notice composition-notice">
+    {#if editingClip}
+      Canvas editing: {selectedMask >= 0
+        ? `mask ${selectedMask + 1}`
+        : editingClip.id}. Drag the outline or corners. Release to refresh and
+      pause playback.
+      {#if positionMs / 1000 < editingClip.start || positionMs / 1000 >= editingClip.start + editingClip.duration}<button
+          class="btn btn-sm"
+          onclick={() => seekTo(editingClip!.start * 1000)}
+          >Show selected clip</button
+        >{/if}
+    {:else}
+      Select a clip on the timeline to move, resize or mask it on the canvas.
+    {/if}
+  </div>
   {#if unavailable}
     <div class="notice" data-testid="video-preview-unavailable">
       Video preview is unavailable in this server build.
@@ -368,6 +414,11 @@
 </section>
 
 <style>
+  .composition-notice {
+    box-sizing: border-box;
+    height: 54px;
+    overflow: auto;
+  }
   .preview {
     display: flex;
     flex-direction: column;

@@ -665,6 +665,7 @@ test.describe("Video media pool", () => {
     await page.getByText("Manual placement", { exact: true }).click();
     await page.getByTestId("video-add-track").click();
     await page.getByTestId("video-clip").scrollIntoViewIfNeeded();
+    await page.getByTestId("video-track-name").nth(1).scrollIntoViewIfNeeded();
     const source = await page.getByTestId("video-clip").boundingBox();
     const target = await page.getByTestId("video-lane").nth(1).boundingBox();
     if (!source || !target) throw new Error("missing timeline geometry");
@@ -814,5 +815,105 @@ test.describe("Live video sources", () => {
     const clip = parse(state.currentYaml()).video.tracks[0].clips[0];
     expect(clip.source).toEqual({ type: "test_pattern" });
     expect(clip.start).toBeGreaterThan(0);
+  });
+});
+
+test.describe("Canvas composition", () => {
+  test.use({ viewport: { width: 1280, height: 1100 } });
+  test("moves and resizes on canvas and persists layout with undo", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByTestId("video-clip").click();
+    for (const [field, value] of [
+      ["width", "640"],
+      ["height", "360"],
+    ]) {
+      await page.getByTestId(`video-composition-${field}`).fill(value);
+      await page
+        .getByTestId(`video-composition-${field}`)
+        .dispatchEvent("change");
+    }
+    await dragBy(page, page.getByTestId("video-canvas-move"), 30);
+    const x = Number(
+      await page.getByTestId("video-composition-x").inputValue(),
+    );
+    expect(x).toBeGreaterThan(0);
+    await dragBy(page, page.getByTestId("video-canvas-resize-se"), 30);
+    expect(
+      Number(await page.getByTestId("video-composition-width").inputValue()),
+    ).toBeGreaterThan(640);
+    await page.getByRole("button", { name: "Undo video edit" }).click();
+    await expect(page.getByTestId("video-composition-width")).toHaveValue(
+      "640",
+    );
+    const handle = page.getByTestId("video-canvas-resize-se");
+    await handle.scrollIntoViewIfNeeded();
+    const bounds = await handle.boundingBox();
+    if (!bounds) throw new Error("missing resize handle");
+    await page.keyboard.down("Shift");
+    await page.mouse.move(
+      bounds.x + bounds.width / 2,
+      bounds.y + bounds.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(
+      bounds.x + bounds.width / 2,
+      bounds.y + bounds.height / 2 + 30,
+      { steps: 5 },
+    );
+    await page.mouse.up();
+    await page.keyboard.up("Shift");
+    const resizedWidth = Number(
+      await page.getByTestId("video-composition-width").inputValue(),
+    );
+    const resizedHeight = Number(
+      await page.getByTestId("video-composition-height").inputValue(),
+    );
+    expect(resizedHeight).toBeGreaterThan(360);
+    expect(Math.abs(resizedWidth / resizedHeight - 640 / 360)).toBeLessThan(
+      0.01,
+    );
+    await page.getByRole("button", { name: "Undo video edit" }).click();
+
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    expect(parse(state.currentYaml()).video.tracks[0].clips[0]).toMatchObject({
+      x,
+      width: 640,
+      height: 360,
+    });
+  });
+  test("adds, feathers, inverts and moves a mask on a live clip", async ({
+    page,
+  }) => {
+    const state = await openVideo(
+      page,
+      INITIAL_YAML.replace("file: opening.mp4", "source: {type: test_pattern}"),
+    );
+    await page.getByTestId("video-clip").click();
+    await page.getByTestId("video-composition-x").fill("-20");
+    await page.getByTestId("video-composition-x").dispatchEvent("change");
+    await page.getByRole("button", { name: "Add ellipse mask" }).click();
+    await page.getByTestId("video-mask-feather").fill("40");
+    await page.getByTestId("video-mask-feather").dispatchEvent("change");
+    await page.getByLabel("Invert (cut a hole)", { exact: true }).check();
+    await page.getByTestId("video-canvas-move").focus();
+    await page.getByTestId("video-canvas-move").press("ArrowRight");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const clip = parse(state.currentYaml()).video.tracks[0].clips[0];
+    expect(clip.x).toBe(-20);
+    expect(clip.source.type).toBe("test_pattern");
+    expect(clip.masks[0]).toMatchObject({
+      shape: "ellipse",
+      feather: 40,
+      invert: true,
+    });
+    expect(clip.masks[0].x).toBeGreaterThan(0.1);
+    await page
+      .getByRole("button", { name: "Remove mask 1", exact: true })
+      .click();
+    await expect(page.getByTestId("video-mask-feather")).toHaveCount(0);
   });
 });

@@ -965,3 +965,21 @@ tracks:
     }
     engine.stop().unwrap();
 }
+
+#[test]
+fn feathered_masks_render_in_output_and_combine_with_opacity() {
+    let directory = tempfile::tempdir().unwrap();
+    make_video(directory.path(), "white.mkv", "white");
+    for source in ["file: white.mkv", "source: {type: test_pattern}"] {
+        let config = video_config(&format!("canvas: {{width: 16, height: 16, frame_rate: 10}}\ntracks: [{{name: masked, clips: [{{id: mask, start: 0, duration: 2, {source}, x: -4, opacity: 0.5, masks: [{{shape: rectangle, x: 0.25, y: 0.25, width: 0.5, height: 0.5, feather: 2}}]}}]}}]"));
+        let mut engine = GstVideoEngine::preview(config, directory.path()).unwrap();
+        let frames = engine.frame_receiver();
+        engine.start(Duration::ZERO).unwrap();
+        let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(pixel(&frame.rgba, 16, 12, 8)[3], 0);
+        let edge = pixel(&frame.rgba, 16, 0, 4)[3];
+        assert!(edge > 0 && edge < 100, "soft edge: {edge}");
+        assert!(pixel(&frame.rgba, 16, 4, 8)[3].abs_diff(128) <= 2);
+        engine.stop().unwrap();
+    }
+}

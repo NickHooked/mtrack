@@ -96,6 +96,19 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
               : {};
           return {
             ...clip,
+            masks: Array.isArray(clip.masks)
+              ? clip.masks.map((m) => ({
+                  shape: "rectangle",
+                  x: 0,
+                  y: 0,
+                  width: 1,
+                  height: 1,
+                  feather: 0,
+                  invert: false,
+                  opacity: 1,
+                  ...m,
+                }))
+              : [],
             id: normalizedId(clip.id, trackIndex, clipIndex),
             start: Math.max(0, finiteNumber(clip.start, 0)),
             duration: Math.max(
@@ -149,6 +162,58 @@ export function videoConfigError(config: VideoConfig): string | null {
       }
       if (!Number.isFinite(clip.source_in) || clip.source_in < 0) {
         return `Set a valid source in for “${clip.file || clip.id}” before saving.`;
+      }
+      if (
+        [clip.x ?? 0, clip.y ?? 0].some(
+          (v) => !Number.isInteger(v) || Math.abs(v) > 4096,
+        )
+      )
+        return "Position must be whole pixels within -4096..4096.";
+      const width = clip.width ?? config.canvas.width,
+        height = clip.height ?? config.canvas.height;
+      if (
+        ![width, height].every(
+          (v) => Number.isInteger(v) && v > 0 && v <= 4096,
+        ) ||
+        width * height > 8847360
+      )
+        return "Clip size exceeds the supported canvas bounds.";
+      if (
+        !Number.isFinite(clip.opacity ?? 1) ||
+        (clip.opacity ?? 1) < 0 ||
+        (clip.opacity ?? 1) > 1
+      )
+        return "Opacity must be between 0 and 1.";
+      if (
+        [clip.fade_in ?? 0, clip.fade_out ?? 0].some(
+          (v) => !Number.isFinite(v) || v < 0,
+        )
+      )
+        return "Fade durations must be non-negative.";
+      if ((clip.masks?.length ?? 0) > 8)
+        return "A clip supports up to eight masks.";
+      for (const mask of clip.masks ?? []) {
+        if (
+          ![
+            mask.x,
+            mask.y,
+            mask.width,
+            mask.height,
+            mask.feather,
+            mask.opacity,
+          ].every(Number.isFinite) ||
+          mask.x < 0 ||
+          mask.y < 0 ||
+          mask.width <= 0 ||
+          mask.height <= 0 ||
+          mask.x + mask.width > 1.000001 ||
+          mask.y + mask.height > 1.000001 ||
+          mask.feather < 0 ||
+          mask.feather > 4096 ||
+          mask.opacity < 0 ||
+          mask.opacity > 1
+        )
+          return "Mask bounds must fit inside the clip; feather must be 0..4096 pixels and opacity 0..1.";
       }
       if (clip.source) {
         if (clip.file || clip.source_in !== 0)

@@ -19,3 +19,6 @@ pub use engine::*;
 
 #[cfg(feature = "video")]
 pub mod capture;
+
+#[cfg(feature = "video")]
+mod mask;

@@ -693,6 +693,8 @@ fn render_timeline(
         (0..request.config.tracks().len()).map(|_| None).collect();
     let mut active_ids: Vec<Option<String>> = vec![None; request.config.tracks().len()];
     let mut live_decoders = std::collections::HashMap::<String, ClipDecoder>::new();
+    let mut masks: Vec<Option<(String, Vec<u8>)>> =
+        (0..request.config.tracks().len()).map(|_| None).collect();
     let mut frame_index = 0u64;
 
     'render: while !request.cancel.load(Ordering::Acquire) {
@@ -730,7 +732,7 @@ fn render_timeline(
                 .active_clips_at(song_position)
                 .into_iter()
                 .find(|clip| clip.z_order() == track_index);
-            let pixels = if let Some(runtime_clip) = active {
+            let mut pixels = if let Some(runtime_clip) = active {
                 let clip = track
                     .clips()
                     .iter()
@@ -818,6 +820,27 @@ fn render_timeline(
                 active_ids[track_index] = None;
                 transparent.clone()
             };
+            if let Some(clip) = active.filter(|clip| !clip.masks().is_empty()) {
+                if masks[track_index].as_ref().map(|(id, _)| id.as_str()) != Some(clip.id()) {
+                    let Some(alpha) = crate::video::mask::rasterize(
+                        clip.masks(),
+                        width,
+                        height,
+                        clip.width().unwrap_or(width),
+                        clip.height().unwrap_or(height),
+                        &request.cancel,
+                    ) else {
+                        break 'render;
+                    };
+                    masks[track_index] = Some((clip.id().into(), alpha));
+                }
+                crate::video::mask::apply(
+                    &mut pixels,
+                    &masks[track_index].as_ref().expect("mask raster").1,
+                );
+            } else {
+                masks[track_index] = None;
+            }
             push_frame(
                 &output_pipeline.sources[track_index + 1],
                 &pixels,
@@ -1185,8 +1208,8 @@ fn configure_clip_pad(
     canvas_width: u32,
     canvas_height: u32,
 ) {
-    pad.set_property("xpos", clip.x() as i32);
-    pad.set_property("ypos", clip.y() as i32);
+    pad.set_property("xpos", clip.x());
+    pad.set_property("ypos", clip.y());
     pad.set_property("width", clip.width().unwrap_or(canvas_width) as i32);
     pad.set_property("height", clip.height().unwrap_or(canvas_height) as i32);
     pad.set_property("alpha", clip.opacity_at(song_position));

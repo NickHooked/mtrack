@@ -15,7 +15,25 @@ export type VideoSource =
   | { type: "v4l2"; device: string }
   | { type: "test_pattern" };
 
+export interface VideoMask {
+  shape: "rectangle" | "ellipse";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  feather: number;
+  invert: boolean;
+  opacity: number;
+}
 export interface VideoClip {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  opacity?: number;
+  fade_in?: number;
+  fade_out?: number;
+  masks?: VideoMask[];
   source?: VideoSource;
   id: string;
   start: number;

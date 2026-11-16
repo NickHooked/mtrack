@@ -28,6 +28,7 @@
     videoConfigError,
     videoEnd,
   } from "../../lib/video/timeline-state";
+  import VideoCompositionPanel from "./VideoCompositionPanel.svelte";
   import VideoPropertiesPanel from "./VideoPropertiesPanel.svelte";
   import VideoPreview from "./VideoPreview.svelte";
   import VideoTrackLane from "./VideoTrackLane.svelte";
@@ -59,6 +60,11 @@
   let config = $derived(video ?? createVideoConfig());
   let error = $state("");
   let playhead = $state(0);
+  let selectedMask = $state(-1);
+  $effect(() => {
+    void selectedClipId;
+    selectedMask = -1;
+  });
   let libraryTab = $state<"media" | "live">("media");
   let previewControl: VideoPreview;
   onMount(() => {
@@ -410,11 +416,16 @@
   function patchSelected(patch: Partial<VideoClip>) {
     if (!selected) return;
     const candidate = normalizeClipPatch(selected.clip, patch);
-    if (!candidate.file.trim()) {
+    if (!candidate.source && !candidate.file.trim()) {
       error = "Clip file must not be empty.";
       return;
     }
     commitClip(selected.trackIndex, candidate);
+  }
+
+  function patchComposition(patch: Partial<VideoClip>) {
+    patchSelected(patch);
+    previewControl?.refreshComposition();
   }
 
   function deleteClip(trackIndex: number, clipId: string) {
@@ -471,6 +482,9 @@
     <div class="viewer">
       <VideoPreview
         bind:this={previewControl}
+        editingClip={locked ? null : (selected?.clip ?? null)}
+        bind:selectedMask
+        onpatch={patchComposition}
         onposition={(ms) => (playhead = ms / 1000)}
         {songName}
         {config}
@@ -703,6 +717,12 @@
       >＋ Drop media here to create a track · or click to add an empty track</button
     >
     {#if selected}
+      <VideoCompositionPanel
+        clip={selected.clip}
+        canvas={config.canvas}
+        bind:selectedMask
+        onpatch={patchComposition}
+      />
       <VideoPropertiesPanel
         clip={selected.clip}
         onpatch={patchSelected}
