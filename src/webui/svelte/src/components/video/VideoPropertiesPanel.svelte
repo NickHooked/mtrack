@@ -1,5 +1,6 @@
 <!-- Copyright (C) 2026 Michael Wilson <mike@mdwn.dev> -->
 <script lang="ts">
+  import { videoSourceLabel } from "../../lib/video/media";
   import type { VideoClip } from "../../lib/video/types";
 
   interface Props {
@@ -70,6 +71,7 @@
       type="number"
       min="0"
       step="0.01"
+      disabled={!!clip.source}
       data-testid="video-clip-source-in"
       value={clip.source_in}
       onchange={(event) =>
@@ -83,11 +85,12 @@
     />
   </label>
   <label class="file-field">
-    <span>File</span>
+    <span>{clip.source ? "Live source" : "File"}</span>
     <input
       type="text"
       data-testid="video-clip-file"
-      value={clip.file}
+      value={videoSourceLabel(clip)}
+      disabled={!!clip.source}
       onchange={(event) =>
         onpatch?.({ file: event.currentTarget.value.trim() })}
       onkeydown={(event) =>

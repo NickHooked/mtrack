@@ -66,7 +66,13 @@ impl VideoConfig {
         let expected = self
             .tracks
             .iter()
-            .map(|track| track.clips.len())
+            .map(|track| {
+                track
+                    .clips
+                    .iter()
+                    .filter(|clip| clip.source.is_none())
+                    .count()
+            })
             .sum::<usize>();
         if files.len() != expected {
             return Err(format!(
@@ -78,6 +84,7 @@ impl VideoConfig {
             .tracks
             .iter_mut()
             .flat_map(|track| track.clips.iter_mut())
+            .filter(|clip| clip.source.is_none())
             .zip(files)
         {
             clip.file = file;
@@ -223,7 +230,16 @@ impl VideoConfig {
                         ));
                     }
                 }
-                if clip.file.trim().is_empty() {
+                if let Some(source) = &clip.source {
+                    if !clip.file.is_empty() || clip.source_in != 0.0 {
+                        errors.push(format!(
+                            "{clip_label}: live sources require no file and source_in = 0"
+                        ));
+                    }
+                    if let Err(error) = source.validate() {
+                        errors.push(format!("{clip_label}: {error}"));
+                    }
+                } else if clip.file.trim().is_empty() {
                     errors.push(format!("{clip_label}: file must not be empty"));
                 } else if !is_safe_relative_path(&clip.file) {
                     errors.push(format!("{clip_label}: file must be a safe relative path"));
@@ -329,13 +345,50 @@ impl VideoTrack {
     }
 }
 
-/// A file-backed clip placed on a video track.
+/// A live input. File clips retain their original `file` field for compatibility.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VideoSource {
+    V4l2 { device: String },
+    TestPattern,
+}
+
+impl VideoSource {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Self::V4l2 { device } = self {
+            let numbered = device
+                .strip_prefix("/dev/video")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            let persistent = ["/dev/v4l/by-id/", "/dev/v4l/by-path/"]
+                .iter()
+                .any(|prefix| {
+                    device.strip_prefix(prefix).is_some_and(|name| {
+                        !name.is_empty()
+                            && name != "."
+                            && name != ".."
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+                    })
+                });
+            if !numbered && !persistent {
+                return Err("camera device must be /dev/videoN or a persistent /dev/v4l/by-id or by-path device".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A file or live clip placed on a video track.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VideoClip {
     id: String,
     start: f64,
     duration: f64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<VideoSource>,
     #[serde(default)]
     source_in: f64,
     #[serde(default)]
@@ -379,6 +432,10 @@ impl VideoClip {
 
     pub fn file(&self) -> &str {
         &self.file
+    }
+
+    pub fn source(&self) -> Option<&VideoSource> {
+        self.source.as_ref()
     }
 
     pub fn source_in(&self) -> f64 {
@@ -844,5 +901,23 @@ tracks: [{tracks}]"##
         assert!(error.contains("expected 2 clip files, got 1"), "{error}");
         assert_eq!(video.tracks()[0].clips()[0].file(), "a");
         assert_eq!(video.tracks()[0].clips()[1].file(), "b");
+    }
+    #[test]
+    fn live_sources_validate_and_roundtrip_without_files() {
+        for device in [
+            "/dev/video0",
+            "/dev/video12",
+            "/dev/v4l/by-id/usb-Capture-video-index0",
+            "/dev/v4l/by-path/pci-0000:00:14.0-video-index0",
+        ] {
+            let video = from_yaml(&format!("tracks: [{{name: Camera, clips: [{{id: camera, start: 2, duration: 4, source: {{type: v4l2, device: {device}}}}}]}}]"));
+            assert!(video.validate().is_ok());
+            let serialized = serde_json::to_value(&video).unwrap();
+            let clip = &serialized["tracks"][0]["clips"][0];
+            assert!(clip.get("file").is_none());
+            assert_eq!(clip["source"]["device"], device);
+            let restored: VideoConfig = serde_json::from_value(serialized).unwrap();
+            assert!(restored.validate().is_ok());
+        }
     }
 }

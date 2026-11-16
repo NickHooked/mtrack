@@ -1,5 +1,6 @@
 <!-- Copyright (C) 2026 Michael Wilson <mike@mdwn.dev> -->
 <script lang="ts">
+  import { videoSourceLabel } from "../../lib/video/media";
   import type { VideoClip } from "../../lib/video/types";
   import {
     MIN_CLIP_DURATION,
@@ -175,7 +176,7 @@
   style:width="{Math.max(14, shown.duration * pixelsPerSecond)}px"
   role="button"
   tabindex="0"
-  aria-label={`Video clip ${clip.file}`}
+  aria-label={`Video clip ${videoSourceLabel(clip)}`}
   onfocus={onselect}
   onpointerdown={(event) => beginDrag(event, "move")}
   onpointermove={drag}
@@ -188,7 +189,9 @@
     data-testid="video-trim-left"
     aria-label="Trim clip start"
     role="slider"
-    aria-valuemin={rounded(Math.max(0, shown.start - shown.source_in))}
+    aria-valuemin={rounded(
+      shown.source ? 0 : Math.max(0, shown.start - shown.source_in),
+    )}
     aria-valuemax={rounded(shown.start + shown.duration - MIN_CLIP_DURATION)}
     aria-valuenow={rounded(shown.start)}
     tabindex="0"
@@ -199,7 +202,7 @@
     onkeydown={(event) => trimKeydown(event, "left")}
   ></span>
   <span class="clip-label"
-    >{clip.file}{#if dragMode}<small
+    >{videoSourceLabel(clip)}{#if dragMode}<small
         >{shown.start.toFixed(2)}s{#if dragMode === "move"}
           · {targetIndex === null
             ? "outside timeline"

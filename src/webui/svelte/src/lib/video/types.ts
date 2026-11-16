@@ -11,7 +11,12 @@ export interface VideoCanvas {
   background: string;
 }
 
+export type VideoSource =
+  | { type: "v4l2"; device: string }
+  | { type: "test_pattern" };
+
 export interface VideoClip {
+  source?: VideoSource;
   id: string;
   start: number;
   duration: number;

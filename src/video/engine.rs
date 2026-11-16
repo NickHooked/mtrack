@@ -184,6 +184,7 @@ impl GstVideoEngine {
             .tracks()
             .iter()
             .flat_map(|track| track.clips())
+            .filter(|clip| clip.source().is_none())
             .map(|clip| {
                 let target = Path::new(clip.file()).canonicalize().map_err(|error| {
                     VideoError::InvalidConfig(format!(
@@ -569,6 +570,7 @@ fn clone_bound_media(
             .tracks()
             .iter()
             .flat_map(|track| track.clips())
+            .filter(|clip| clip.source().is_none())
             .map(|clip| {
                 descriptor_paths
                     .get(clip.file())
@@ -645,6 +647,17 @@ fn frame_period(frame_rate: f64) -> Result<Duration, VideoError> {
     Ok(period)
 }
 
+fn live_source_key(source: &crate::config::video::VideoSource) -> String {
+    use crate::config::video::VideoSource;
+    match source {
+        VideoSource::V4l2 { device } => std::fs::canonicalize(device)
+            .unwrap_or_else(|_| PathBuf::from(device))
+            .to_string_lossy()
+            .into_owned(),
+        VideoSource::TestPattern => "test-pattern".into(),
+    }
+}
+
 fn render_timeline(
     request: &WorkerRequest,
     startup: &Sender<Result<(), VideoError>>,
@@ -679,6 +692,7 @@ fn render_timeline(
     let mut decoders: Vec<Option<ClipDecoder>> =
         (0..request.config.tracks().len()).map(|_| None).collect();
     let mut active_ids: Vec<Option<String>> = vec![None; request.config.tracks().len()];
+    let mut live_decoders = std::collections::HashMap::<String, ClipDecoder>::new();
     let mut frame_index = 0u64;
 
     'render: while !request.cancel.load(Ordering::Acquire) {
@@ -700,6 +714,16 @@ fn render_timeline(
             running_pts,
             period,
         )?;
+        // One capture pipeline per physical source, even when several layers use it.
+        // Inactive inputs are released immediately, including on timeline gaps.
+        let active_sources: std::collections::HashSet<_> = request
+            .timeline
+            .active_clips_at(song_position)
+            .iter()
+            .filter_map(|clip| clip.source().map(live_source_key))
+            .collect();
+        live_decoders.retain(|key, _| active_sources.contains(key));
+        let mut live_frames = std::collections::HashMap::<String, Vec<u8>>::new();
         for (track_index, track) in request.config.tracks().iter().enumerate() {
             let active = request
                 .timeline
@@ -719,31 +743,74 @@ fn render_timeline(
                     width,
                     height,
                 );
-                if active_ids[track_index].as_deref() != Some(clip.id()) {
-                    let decoder = ClipDecoder::open(
-                        clip,
-                        runtime_clip,
-                        &request.base_path,
-                        width,
-                        height,
-                        fps_n,
-                        fps_d,
-                        song_position,
-                        &request.cancel,
-                    )?;
-                    decoders[track_index] = match decoder {
-                        DecoderPoll::Ready(decoder) => Some(decoder),
+                if let Some(source) = clip.source() {
+                    decoders[track_index] = None;
+                    active_ids[track_index] = None;
+                    let key = live_source_key(source);
+                    if !live_decoders.contains_key(&key) {
+                        let decoder = ClipDecoder::open(
+                            clip,
+                            runtime_clip,
+                            &request.base_path,
+                            width,
+                            height,
+                            fps_n,
+                            fps_d,
+                            song_position,
+                            &request.cancel,
+                        )?;
+                        match decoder {
+                            DecoderPoll::Ready(decoder) => {
+                                live_decoders.insert(key.clone(), decoder);
+                            }
+                            DecoderPoll::Cancelled => break 'render,
+                        }
+                    }
+                    if !live_frames.contains_key(&key) {
+                        let frame = live_decoders
+                            .get_mut(&key)
+                            .expect("active capture")
+                            .next_frame(&request.cancel)?;
+                        match frame {
+                            DecoderPoll::Ready(frame) => {
+                                live_frames.insert(
+                                    key.clone(),
+                                    frame.unwrap_or_else(|| transparent.clone()),
+                                );
+                            }
+                            DecoderPoll::Cancelled => break 'render,
+                        }
+                    }
+                    live_frames[&key].clone()
+                } else {
+                    if active_ids[track_index].as_deref() != Some(clip.id()) {
+                        // Release the previous decoder before opening the next clip.
+                        decoders[track_index] = None;
+                        let decoder = ClipDecoder::open(
+                            clip,
+                            runtime_clip,
+                            &request.base_path,
+                            width,
+                            height,
+                            fps_n,
+                            fps_d,
+                            song_position,
+                            &request.cancel,
+                        )?;
+                        decoders[track_index] = match decoder {
+                            DecoderPoll::Ready(decoder) => Some(decoder),
+                            DecoderPoll::Cancelled => break 'render,
+                        };
+                        active_ids[track_index] = Some(clip.id().to_string());
+                    }
+                    match decoders[track_index]
+                        .as_mut()
+                        .expect("decoder created for active clip")
+                        .next_frame(&request.cancel)?
+                    {
+                        DecoderPoll::Ready(frame) => frame.unwrap_or_else(|| transparent.clone()),
                         DecoderPoll::Cancelled => break 'render,
-                    };
-                    active_ids[track_index] = Some(clip.id().to_string());
-                }
-                match decoders[track_index]
-                    .as_mut()
-                    .expect("decoder created for active clip")
-                    .next_frame(&request.cancel)?
-                {
-                    DecoderPoll::Ready(frame) => frame.unwrap_or_else(|| transparent.clone()),
-                    DecoderPoll::Cancelled => break 'render,
+                    }
                 }
             } else {
                 output_pipeline.track_pads[track_index].set_property("alpha", 0.0_f64);
@@ -1192,19 +1259,33 @@ impl ClipDecoder {
         song_position: Duration,
         cancel: &AtomicBool,
     ) -> Result<DecoderPoll<Self>, VideoError> {
-        let uri_path = base_path.join(clip.file());
-        let path = runtime_clip.file().to_path_buf();
-        let uri = gst::glib::filename_to_uri(&uri_path, None).map_err(|error| {
-            VideoError::PipelineBuild {
-                context: "file decoder",
-                message: format!("clip {:?} path {}: {error}", clip.id(), path.display()),
-            }
-        })?;
+        use crate::config::video::VideoSource;
+        let live = clip.source().is_some();
+        let path = match clip.source() {
+            Some(VideoSource::V4l2 { device }) => PathBuf::from(device),
+            Some(VideoSource::TestPattern) => PathBuf::from("live-test-pattern"),
+            None => runtime_clip.file().to_path_buf(),
+        };
         let caps = format!(
             "video/x-raw,format=RGBA,width={width},height={height},framerate={fps_n}/{fps_d}"
         );
+        let input = match clip.source() {
+            Some(VideoSource::V4l2 { .. }) => {
+                "v4l2src name=capture do-timestamp=true ! decodebin".to_string()
+            }
+            Some(VideoSource::TestPattern) => "videotestsrc is-live=true".to_string(),
+            None => {
+                let uri = gst::glib::filename_to_uri(base_path.join(clip.file()), None).map_err(
+                    |error| VideoError::PipelineBuild {
+                        context: "file decoder",
+                        message: error.to_string(),
+                    },
+                )?;
+                format!("uridecodebin3 uri=\"{uri}\"")
+            }
+        };
         let description = format!(
-            "uridecodebin3 uri=\"{uri}\" name=decode decode. ! queue ! videoconvert ! videoscale ! videorate ! {caps} ! appsink name=decoded sync=false max-buffers=2 drop=false"
+            "{input} ! queue max-size-buffers=2 ! videoconvert ! videoscale ! videorate ! {caps} ! appsink name=decoded sync=false max-buffers=1 drop={live}"
         );
         let element =
             gst::parse::launch(&description).map_err(|error| VideoError::PipelineBuild {
@@ -1222,6 +1303,12 @@ impl ClipDecoder {
                     ),
                 })?;
         let pipeline = PipelineGuard(pipeline);
+        if let Some(VideoSource::V4l2 { device }) = clip.source() {
+            pipeline
+                .by_name("capture")
+                .expect("capture element")
+                .set_property("device", device);
+        }
         let sink = pipeline
             .by_name("decoded")
             .and_then(|element| element.downcast::<gst_app::AppSink>().ok())
@@ -1229,34 +1316,37 @@ impl ClipDecoder {
                 context: "file decoder",
                 message: format!("clip {:?}: appsink was not created", clip.id()),
             })?;
-        pipeline
-            .set_state(gst::State::Paused)
-            .map_err(|error| VideoError::Worker {
-                context: "pausing file decoder",
-                message: format!("clip {:?} file {}: {error}", clip.id(), path.display()),
-            })?;
-        if wait_for_decoder_preroll(&pipeline, cancel, clip.id(), &path)? == DecoderPoll::Cancelled
-        {
-            return Ok(DecoderPoll::Cancelled);
+        if !live {
+            pipeline
+                .set_state(gst::State::Paused)
+                .map_err(|error| VideoError::Worker {
+                    context: "pausing file decoder",
+                    message: format!("clip {:?} file {}: {error}", clip.id(), path.display()),
+                })?;
+            if wait_for_decoder_preroll(&pipeline, cancel, clip.id(), &path)?
+                == DecoderPoll::Cancelled
+            {
+                return Ok(DecoderPoll::Cancelled);
+            }
+            let seek = runtime_clip.source_position_at(song_position);
+            pipeline
+                .seek_simple(
+                    gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                    gst::ClockTime::from_nseconds(seek.as_nanos().min(u64::MAX as u128) as u64),
+                )
+                .map_err(|error| VideoError::Worker {
+                    context: "seeking file clip",
+                    message: format!(
+                        "clip {:?} file {} to {seek:?}: {error}",
+                        clip.id(),
+                        path.display()
+                    ),
+                })?;
         }
-        let seek = runtime_clip.source_position_at(song_position);
-        pipeline
-            .seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
-                gst::ClockTime::from_nseconds(seek.as_nanos().min(u64::MAX as u128) as u64),
-            )
-            .map_err(|error| VideoError::Worker {
-                context: "seeking file clip",
-                message: format!(
-                    "clip {:?} file {} to {seek:?}: {error}",
-                    clip.id(),
-                    path.display()
-                ),
-            })?;
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|error| VideoError::Worker {
-                context: "starting file decoder",
+                context: "starting video source",
                 message: format!("clip {:?} file {}: {error}", clip.id(), path.display()),
             })?;
         Ok(DecoderPoll::Ready(Self {

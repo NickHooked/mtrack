@@ -32,3 +32,28 @@ export function localVideoDuration(file: File): Promise<number | null> {
     video.src = url;
   });
 }
+
+export function liveMedia(source: import("./types").VideoSource): string {
+  return `mtrack-live:${JSON.stringify(source)}`;
+}
+export function parseLiveMedia(
+  value: string,
+): import("./types").VideoSource | null {
+  if (!value.startsWith("mtrack-live:")) return null;
+  try {
+    const source = JSON.parse(value.slice(12));
+    if (source.type === "test_pattern") return { type: "test_pattern" };
+    if (source.type === "v4l2" && typeof source.device === "string")
+      return { type: "v4l2", device: source.device };
+  } catch {
+    /* Ignore malformed drag payloads. */
+  }
+  return null;
+}
+export function videoSourceLabel(clip: import("./types").VideoClip): string {
+  return clip.source?.type === "v4l2"
+    ? `LIVE ${clip.source.device}`
+    : clip.source
+      ? "LIVE Test pattern"
+      : clip.file;
+}

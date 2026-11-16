@@ -968,11 +968,13 @@ impl Song {
             .map(Track::file)
             .chain(self.midi_playback.iter().map(MidiPlayback::file_path))
             .chain(self.light_shows.iter().map(LightShow::dmx_file_path))
-            .chain(
-                self.video_timeline
+            .chain(self.video_timeline.iter().flat_map(|timeline| {
+                timeline
+                    .clips()
                     .iter()
-                    .flat_map(|timeline| timeline.clips().iter().map(|clip| clip.file())),
-            )
+                    .filter(|clip| clip.source().is_none())
+                    .map(|clip| clip.file())
+            }))
             .chain(
                 self.dsl_lighting_shows
                     .iter()

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use crate::config::video::VideoConfig;
+use crate::config::video::{VideoConfig, VideoSource};
 
 /// A validated video timeline whose media paths are canonical and contained in
 /// the song directory. It has no dependency on a playback backend.
@@ -27,13 +27,14 @@ pub struct RuntimeVideoTimeline {
     end: Duration,
 }
 
-/// One resolved file clip. `z_order` is the source track's back-to-front index.
+/// One resolved file or live clip. `z_order` orders tracks back-to-front.
 #[derive(Clone, Debug)]
 pub struct RuntimeVideoClip {
     id: String,
     track_name: String,
     z_order: usize,
     file: PathBuf,
+    source: Option<VideoSource>,
     start: Duration,
     duration: Duration,
     source_in: Duration,
@@ -126,34 +127,38 @@ impl RuntimeVideoTimeline {
         let mut end = Duration::ZERO;
         for (z_order, track) in config.tracks().iter().enumerate() {
             for clip in track.clips() {
-                let unresolved = base_path.join(clip.file());
-                let file =
-                    unresolved
-                        .canonicalize()
-                        .map_err(|source| TimelineError::MissingMedia {
+                let file = if clip.source().is_some() {
+                    PathBuf::new()
+                } else {
+                    let unresolved = base_path.join(clip.file());
+                    let file = unresolved.canonicalize().map_err(|source| {
+                        TimelineError::MissingMedia {
                             song: song.to_string(),
                             track: track.name().to_string(),
                             clip: clip.id().to_string(),
                             path: unresolved.clone(),
                             source,
-                        })?;
-                if !file.starts_with(&root) {
-                    return Err(TimelineError::OutsideSong {
-                        song: song.to_string(),
-                        track: track.name().to_string(),
-                        clip: clip.id().to_string(),
-                        path: unresolved,
-                        root,
-                    });
-                }
-                if !file.is_file() {
-                    return Err(TimelineError::NotAFile {
-                        song: song.to_string(),
-                        track: track.name().to_string(),
-                        clip: clip.id().to_string(),
-                        path: file,
-                    });
-                }
+                        }
+                    })?;
+                    if !file.starts_with(&root) {
+                        return Err(TimelineError::OutsideSong {
+                            song: song.to_string(),
+                            track: track.name().to_string(),
+                            clip: clip.id().to_string(),
+                            path: unresolved,
+                            root,
+                        });
+                    }
+                    if !file.is_file() {
+                        return Err(TimelineError::NotAFile {
+                            song: song.to_string(),
+                            track: track.name().to_string(),
+                            clip: clip.id().to_string(),
+                            path: file,
+                        });
+                    }
+                    file
+                };
                 let duration_value = |value, field| {
                     Duration::try_from_secs_f64(value).map_err(|source| {
                         TimelineError::InvalidDuration {
@@ -177,6 +182,7 @@ impl RuntimeVideoTimeline {
                     track_name: track.name().to_string(),
                     z_order,
                     file,
+                    source: clip.source().cloned(),
                     start,
                     duration,
                     source_in,
@@ -220,6 +226,9 @@ impl RuntimeVideoTimeline {
 }
 
 impl RuntimeVideoClip {
+    pub fn source(&self) -> Option<&VideoSource> {
+        self.source.as_ref()
+    }
     pub fn id(&self) -> &str {
         &self.id
     }

@@ -16,3 +16,6 @@ pub mod gstreamer;
 pub(crate) mod media_binding;
 #[cfg(feature = "video")]
 pub use engine::*;
+
+#[cfg(feature = "video")]
+pub mod capture;

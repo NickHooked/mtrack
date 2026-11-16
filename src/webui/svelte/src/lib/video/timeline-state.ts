@@ -150,7 +150,17 @@ export function videoConfigError(config: VideoConfig): string | null {
       if (!Number.isFinite(clip.source_in) || clip.source_in < 0) {
         return `Set a valid source in for “${clip.file || clip.id}” before saving.`;
       }
-      if (!clip.file.trim() || !isSafeRelativePath(clip.file)) {
+      if (clip.source) {
+        if (clip.file || clip.source_in !== 0)
+          return "Live clips cannot have a file or source offset.";
+        if (
+          clip.source.type === "v4l2" &&
+          !/^\/dev\/(video[0-9]+|v4l\/(by-id|by-path)\/[a-zA-Z0-9_.:-]+)$/.test(
+            clip.source.device,
+          )
+        )
+          return "Choose a Linux video device such as /dev/video0.";
+      } else if (!clip.file.trim() || !isSafeRelativePath(clip.file)) {
         return `Choose a safe relative file for “${clip.id}” before saving.`;
       }
     }
@@ -218,7 +228,9 @@ export function moveClip(clip: VideoClip, start: number): VideoClip {
 }
 
 export function trimClipLeft(clip: VideoClip, newStart: number): VideoClip {
-  const minimumStart = Math.max(0, clip.start - clip.source_in);
+  const minimumStart = clip.source
+    ? 0
+    : Math.max(0, clip.start - clip.source_in);
   const maximumStart = clip.start + clip.duration - MIN_CLIP_DURATION;
   const start = roundTimelineValue(
     Math.min(maximumStart, Math.max(minimumStart, newStart)),
@@ -230,7 +242,9 @@ export function trimClipLeft(clip: VideoClip, newStart: number): VideoClip {
     duration: roundTimelineValue(
       Math.max(MIN_CLIP_DURATION, clip.duration - delta),
     ),
-    source_in: roundTimelineValue(Math.max(0, clip.source_in + delta)),
+    source_in: clip.source
+      ? 0
+      : roundTimelineValue(Math.max(0, clip.source_in + delta)),
   };
 }
 

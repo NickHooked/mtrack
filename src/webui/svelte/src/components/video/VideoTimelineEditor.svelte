@@ -7,6 +7,8 @@
     uploadTrack,
     type SongFile,
   } from "../../lib/api/songs";
+  import VideoLiveSources from "./VideoLiveSources.svelte";
+  import { parseLiveMedia } from "../../lib/video/media";
   import VideoMediaPool from "./VideoMediaPool.svelte";
   import {
     isVideoFile,
@@ -57,6 +59,7 @@
   let config = $derived(video ?? createVideoConfig());
   let error = $state("");
   let playhead = $state(0);
+  let libraryTab = $state<"media" | "live">("media");
   let previewControl: VideoPreview;
   onMount(() => {
     let active = true;
@@ -87,7 +90,7 @@
           .map((file) => file.name),
         ...mediaFiles,
         ...config.tracks.flatMap((track) =>
-          track.clips.map((clip) => clip.file),
+          track.clips.filter((clip) => !clip.source).map((clip) => clip.file),
         ),
       ]),
     ].sort((a, b) => a.localeCompare(b)),
@@ -187,7 +190,8 @@
     return `Video ${number}`;
   }
   function placeMedia(file: string, trackIndex: number, start?: number) {
-    if (locked || !media.includes(file)) return;
+    const source = parseLiveMedia(file);
+    if (locked || (!source && !media.includes(file))) return;
     const track = config.tracks[trackIndex] ?? {
       name: nextTrackName(),
       clips: [],
@@ -199,8 +203,12 @@
         0,
       );
     const clip: VideoClip = {
-      id: uniqueClipId(config, file),
-      file,
+      id: uniqueClipId(
+        config,
+        source?.type === "v4l2" ? source.device : source ? "live-test" : file,
+      ),
+      file: source ? "" : file,
+      ...(source ? { source } : {}),
       start: position,
       duration:
         mediaDurations[file] ?? Math.max(0.01, Number(addDuration) || 10),
@@ -431,13 +439,35 @@
 <svelte:window onkeydown={historyKey} />
 <div class="video-editor" data-testid="video-timeline-editor">
   <div class="workspace">
-    <VideoMediaPool
-      files={media}
-      busy={importing}
-      {locked}
-      onimport={importMedia}
-      onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
-    />
+    <div class="source-library">
+      <div class="library-tabs" role="tablist" aria-label="Video sources">
+        <button
+          role="tab"
+          aria-selected={libraryTab === "media"}
+          onclick={() => (libraryTab = "media")}>Media files</button
+        >
+        <button
+          role="tab"
+          aria-selected={libraryTab === "live"}
+          onclick={() => (libraryTab = "live")}>Live sources</button
+        >
+      </div>
+      <div hidden={libraryTab !== "media"}>
+        <VideoMediaPool
+          files={media}
+          busy={importing}
+          {locked}
+          onimport={importMedia}
+          onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
+        />
+      </div>
+      <div hidden={libraryTab !== "live"}>
+        <VideoLiveSources
+          {locked}
+          onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
+        />
+      </div>
+    </div>
     <div class="viewer">
       <VideoPreview
         bind:this={previewControl}
@@ -683,6 +713,27 @@
 </div>
 
 <style>
+  .source-library {
+    min-width: 0;
+  }
+  .library-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 6px;
+  }
+  .library-tabs button {
+    padding: 6px 10px;
+    color: var(--nc-fg-3);
+    background: var(--nc-bg-2);
+    border: 1px solid var(--card-border);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .library-tabs button[aria-selected="true"] {
+    color: var(--nc-cyan-400);
+    border-color: var(--nc-cyan-400);
+  }
+
   .workspace {
     display: grid;
     grid-template-columns: 260px minmax(0, 1fr);

@@ -36,6 +36,7 @@ pub(crate) fn bind_timeline(
         let unique = timeline
             .clips()
             .iter()
+            .filter(|clip| clip.source().is_none())
             .map(|clip| clip.file())
             .collect::<std::collections::HashSet<_>>();
         if unique.len() > MAX_UNIQUE_MEDIA_FILES {
@@ -51,6 +52,9 @@ pub(crate) fn bind_timeline(
         // runtime timeline is sorted by clip start and cannot be zipped back
         // onto the source config without swapping media between tracks.
         for configured_clip in config.tracks().iter().flat_map(|track| track.clips()) {
+            if configured_clip.source().is_some() {
+                continue;
+            }
             let clip = timeline
                 .clips()
                 .iter()

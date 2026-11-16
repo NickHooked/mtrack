@@ -223,6 +223,13 @@ pub async fn start(
                 axum::Json(serde_json::json!({"video_preview": cfg!(feature = "video")}))
             }),
         )
+        .route("/api/video/sources", get(|| async {
+            #[cfg(feature = "video")]
+            let devices = crate::video::capture::devices();
+            #[cfg(not(feature = "video"))]
+            let devices: Vec<serde_json::Value> = Vec::new();
+            axum::Json(serde_json::json!({"devices": devices, "live_capture": cfg!(feature = "video")}))
+        }))
         .route("/", get(index_handler))
         .fallback(get(static_handler))
         .with_state(webui_state);

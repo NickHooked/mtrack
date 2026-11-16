@@ -81,6 +81,7 @@ async function openVideo(page: Page, yaml = INITIAL_YAML, songName = SONG) {
 }
 
 async function dragBy(page: Page, locator: Locator, deltaX: number) {
+  await locator.scrollIntoViewIfNeeded();
   const box = await locator.boundingBox();
   if (!box) throw new Error("timeline control has no bounding box");
   const x = box.x + box.width / 2;
@@ -752,4 +753,66 @@ test("video ruler seeks the preview and moves its playhead", async ({
     "00:05.000",
   );
   await expect(page.locator(".ruler-playhead")).toHaveCSS("left", "50px");
+});
+
+test.describe("Live video sources", () => {
+  test.use({ viewport: { width: 1280, height: 1100 } });
+  test.beforeEach(async ({ page }) => {
+    await page.route("**/api/video/sources", (route) =>
+      route.fulfill({
+        json: {
+          live_capture: true,
+          devices: [
+            {
+              name: "HDMI Input 1",
+              device: "/dev/v4l/by-id/usb-capture-video-index0",
+            },
+          ],
+        },
+      }),
+    );
+  });
+  test("drags a camera to the timeline, persists its source and supports undo", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByText("Manual placement", { exact: true }).click();
+    await page.getByRole("tab", { name: "Live sources", exact: true }).click();
+    await page
+      .getByRole("button", { name: /HDMI Input 1/ })
+      .dragTo(page.getByTestId("video-new-track-drop"));
+    await expect(page.getByTestId("video-clip")).toHaveCount(2);
+    await expect(page.getByTestId("video-clip-file")).toHaveValue(
+      "LIVE /dev/v4l/by-id/usb-capture-video-index0",
+    );
+    await expect(page.getByTestId("video-clip-source-in")).toBeDisabled();
+    await page.getByRole("button", { name: "Undo video edit" }).click();
+    await expect(page.getByTestId("video-clip")).toHaveCount(1);
+    await page.getByRole("button", { name: "Redo video edit" }).click();
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const clip = parse(state.currentYaml()).video.tracks[1].clips[0];
+    expect(clip.source).toEqual({
+      type: "v4l2",
+      device: "/dev/v4l/by-id/usb-capture-video-index0",
+    });
+    expect(clip.source_in).toBe(0);
+    expect(clip.file || "").toBe("");
+  });
+  test("live clips survive reload and trimming does not add a media offset", async ({
+    page,
+  }) => {
+    const state = await openVideo(
+      page,
+      INITIAL_YAML.replace("file: opening.mp4", "source: {type: test_pattern}"),
+    );
+    await page.getByTestId("video-clip").click();
+    await dragBy(page, page.getByTestId("video-trim-left"), 20);
+    await expect(page.getByTestId("video-clip-source-in")).toHaveValue("0");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const clip = parse(state.currentYaml()).video.tracks[0].clips[0];
+    expect(clip.source).toEqual({ type: "test_pattern" });
+    expect(clip.start).toBeGreaterThan(0);
+  });
 });

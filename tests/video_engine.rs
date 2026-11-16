@@ -853,3 +853,115 @@ tracks:
         .expect("program-output cancellation exceeded its watchdog")
         .expect("program-output worker did not stop cleanly");
 }
+
+#[test]
+fn live_source_renders_seeks_and_releases_without_media_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = video_config(
+        r##"
+canvas: { width: 16, height: 16, frame_rate: 20, background: "#000000" }
+tracks:
+  - name: Camera
+    clips:
+      - { id: live, start: 0, duration: 10, source: { type: test_pattern } }
+"##,
+    );
+    let mut engine = GstVideoEngine::preview(config, directory.path()).unwrap();
+    let frames = engine.frame_receiver();
+    engine.start(Duration::ZERO).unwrap();
+    let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(frame.rgba.chunks_exact(4).any(|p| p[0] > 100));
+    engine.seek(Duration::from_secs(3)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = frames.recv_timeout(Duration::from_secs(2)).unwrap();
+        if frame.song_position >= Duration::from_secs(3) {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+    }
+    let before = Instant::now();
+    engine.stop().unwrap();
+    assert!(before.elapsed() < Duration::from_secs(2));
+    assert!(!engine.is_running());
+    // A second session can acquire the source after the first is stopped.
+    engine.start(Duration::from_secs(1)).unwrap();
+    frames.recv_timeout(Duration::from_secs(5)).unwrap();
+    engine.stop().unwrap();
+}
+
+#[test]
+fn live_config_rejects_file_offsets_and_arbitrary_devices() {
+    for fields in [
+        "file: video.mp4, source: {type: test_pattern}",
+        "source_in: 1, source: {type: test_pattern}",
+        "source: {type: v4l2, device: /etc/passwd}",
+        "source: {type: v4l2, device: '/dev/video0 ! fakesink'}",
+        "source: {type: v4l2, device: /dev/v4l/by-id/../bad}",
+    ] {
+        let config = video_config(&format!(
+            "tracks: [{{name: Camera, clips: [{{id: live, start: 0, duration: 2, {fields}}}]}}]"
+        ));
+        assert!(config.validate().is_err(), "{fields}");
+    }
+    let config = video_config("tracks: [{name: Camera, clips: [{id: live, start: 0, duration: 2, source: {type: v4l2, device: /dev/video999}}]}]");
+    let directory = tempfile::tempdir().unwrap();
+    // A disconnected source must not prevent loading or editing a song.
+    assert!(mtrack::video::timeline::RuntimeVideoTimeline::resolve(
+        "camera",
+        directory.path(),
+        &config
+    )
+    .is_ok());
+}
+
+#[test]
+fn disconnected_live_camera_reports_error_and_stops() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = video_config("canvas: {width: 16, height: 16, frame_rate: 20}\ntracks: [{name: Camera, clips: [{id: disconnected, start: 0, duration: 10, source: {type: v4l2, device: /dev/video99999}}]}]");
+    let mut engine = GstVideoEngine::preview(config, directory.path()).unwrap();
+    let errors = engine.runtime_error_receiver();
+    engine.start(Duration::ZERO).unwrap();
+    let error = errors
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap()
+        .to_string();
+    assert!(error.contains("disconnected"), "{error}");
+    assert!(error.contains("video99999"), "{error}");
+    engine.stop().unwrap();
+}
+
+#[test]
+fn live_layers_share_frames_and_coexist_with_bound_file_media() {
+    let directory = tempfile::tempdir().unwrap();
+    make_video(directory.path(), "white.mkv", "white");
+    let config = video_config(
+        r##"
+canvas: { width: 32, height: 16, frame_rate: 10, background: "#000000" }
+tracks:
+  - name: Background file
+    clips:
+      - { id: file, start: 0, duration: 2, file: white.mkv }
+  - name: Left camera
+    clips:
+      - { id: left, start: 0, duration: 2, width: 16, height: 16, source: {type: test_pattern} }
+  - name: Right camera
+    clips:
+      - { id: right, start: 0, duration: 2, x: 16, width: 16, height: 16, source: {type: test_pattern} }
+"##,
+    );
+    let mut engine = GstVideoEngine::preview(config, directory.path()).unwrap();
+    let frames = engine.frame_receiver();
+    engine.start(Duration::ZERO).unwrap();
+    for _ in 0..3 {
+        let frame = frames.recv_timeout(Duration::from_secs(5)).unwrap();
+        for row in frame.rgba.chunks_exact(32 * 4) {
+            assert_eq!(
+                &row[..16 * 4],
+                &row[16 * 4..],
+                "both layers must receive the same live frame"
+            );
+        }
+    }
+    engine.stop().unwrap();
+}

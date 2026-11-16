@@ -75,6 +75,75 @@ Validation: 39 video browser tests, frontend type checking and targeted lint,
 production frontend and video backend builds, and backend tests covering video
 upload filename confinement and unchanged song config after import.
 
+## Live capture sources — 2026-11-16
+
+The editor now has **Media files** and **Live sources** tabs. Camera discovery
+runs on the Mtrack host via `/api/video/sources`, not in the browser. Connect a
+Linux V4L2 capture device and choose **Refresh cameras**. Each video node has
+its own entry. Persistent `/dev/v4l/by-id` paths are preferred, then `by-path`,
+then `/dev/videoN`. Some devices expose additional non-capture nodes; selecting
+an unsupported or unavailable node reports a preview error. Native DeckLink
+SDK inputs that do not expose V4L2 nodes are not implemented.
+
+Drag a source onto an existing lane or the new-track target, or click to append.
+Start and duration determine its visible interval. Position, scaling, opacity,
+layer order and fades use the existing compositor. Live clips have no source-in
+offset: seeking samples the current input, not historical video. Pause freezes
+the preview and releases capture; play or seek reopens it. A live test pattern
+is available for checking the workflow without hardware. The manual path field
+also supports configuring a disconnected camera; song loading does not open it.
+
+```yaml
+video:
+  canvas: { width: 1280, height: 720, frame_rate: 25 }
+  tracks:
+    - name: HDMI 1
+      clips:
+        - id: camera-1
+          start: 0
+          duration: 60
+          source:
+            type: v4l2
+            device: /dev/video0
+    - name: Test input
+      clips:
+        - id: test-input
+          start: 60
+          duration: 10
+          source: { type: test_pattern }
+```
+
+File clips retain their original `file` format. `source` is a tagged enum so
+future protocols can add their own configuration and decoder implementation;
+RTSP and native DeckLink capture are not implemented yet. Live sources are
+excluded from file inventory, canonical file resolution and descriptor binding.
+A source and a file cannot coexist on one clip. Camera device paths are
+validated and assigned as GStreamer element properties, never interpolated
+into executable pipeline descriptions.
+
+The engine shares one capture pipeline and one sampled frame per input across
+active layers, including aliases resolving to the same device. Inactive inputs
+are closed. Capture uses bounded buffers with old-frame dropping; cancellation
+is polled during frame waits. Camera startup failure, disconnect or a five-second
+frame stall terminates the preview with a contextual error. There is no automatic
+reconnect or seamless failover. Format negotiation is automatic through V4L2 and
+decodebin; there are no manual capture resolution/format controls yet.
+
+Scope: timeline editing, persistence and GStreamer editor preview. The existing
+program-output engine can render these sources, but it is not yet wired into the
+main song player's transport or an independent output-window UI. Four physical
+capture channels and real-device format negotiation still need hardware testing:
+no video devices were connected to the development host during this work.
+
+Validation: 41 video browser tests, 27 core video tests, 72 backend video tests
+and 28 GStreamer integration tests passed. Coverage includes camera-source
+persistence, live trimming, shared frames across layers, mixed file/live media,
+seek/restart/stop, missing-camera errors, device-path validation and discovery
+of four independent device nodes. Frontend type checking, targeted ESLint and
+the production frontend build also passed. The video backend build and a
+no-default-features check passed. The running demo was verified through the
+real preview WebSocket: initial frame, play and pause all rendered live input.
+
 ## Repository and branch
 
 The work is published in Nick Haakman's fork:
