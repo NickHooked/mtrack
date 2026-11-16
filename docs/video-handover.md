@@ -486,8 +486,11 @@ The branch is intentionally published from Nick's fork without an upstream pull 
 
 ## Automation and compound sources (November 2026)
 
-The video editor now has a clip-local automation envelope editor below the tracks.
-Select a clip, choose a property, enable **Read**, then double-click the graph to
+The video editor now shows clip-local automation in collapsible lanes directly
+below each track, sharing the ruler, horizontal scroll, zoom and playhead with
+the clips. Multiple tracks can remain expanded. Other clips on the same track
+show selectable envelope segments; each track retains its chosen property.
+Expand Automation under a track, choose a property, enable **Read**, then double-click the graph to
 add points. Drag the points to edit time/value or the orange segment handles to
 bend the interpolation. Selected points expose precise time/value, curvature,
 and Hold controls. **Off** keeps the saved envelope but uses the static value.
@@ -541,3 +544,9 @@ browser tests include point/curve dragging with undo, trimmed envelope reload,
 and dragging a compound with simultaneous live/file tracks onto a new track.
 The real local demo renders a live test pattern beside a recorded video; this
 is test-source validation, not USB/DeckLink hardware validation.
+
+Track-lane layout validation: browser coverage checks exact clip/point alignment
+before and after zoom, independent edits on two expanded tracks, cross-track clip
+dragging, and ruler seeking. Lanes expand explicitly so selecting a clip during
+a drag does not move the destination track. Existing clip-local persistence and
+playback semantics are unchanged.

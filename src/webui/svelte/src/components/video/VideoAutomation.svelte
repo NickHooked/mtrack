@@ -11,19 +11,28 @@
   } from "../../lib/video/automation.svelte";
   let {
     clip,
+    path = $bindable("/opacity"),
     canvas,
     position,
     onpatch,
     onseek,
+    pixelsPerSecond,
+    timelineWidth,
+    trackClips = [],
+    onselectclip,
   }: {
+    pixelsPerSecond: number;
+    timelineWidth: number;
+    trackClips?: VideoClip[];
+    onselectclip?: (id: string) => void;
+    path?: string;
     clip: VideoClip;
     canvas: VideoCanvas;
     position: number;
     onpatch: (patch: Partial<VideoClip>) => void;
     onseek: (time: number) => void;
   } = $props();
-  let path = $state("/opacity"),
-    selected = $state(-1),
+  let selected = $state(-1),
     draft = $state<AutomationPoint[] | null>(null);
   let svg: SVGSVGElement;
   let drag: {
@@ -39,11 +48,11 @@
     local = $derived(
       Math.max(0, Math.min(clip.duration, position - clip.start)),
     );
-  const width = 1000,
-    height = 160,
+  let width = $derived(timelineWidth);
+  const height = 160,
     margin = 12;
   function x(t: number) {
-    return margin + (t / clip.duration) * (width - 2 * margin);
+    return (clip.start + t) * pixelsPerSecond;
   }
   function y(v: number) {
     return (
@@ -75,13 +84,16 @@
   }
   function add(e?: MouseEvent) {
     const p = e ? pointer(e) : null;
+    if (
+      p &&
+      (p.x / pixelsPerSecond < clip.start ||
+        p.x / pixelsPerSecond > clip.start + clip.duration)
+    )
+      return;
     const t = p
         ? Math.max(
             0,
-            Math.min(
-              clip.duration,
-              ((p.x - margin) / (width - 2 * margin)) * clip.duration,
-            ),
+            Math.min(clip.duration, p.x / pixelsPerSecond - clip.start),
           )
         : local,
       v = p
@@ -127,7 +139,7 @@
           drag.index < next.length - 1
             ? next[drag.index + 1].time - 0.001
             : clip.duration,
-          ((p.x - margin) / (width - 2 * margin)) * clip.duration,
+          p.x / pixelsPerSecond - clip.start,
         ),
       );
       a.value = Math.max(
@@ -187,7 +199,8 @@
   aria-label="Video automation"
 >
   <header>
-    <strong>Automation</strong><select
+    <span class="clip-label" title={clip.id}>{clip.id}</span>
+    <select
       aria-label="Automation property"
       bind:value={path}
       onchange={() => {
@@ -205,10 +218,13 @@
       class="btn btn-sm"
       title="Add at the playhead. Double-click the graph to draw points; drag segment handles to bend curves."
       onclick={() => add()}>＋ Point</button
-    ><span>{local.toFixed(2)}s · {clip.id}</span>
+    ><span
+      >{clip.start.toFixed(2)}–{(clip.start + clip.duration).toFixed(2)}s</span
+    >
   </header>
   <svg
     bind:this={svg}
+    style:width="{width}px"
     viewBox={`0 0 ${width} ${height}`}
     preserveAspectRatio="none"
     role="group"
@@ -222,13 +238,55 @@
       drag = null;
     }}
   >
-    {#each [0, 0.25, 0.5, 0.75, 1] as v}<line
+    {#each [0, 0.25, 0.5, 0.75, 1] as v (v)}<line
         x1={margin}
         x2={width - margin}
         y1={margin + v * (height - 2 * margin)}
         y2={margin + v * (height - 2 * margin)}
         class="grid"
       />{/each}
+    {#each trackClips.filter((c) => c.id !== clip.id) as other (other.id)}
+      <g
+        role="button"
+        tabindex="0"
+        aria-label={`Edit automation ${other.id}`}
+        onclick={() => onselectclip?.(other.id)}
+        onkeydown={(e) => {
+          if (e.key === "Enter") onselectclip?.(other.id);
+        }}
+      >
+        <title>{other.id}</title>
+        <rect
+          x={other.start * pixelsPerSecond}
+          y="0"
+          width={other.duration * pixelsPerSecond}
+          {height}
+          fill="#20d6e8"
+          fill-opacity="0.04"
+        />
+        <path
+          d={Array.from({ length: 101 }, (_, i) => {
+            const t = (i / 100) * other.duration;
+            const v =
+              valueAt(other.automation?.[property.path], t) ??
+              propertyValue(evaluatedClip(other, canvas, t), property.path);
+            return `${i ? "L" : "M"}${(other.start + t) * pixelsPerSecond},${y(v)}`;
+          }).join(" ")}
+          fill="none"
+          stroke="#7da3a7"
+          stroke-width="2"
+        />
+      </g>
+    {/each}
+    <rect
+      x={x(0)}
+      y="0"
+      width={clip.duration * pixelsPerSecond}
+      {height}
+      fill="#20d6e8"
+      fill-opacity="0.06"
+      pointer-events="none"
+    />
     <path
       d={line}
       fill="none"
@@ -236,8 +294,8 @@
       stroke-width="2"
       vector-effect="non-scaling-stroke"
     /><line
-      x1={x(local)}
-      x2={x(local)}
+      x1={position * pixelsPerSecond}
+      x2={position * pixelsPerSecond}
       y1="0"
       y2={height}
       stroke="#fff"
@@ -284,11 +342,6 @@
           }}
         />{/if}{/each}
   </svg>
-  <footer>
-    <span>0s · {property.max}</span><span
-      >{clip.duration.toFixed(2)}s · {property.min}</span
-    >
-  </footer>
   {#if selected >= 0 && points[selected]}<div class="point-fields">
       <label
         >Time<input
@@ -340,27 +393,48 @@
 
 <style>
   .automation {
-    border: 1px solid var(--card-border);
-    border-radius: 6px;
-    padding: 10px;
+    display: grid;
+    grid-template-columns: 150px 1fr;
+    min-width: max-content;
+    border-bottom: 1px solid var(--card-border);
     background: var(--nc-bg-2);
   }
-  header,
+  header {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: var(--nc-bg-2);
+    padding: 8px;
+    width: 150px;
+    box-sizing: border-box;
+    display: flex;
+    flex-wrap: wrap;
+    align-content: start;
+    gap: 6px;
+  }
+  header select,
+  .clip-label {
+    width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   .point-fields {
+    grid-column: 2;
+    padding: 6px;
     display: flex;
     gap: 10px;
     align-items: center;
     flex-wrap: wrap;
   }
-  header span,
-  footer {
+  header span {
     font-size: 11px;
     color: var(--nc-fg-3);
   }
   svg {
-    width: 100%;
+    display: block;
     height: 160px;
-    margin-top: 10px;
+    overflow: visible;
     touch-action: none;
     background: var(--nc-bg-1);
   }
@@ -373,10 +447,6 @@
   }
   rect {
     cursor: ns-resize;
-  }
-  footer {
-    display: flex;
-    justify-content: space-between;
   }
   .point-fields label {
     display: flex;

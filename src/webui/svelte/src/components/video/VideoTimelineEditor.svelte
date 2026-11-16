@@ -28,7 +28,7 @@
     videoConfigError,
     videoEnd,
   } from "../../lib/video/timeline-state";
-  import VideoAutomation from "./VideoAutomation.svelte";
+  import VideoTrackAutomation from "./VideoTrackAutomation.svelte";
   import {
     evaluatedClip,
     insertPoint,
@@ -872,17 +872,23 @@
             oncommitclip={(clip) => commitClip(trackIndex, clip)}
             ondeleteclip={(id) => deleteClip(trackIndex, id)}
           />
+          <VideoTrackAutomation
+            {track}
+            canvas={config.canvas}
+            {selectedClipId}
+            {pixelsPerSecond}
+            {timelineWidth}
+            position={playhead}
+            onselectclip={(id) => (selectedClipId = id)}
+            onpatch={(clip, patch) => {
+              commitClip(trackIndex, normalizeClipPatch(clip, patch));
+              previewControl?.refreshComposition();
+            }}
+            onseek={(time) => previewControl?.seekTo(time * 1000)}
+          />
         {/each}
       </div>
     {/if}
-
-    {#if selected}{#key selected.clip.id}<VideoAutomation
-          clip={selected.clip}
-          canvas={config.canvas}
-          position={playhead}
-          onpatch={patchComposition}
-          onseek={(time) => previewControl?.seekTo(time * 1000)}
-        />{/key}{/if}
 
     <button
       type="button"

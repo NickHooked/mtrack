@@ -975,11 +975,63 @@ test.describe("Freeform masks", () => {
 
 test.describe("Automation and compounds", () => {
   test.use({ viewport: { width: 1440, height: 1100 } });
+  test("keeps automation under each track and aligned with clips when zooming", async ({
+    page,
+  }) => {
+    const state = await openVideo(
+      page,
+      INITIAL_YAML +
+        `    - name: Camera B
+      clips:
+        - {id: second, file: camera-b.mp4, start: 5, duration: 10, source_in: 0}
+`,
+    );
+    await page.getByTestId("video-clip").first().click();
+    const lanes = page.getByTestId("video-track-automation");
+    await expect(lanes).toHaveCount(2);
+    await lanes.nth(0).locator("summary").click();
+    await lanes.nth(1).locator("summary").click();
+    await lanes
+      .nth(0)
+      .getByRole("button", { name: "Off", exact: true })
+      .click();
+    await page.getByTestId("video-clip").nth(1).click();
+    await lanes
+      .nth(1)
+      .getByRole("button", { name: "Off", exact: true })
+      .click();
+    await expect(lanes.nth(0).getByTestId("automation-curve")).toBeVisible();
+    for (let zoom = 0; zoom < 2; zoom++) {
+      const clip = (await page.getByTestId("video-clip").nth(1).boundingBox())!;
+      const point = (await lanes
+        .nth(1)
+        .getByTestId("automation-point-0")
+        .boundingBox())!;
+      expect(Math.abs(point.x + point.width / 2 - clip.x)).toBeLessThan(2);
+      await page
+        .getByRole("button", { name: "Zoom in video timeline" })
+        .click();
+    }
+    await lanes.nth(0).getByTestId("automation-point-0").press("Enter");
+    const value = lanes
+      .nth(0)
+      .getByLabel("Automation point value", { exact: true });
+    await value.fill("0.25");
+    await value.dispatchEvent("change");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const tracks = parse(state.currentYaml()).video.tracks;
+    expect(tracks[0].clips[0].automation["/opacity"].points[0].value).toBe(
+      0.25,
+    );
+    expect(tracks[1].clips[0].automation["/opacity"].points[0].value).toBe(1);
+  });
   test("draws, bends, trims and persists a clip-local automation envelope", async ({
     page,
   }) => {
     const state = await openVideo(page);
     await page.getByTestId("video-clip").click();
+    await page.getByTestId("video-track-automation").locator("summary").click();
     const graph = page.getByTestId("video-automation");
     await graph.getByRole("button", { name: "Off", exact: true }).click();
     await page.getByTestId("automation-point-0").press("Enter");
@@ -1012,6 +1064,7 @@ test.describe("Automation and compounds", () => {
   }) => {
     const state = await openVideo(page);
     await page.getByTestId("video-clip").click();
+    await page.getByTestId("video-track-automation").locator("summary").click();
     const graph = page.getByTestId("video-automation");
     await graph.getByRole("button", { name: "Off", exact: true }).click();
     async function dragDown(locator: Locator, pixels: number) {
