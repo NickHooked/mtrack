@@ -76,6 +76,7 @@
   <header>
     <strong>Canvas & masks</strong><button
       class="btn btn-sm"
+      title="Drag the outline or corners in the preview. Hold Shift to keep the aspect ratio. Masks move with the clip."
       onclick={() => {
         selectedMask = -1;
         drawingMask = false;
@@ -87,22 +88,15 @@
       >Fill canvas</button
     >
   </header>
-  <p>
-    Select a clip on the timeline, then drag its outline or corner handles in
-    the preview. Shift keeps the aspect ratio. Masks move with the clip.
-  </p>
   <div class="actions">
     <button
       class="btn btn-sm"
       disabled={(clip.masks?.length ?? 0) >= 8}
+      title="Click 3–64 points in the preview. Click the first point or press Enter to close. Escape cancels; Backspace removes the last point."
       onclick={() => {
         drawingMask = !drawingMask;
       }}>{drawingMask ? "Cancel drawing" : "Draw freeform mask"}</button
     >
-    {#if drawingMask}<p>
-        Click points in the preview. Click the first point or press Enter to
-        close (3–64 points). Escape cancels.
-      </p>{/if}
     <button
       class="btn btn-sm"
       disabled={(clip.masks?.length ?? 0) >= 8}
@@ -118,6 +112,9 @@
       <header>
         <button
           class="btn btn-sm"
+          title={mask.shape === "polygon"
+            ? "Drag points to reshape. Arrow keys nudge; Shift moves ten pixels. Delete removes a focused point (minimum 3)."
+            : "Drag the mask outline to move it, or its corners to resize."}
           aria-pressed={selectedMask === index}
           onclick={() => {
             selectedMask = index;
@@ -132,10 +129,6 @@
           }}>Remove</button
         >
       </header>
-      {#if mask.shape === "polygon"}<p>
-          Drag points to reshape. Arrow keys nudge; Delete removes a focused
-          point (minimum 3).
-        </p>{/if}
       <div class="fields">
         {#each ["x", "y", "width", "height"] as field (field)}
           <label
@@ -157,6 +150,7 @@
             type="number"
             min="0"
             max="4096"
+            title="Softens the mask edge inward, measured in output pixels."
             value={mask.feather}
             data-testid="video-mask-feather"
             onchange={(e) =>
@@ -169,6 +163,7 @@
             min="0"
             max="1"
             step="0.01"
+            title="Mask strength: 0 disables this mask; 1 applies it fully. Multiple masks intersect."
             value={mask.opacity}
             onchange={(e) =>
               patchMask(index, { opacity: Number(e.currentTarget.value) })}
@@ -177,6 +172,7 @@
         <label class="invert"
           ><input
             type="checkbox"
+            title="Cut a hole inside the shape instead of keeping its inside."
             checked={mask.invert}
             onchange={(e) =>
               patchMask(index, { invert: e.currentTarget.checked })}
@@ -199,11 +195,6 @@
       >
     {/each}
   </div>
-  {#if clip.masks?.length}<p>
-      Masks keep the inside of their shape; invert cuts a hole. Feather softens
-      inward in output pixels. Multiple masks intersect; strength 0 disables a
-      mask.
-    </p>{/if}
 </section>
 
 <style>
@@ -223,10 +214,8 @@
   header strong {
     margin-right: auto;
   }
-  p {
-    font-size: 12px;
-    color: var(--nc-fg-3);
-    line-height: 1.5;
+  .actions {
+    margin-top: 10px;
   }
   .fields {
     display: grid;

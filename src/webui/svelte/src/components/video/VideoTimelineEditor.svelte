@@ -528,7 +528,10 @@
   <div class="edit-controls" inert={locked}>
     <div class="toolbar">
       <div>
-        <strong>Video timeline</strong>
+        <strong
+          title="Drag media onto a track. Drag clips to move them or their edges to trim. Hold Shift to bypass snapping. New clips use the imported duration when available; otherwise the manual duration (default 10s)."
+          >Video timeline</strong
+        >
         <span class="canvas-summary"
           >{config.canvas.width}×{config.canvas.height} · {config.canvas
             .frame_rate} fps</span
@@ -578,11 +581,6 @@
       </div>
     </div>
 
-    <p class="editing-hint">
-      Drag media onto a track. Drag clips to move them, or their edges to trim.
-      Hold Shift to bypass snapping. New clips use the imported duration when
-      available; otherwise the manual duration (default 10s).
-    </p>
     <details class="manual-placement">
       <summary>Manual placement</summary>
       <div class="add-panel">
@@ -783,7 +781,6 @@
     flex-direction: column;
     gap: 12px;
   }
-  .editing-hint,
   .import-message {
     margin: 0;
     color: var(--nc-fg-3);

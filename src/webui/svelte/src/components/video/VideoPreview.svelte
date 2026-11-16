@@ -329,21 +329,6 @@
     >
   </div>
 
-  <div class="notice composition-notice">
-    {#if editingClip}
-      Canvas editing: {selectedMask >= 0
-        ? `mask ${selectedMask + 1}`
-        : editingClip.id}. Drag the outline or corners. Release to refresh and
-      pause playback.
-      {#if positionMs / 1000 < editingClip.start || positionMs / 1000 >= editingClip.start + editingClip.duration}<button
-          class="btn btn-sm"
-          onclick={() => seekTo(editingClip!.start * 1000)}
-          >Show selected clip</button
-        >{/if}
-    {:else}
-      Select a clip on the timeline to move, resize or mask it on the canvas.
-    {/if}
-  </div>
   {#if unavailable}
     <div class="notice" data-testid="video-preview-unavailable">
       Video preview is unavailable in this server build.
@@ -367,6 +352,14 @@
 
   <div class="transport">
     <div class="buttons">
+      {#if editingClip && (positionMs / 1000 < editingClip.start || positionMs / 1000 >= editingClip.start + editingClip.duration)}
+        <button
+          class="btn btn-sm"
+          disabled={controlsDisabled}
+          onclick={() => seekTo(editingClip!.start * 1000)}
+          >Show selected clip</button
+        >
+      {/if}
       <button
         type="button"
         class="btn btn-sm btn-primary"
@@ -417,11 +410,6 @@
 </section>
 
 <style>
-  .composition-notice {
-    box-sizing: border-box;
-    height: 54px;
-    overflow: auto;
-  }
   .preview {
     display: flex;
     flex-direction: column;
