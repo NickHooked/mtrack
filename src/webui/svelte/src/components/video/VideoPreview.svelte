@@ -14,6 +14,7 @@
   interface Props {
     editingClip?: VideoClip | null;
     selectedMask?: number;
+    drawingMask?: boolean;
     onpatch?: (patch: Partial<VideoClip>) => void;
     songName: string;
     config: VideoConfig;
@@ -27,6 +28,7 @@
   let {
     editingClip = null,
     selectedMask = $bindable(-1),
+    drawingMask = $bindable(false),
     onpatch,
     songName,
     config,
@@ -310,7 +312,8 @@
       <VideoCanvasOverlay
         clip={editingClip}
         canvas={config.canvas}
-        {selectedMask}
+        bind:selectedMask
+        bind:drawingMask
         {onpatch}
       />
     {/if}

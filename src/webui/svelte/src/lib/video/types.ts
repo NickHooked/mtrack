@@ -16,7 +16,8 @@ export type VideoSource =
   | { type: "test_pattern" };
 
 export interface VideoMask {
-  shape: "rectangle" | "ellipse";
+  shape: "rectangle" | "ellipse" | "polygon";
+  points?: { x: number; y: number }[];
   x: number;
   y: number;
   width: number;

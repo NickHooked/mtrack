@@ -234,6 +234,18 @@ impl VideoConfig {
                     errors.push(format!("{clip_label}: at most 8 masks are supported"));
                 }
                 for mask in &clip.masks {
+                    if matches!(mask.shape, MaskShape::Polygon)
+                        && !(3..=64).contains(&mask.points.len())
+                        || mask.points.len() > 64
+                        || mask.points.iter().any(|p| {
+                            !p.x.is_finite()
+                                || !p.y.is_finite()
+                                || !(0.0..=1.0).contains(&p.x)
+                                || !(0.0..=1.0).contains(&p.y)
+                        })
+                    {
+                        errors.push(format!("{clip_label}: polygons require 3..64 points within normalized mask coordinates 0..1"));
+                    }
                     if !mask.x.is_finite()
                         || !mask.y.is_finite()
                         || !mask.width.is_finite()
@@ -410,6 +422,9 @@ impl VideoSource {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoMask {
+    /// Vertices normalized within the mask bounds (polygon only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<MaskPoint>,
     #[serde(default)]
     pub shape: MaskShape,
     #[serde(default)]
@@ -434,6 +449,14 @@ pub enum MaskShape {
     #[default]
     Rectangle,
     Ellipse,
+    Polygon,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaskPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
 /// A file or live clip placed on a video track.
@@ -981,6 +1004,22 @@ tracks: [{tracks}]"##
             assert_eq!(clip["source"]["device"], device);
             let restored: VideoConfig = serde_json::from_value(serialized).unwrap();
             assert!(restored.validate().is_ok());
+        }
+    }
+    #[test]
+    fn polygons_validate_and_roundtrip() {
+        for (points, valid) in [
+            ("[{x: 0, y: 0}, {x: 1, y: 0}, {x: 0.5, y: 1}]", true),
+            ("[{x: 0, y: 0}, {x: 1, y: 0}]", false),
+            ("[{x: -0.1, y: 0}, {x: 1, y: 0}, {x: 0.5, y: 1}]", false),
+        ] {
+            let config = from_yaml(&format!("tracks: [{{name: screen, clips: [{{id: a, start: 0, duration: 1, file: a.mkv, masks: [{{shape: polygon, points: {points}}}]}}]}}]"));
+            assert_eq!(config.validate().is_ok(), valid);
+            if valid {
+                assert!(from_yaml(&serde_json::to_string(&config).unwrap())
+                    .validate()
+                    .is_ok());
+            }
         }
     }
     #[test]

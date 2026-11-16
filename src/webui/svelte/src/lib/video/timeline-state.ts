@@ -193,6 +193,23 @@ export function videoConfigError(config: VideoConfig): string | null {
       if ((clip.masks?.length ?? 0) > 8)
         return "A clip supports up to eight masks.";
       for (const mask of clip.masks ?? []) {
+        if (!["rectangle", "ellipse", "polygon"].includes(mask.shape))
+          return "Unknown mask shape.";
+        if (
+          (mask.shape === "polygon" &&
+            (!mask.points || mask.points.length < 3)) ||
+          (mask.points?.length ?? 0) > 64 ||
+          mask.points?.some(
+            (p) =>
+              !Number.isFinite(p.x) ||
+              !Number.isFinite(p.y) ||
+              p.x < 0 ||
+              p.x > 1 ||
+              p.y < 0 ||
+              p.y > 1,
+          )
+        )
+          return "Polygons require 3–64 points inside the mask.";
         if (
           ![
             mask.x,

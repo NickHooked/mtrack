@@ -3,15 +3,120 @@
   let {
     clip,
     canvas,
-    selectedMask = -1,
+    selectedMask = $bindable(-1),
+    drawingMask = $bindable(false),
     onpatch,
   }: {
     clip: VideoClip;
     canvas: VideoCanvas;
     selectedMask?: number;
+    drawingMask?: boolean;
     onpatch: (patch: Partial<VideoClip>) => void;
   } = $props();
   let svg: SVGSVGElement;
+  type Point = { x: number; y: number };
+  let drawingPoints = $state<Point[]>([]);
+  let vertexDraft = $state<Point[] | null>(null);
+  let vertexIndex: number | null = null;
+  $effect(() => {
+    void drawingMask;
+    drawingPoints = [];
+  });
+  function closePolygon() {
+    if (drawingPoints.length < 3 || (clip.masks?.length ?? 0) >= 8) return;
+    const x = Math.min(...drawingPoints.map((p) => p.x)),
+      y = Math.min(...drawingPoints.map((p) => p.y));
+    const width = Math.max(...drawingPoints.map((p) => p.x)) - x,
+      height = Math.max(...drawingPoints.map((p) => p.y)) - y;
+    if (width < 0.000001 || height < 0.000001) return;
+    const masks = [
+      ...(clip.masks ?? []),
+      {
+        shape: "polygon" as const,
+        x,
+        y,
+        width,
+        height,
+        points: drawingPoints.map((p) => ({
+          x: (p.x - x) / width,
+          y: (p.y - y) / height,
+        })),
+        feather: 20,
+        invert: false,
+        opacity: 1,
+      },
+    ];
+    onpatch({ masks });
+    selectedMask = masks.length - 1;
+    drawingMask = false;
+  }
+  function drawPoint(event: PointerEvent) {
+    if (event.button !== 0 || drawingPoints.length >= 64) return;
+    const p = point(event);
+    const x = (p.x - clipBox.x) / clipBox.width,
+      y = (p.y - clipBox.y) / clipBox.height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return;
+    drawingPoints = [...drawingPoints, { x, y }];
+  }
+  function drawingKeys(event: KeyboardEvent) {
+    if (
+      !drawingMask ||
+      (event.target instanceof HTMLElement &&
+        ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName))
+    )
+      return;
+    if (["Enter", "Escape", "Backspace"].includes(event.key)) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    if (event.key === "Enter") closePolygon();
+    if (event.key === "Escape") drawingMask = false;
+    if (event.key === "Backspace") drawingPoints = drawingPoints.slice(0, -1);
+  }
+  function patchVertices(points: Point[]) {
+    onpatch({
+      masks: clip.masks?.map((m, i) =>
+        i === selectedMask ? { ...m, points } : m,
+      ),
+    });
+  }
+  function vertexKeys(event: KeyboardEvent, index: number) {
+    if (
+      (event.key === "Delete" || event.key === "Backspace") &&
+      vertices.length > 3
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      patchVertices(vertices.filter((_, i) => i !== index));
+    }
+    const d: Record<string, Point> = {
+      ArrowLeft: { x: -1, y: 0 },
+      ArrowRight: { x: 1, y: 0 },
+      ArrowUp: { x: 0, y: -1 },
+      ArrowDown: { x: 0, y: 1 },
+    };
+    if (d[event.key]) {
+      event.preventDefault();
+      event.stopPropagation();
+      const step = event.shiftKey ? 10 : 1;
+      patchVertices(
+        vertices.map((p, i) =>
+          i === index
+            ? {
+                x: Math.max(
+                  0,
+                  Math.min(1, p.x + (d[event.key].x * step) / box.width),
+                ),
+                y: Math.max(
+                  0,
+                  Math.min(1, p.y + (d[event.key].y * step) / box.height),
+                ),
+              }
+            : p,
+        ),
+      );
+    }
+  }
   type Box = { x: number; y: number; width: number; height: number };
   let draft = $state<Box | null>(null);
   let drag: { mode: string; point: { x: number; y: number }; box: Box } | null =
@@ -24,6 +129,7 @@
     height: clip.height ?? canvas.height,
   });
   let mask = $derived(clip.masks?.[selectedMask]);
+  let vertices = $derived(vertexDraft ?? mask?.points ?? []);
   let box = $derived(
     draft ??
       (mask
@@ -85,6 +191,18 @@
     };
   }
   function move(event: PointerEvent) {
+    if (vertexIndex !== null) {
+      const p = point(event);
+      vertexDraft = vertices.map((v, i) =>
+        i === vertexIndex
+          ? {
+              x: Math.max(0, Math.min(1, (p.x - box.x) / box.width)),
+              y: Math.max(0, Math.min(1, (p.y - box.y) / box.height)),
+            }
+          : v,
+      );
+      return;
+    }
     if (!drag) return;
     const p = point(event),
       dx = p.x - drag.point.x,
@@ -129,6 +247,9 @@
     } else onpatch(b);
   }
   function finish() {
+    if (vertexDraft) patchVertices(vertexDraft);
+    vertexDraft = null;
+    vertexIndex = null;
     if (drag && draft) commit(draft);
     draft = null;
     drag = null;
@@ -154,6 +275,8 @@
   }
 </script>
 
+<svelte:window onkeydown={drawingKeys} />
+
 <svg
   bind:this={svg}
   viewBox={`0 0 ${canvas.width} ${canvas.height}`}
@@ -166,50 +289,145 @@
   onpointercancel={() => {
     draft = null;
     drag = null;
+    vertexDraft = null;
+    vertexIndex = null;
   }}
 >
-  {#if mask?.shape === "ellipse"}<ellipse
-      cx={box.x + box.width / 2}
-      cy={box.y + box.height / 2}
-      rx={box.width / 2}
-      ry={box.height / 2}
-      fill="none"
-      stroke="#ffb74d"
-      vector-effect="non-scaling-stroke"
-    />{/if}
-  <rect
-    x={box.x}
-    y={box.y}
-    width={box.width}
-    height={box.height}
-    fill="transparent"
-    stroke={mask ? "#ffb74d" : "#20d6e8"}
-    stroke-dasharray={mask ? "5 3" : undefined}
-    vector-effect="non-scaling-stroke"
-    role="button"
-    tabindex="0"
-    aria-label={mask ? "Move selected mask" : "Move selected clip on canvas"}
-    data-testid="video-canvas-move"
-    onpointerdown={(e) => start(e, "move")}
-    onkeydown={(e) => keys(e)}
-  />
-  {#each corners as corner (corner)}
+  {#if !drawingMask}
+    {#if mask?.shape === "ellipse"}<ellipse
+        cx={box.x + box.width / 2}
+        cy={box.y + box.height / 2}
+        rx={box.width / 2}
+        ry={box.height / 2}
+        fill="none"
+        stroke="#ffb74d"
+        vector-effect="non-scaling-stroke"
+      />{/if}
     <rect
-      x={box.x + (corner.includes("e") ? box.width : 0) - handle / 2}
-      y={box.y + (corner.includes("s") ? box.height : 0) - handle / 2}
-      width={handle}
-      height={handle}
-      fill={mask ? "#ffb74d" : "#20d6e8"}
-      stroke="#111"
+      x={box.x}
+      y={box.y}
+      width={box.width}
+      height={box.height}
+      fill="transparent"
+      stroke={mask ? "#ffb74d" : "#20d6e8"}
+      stroke-dasharray={mask ? "5 3" : undefined}
       vector-effect="non-scaling-stroke"
       role="button"
       tabindex="0"
-      aria-label={`Resize ${mask ? "mask" : "clip"} ${corner}`}
-      data-testid={`video-canvas-resize-${corner}`}
-      onpointerdown={(e) => start(e, corner)}
-      onkeydown={(e) => keys(e, true)}
+      aria-label={mask ? "Move selected mask" : "Move selected clip on canvas"}
+      data-testid="video-canvas-move"
+      onpointerdown={(e) => start(e, "move")}
+      onkeydown={(e) => keys(e)}
     />
-  {/each}
+    {#each corners as corner (corner)}
+      <rect
+        x={box.x +
+          (corner.includes("e") ? box.width : 0) -
+          handle / 2 +
+          (mask?.shape === "polygon"
+            ? corner.includes("e")
+              ? handle
+              : -handle
+            : 0)}
+        y={box.y +
+          (corner.includes("s") ? box.height : 0) -
+          handle / 2 +
+          (mask?.shape === "polygon"
+            ? corner.includes("s")
+              ? handle
+              : -handle
+            : 0)}
+        width={handle}
+        height={handle}
+        fill={mask ? "#ffb74d" : "#20d6e8"}
+        stroke="#111"
+        vector-effect="non-scaling-stroke"
+        role="button"
+        tabindex="0"
+        aria-label={`Resize ${mask ? "mask" : "clip"} ${corner}`}
+        data-testid={`video-canvas-resize-${corner}`}
+        onpointerdown={(e) => start(e, corner)}
+        onkeydown={(e) => keys(e, true)}
+      />
+    {/each}
+    {#if mask?.shape === "polygon"}
+      <polygon
+        points={vertices
+          .map((p) => `${box.x + p.x * box.width},${box.y + p.y * box.height}`)
+          .join(" ")}
+        fill="none"
+        stroke="#ffb74d"
+        vector-effect="non-scaling-stroke"
+      />
+      {#each vertices as p, i (i)}
+        <circle
+          cx={box.x + p.x * box.width}
+          cy={box.y + p.y * box.height}
+          r={handle / 2}
+          fill="#ffb74d"
+          stroke="#111"
+          role="button"
+          tabindex="0"
+          aria-label={`Mask point ${i + 1}`}
+          data-testid={`video-mask-point-${i}`}
+          onkeydown={(e) => vertexKeys(e, i)}
+          onpointerdown={(e) => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            vertexIndex = i;
+            svg.setPointerCapture(e.pointerId);
+          }}
+        />
+      {/each}
+    {/if}
+  {:else}
+    <rect
+      x="0"
+      y="0"
+      width={canvas.width}
+      height={canvas.height}
+      fill="transparent"
+      role="button"
+      tabindex="0"
+      aria-label="Draw mask points"
+      data-testid="video-mask-draw"
+      onpointerdown={drawPoint}
+      onkeydown={drawingKeys}
+    />
+    <polyline
+      points={drawingPoints
+        .map(
+          (p) =>
+            `${clipBox.x + p.x * clipBox.width},${clipBox.y + p.y * clipBox.height}`,
+        )
+        .join(" ")}
+      fill="none"
+      stroke="#ffb74d"
+      vector-effect="non-scaling-stroke"
+    />
+    {#each drawingPoints as p, i (i)}
+      <circle
+        cx={clipBox.x + p.x * clipBox.width}
+        cy={clipBox.y + p.y * clipBox.height}
+        r={handle / 2}
+        fill="#ffb74d"
+        role="button"
+        tabindex="0"
+        aria-label={i === 0 ? "Close mask" : `Draft point ${i + 1}`}
+        onpointerdown={(e) => {
+          e.stopPropagation();
+          if (i === 0) closePolygon();
+        }}
+        onkeydown={(e) => {
+          if (e.key === "Enter") {
+            e.stopPropagation();
+            closePolygon();
+          }
+        }}
+      />
+    {/each}
+  {/if}
 </svg>
 
 <style>
@@ -220,6 +438,11 @@
     height: 100%;
     pointer-events: none;
     overflow: hidden;
+  }
+  circle {
+    pointer-events: auto;
+    cursor: crosshair;
+    touch-action: none;
   }
   rect {
     pointer-events: auto;

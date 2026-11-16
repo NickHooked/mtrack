@@ -2,6 +2,32 @@
 
 This document describes the current state of the experimental Linux video timeline work and is intended to help Michael continue development without having to reconstruct the earlier decisions.
 
+## Properties sidebar and freeform masks — 2026-11-16
+
+The video workspace now places a scrollable properties inspector to the right
+of the preview, with clip transforms, mask selection, feather/invert/strength,
+and timing/source properties. Narrow screens stack the columns. The inspector
+has a stable height so selecting a clip does not displace the timeline.
+
+Choose **Draw freeform mask**, click 3–64 points in the preview and click the
+first point or press Enter to close. Escape cancels; Backspace removes the last
+point while drawing. After closing, drag individual points or use arrow keys
+(Shift for ten pixels). Delete/Backspace removes a focused point down to three.
+The outline/corners still move/scale the complete mask. Each gesture creates one
+undo step; Save persists the polygon with the clip, for file and live sources.
+
+Polygon vertices are normalized within the existing mask bounds (`shape:
+polygon`, `points: [{x: 0, y: 0}, ...]`). The renderer uses even-odd containment
+and distance to the nearest edge for inward feathering in output pixels.
+Concave polygons are supported; self-intersections use the same even-odd rule.
+Existing rectangle/ellipse masks remain compatible. This is a straight-segment
+polygon tool; curved Bézier handles and video/luma mattes remain future work.
+
+Validation: 44 browser tests, 29 core video tests, 75 backend video unit tests,
+and all 29 GStreamer integration tests passed. Svelte checking reports no
+errors or warnings; targeted ESLint and the frontend production build pass.
+The integration test covers feathered polygon masks on file and live sources.
+
 ## Upstream refresh — 2026-11-16
 
 This branch is integrated with upstream `mdwn/mtrack` main at
@@ -200,7 +226,7 @@ Millumin's GPU blur implementation. Mask alpha multiplies existing source alpha
 before the compositor, so masks, clip opacity and temporal fades combine. Each
 active clip caches a raster until the clip changes; rasterization polls
 cancellation. Real multi-camera/high-resolution throughput still needs hardware
-profiling. Freeform/Bézier masks, rotation, animated masks, alpha/luma video
+profiling. Curved Bézier masks, rotation, animated masks, alpha/luma video
 mattes and projection mapping are not included in this iteration.
 
 The work also fixes the properties panel's file-required guard for live clips.

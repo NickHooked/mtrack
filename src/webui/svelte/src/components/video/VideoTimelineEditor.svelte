@@ -61,9 +61,11 @@
   let error = $state("");
   let playhead = $state(0);
   let selectedMask = $state(-1);
+  let drawingMask = $state(false);
   $effect(() => {
     void selectedClipId;
     selectedMask = -1;
+    drawingMask = false;
   });
   let libraryTab = $state<"media" | "live">("media");
   let previewControl: VideoPreview;
@@ -484,6 +486,7 @@
         bind:this={previewControl}
         editingClip={locked ? null : (selected?.clip ?? null)}
         bind:selectedMask
+        bind:drawingMask
         onpatch={patchComposition}
         onposition={(ms) => (playhead = ms / 1000)}
         {songName}
@@ -494,6 +497,23 @@
         onreloaded={() => (previewStale = false)}
       />
     </div>
+    <aside class="inspector" aria-label="Video properties" inert={locked}>
+      {#if selected}
+        <VideoCompositionPanel
+          clip={selected.clip}
+          canvas={config.canvas}
+          bind:selectedMask
+          bind:drawingMask
+          onpatch={patchComposition}
+        />
+        <VideoPropertiesPanel
+          clip={selected.clip}
+          onpatch={patchSelected}
+          ondelete={deleteSelected}
+        />
+      {/if}
+      {#if !selected}<p>Select a clip to edit its position and masks.</p>{/if}
+    </aside>
   </div>
   {#if importMessage}<div
       class="import-message"
@@ -716,19 +736,6 @@
       onclick={addTrack}
       >＋ Drop media here to create a track · or click to add an empty track</button
     >
-    {#if selected}
-      <VideoCompositionPanel
-        clip={selected.clip}
-        canvas={config.canvas}
-        bind:selectedMask
-        onpatch={patchComposition}
-      />
-      <VideoPropertiesPanel
-        clip={selected.clip}
-        onpatch={patchSelected}
-        ondelete={deleteSelected}
-      />
-    {/if}
   </div>
 </div>
 
@@ -756,9 +763,17 @@
 
   .workspace {
     display: grid;
-    grid-template-columns: 260px minmax(0, 1fr);
+    grid-template-columns: 200px minmax(0, 1fr) 300px;
     gap: 12px;
     align-items: stretch;
+  }
+  .inspector {
+    height: 430px;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
   }
   .viewer {
     min-width: 0;

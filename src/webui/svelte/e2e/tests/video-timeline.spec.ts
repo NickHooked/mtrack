@@ -618,6 +618,7 @@ test.describe("Video media pool", () => {
     const state = await openVideo(page);
     await page.getByText("Manual placement", { exact: true }).click();
     await expect(page.getByTestId("video-add-file")).not.toBeVisible();
+    await page.getByTestId("video-new-track-drop").scrollIntoViewIfNeeded();
     await page
       .getByTestId("video-media-item")
       .filter({ hasText: "camera-b.mp4" })
@@ -915,5 +916,59 @@ test.describe("Canvas composition", () => {
       .getByRole("button", { name: "Remove mask 1", exact: true })
       .click();
     await expect(page.getByTestId("video-mask-feather")).toHaveCount(0);
+  });
+});
+
+test.describe("Freeform masks", () => {
+  test.use({ viewport: { width: 1440, height: 1100 } });
+  test("draws a polygon in the right inspector, edits vertices, cancels and persists", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByTestId("video-clip").click();
+    const inspector = page.getByRole("complementary", {
+      name: "Video properties",
+    });
+    await expect(inspector).toBeVisible();
+    const previewBounds = await page
+      .getByTestId("video-canvas-move")
+      .boundingBox();
+    const inspectorBounds = await inspector.boundingBox();
+    expect(inspectorBounds!.x).toBeGreaterThan(
+      previewBounds!.x + previewBounds!.width,
+    );
+    await page.getByRole("button", { name: "Draw freeform mask" }).click();
+    const drawing = page.getByTestId("video-mask-draw");
+    await drawing.scrollIntoViewIfNeeded();
+    const b = (await drawing.boundingBox())!;
+    for (const [x, y] of [
+      [0.2, 0.2],
+      [0.8, 0.2],
+      [0.7, 0.8],
+      [0.2, 0.7],
+    ]) {
+      await page.mouse.click(b.x + b.width * x, b.y + b.height * y);
+    }
+    await page.getByRole("button", { name: "Close mask", exact: true }).click();
+    await expect(page.getByTestId("video-mask-point-3")).toBeVisible();
+    await dragBy(page, page.getByTestId("video-mask-point-1"), -20);
+    await page.getByTestId("video-mask-point-0").press("ArrowRight");
+    await page.getByTestId("video-mask-point-3").press("Delete");
+    await expect(page.getByTestId("video-mask-point-3")).toHaveCount(0);
+    await page.getByRole("button", { name: "Undo video edit" }).click();
+    await expect(page.getByTestId("video-mask-point-3")).toBeVisible();
+    await page.getByTestId("video-mask-feather").fill("35");
+    await page.getByTestId("video-mask-feather").dispatchEvent("change");
+    await page.getByRole("button", { name: "Draw freeform mask" }).click();
+    await page.keyboard.press("Escape");
+    await expect(drawing).toHaveCount(0);
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    const mask = parse(state.currentYaml()).video.tracks[0].clips[0].masks[0];
+    expect(mask.shape).toBe("polygon");
+    expect(mask.points).toHaveLength(4);
+    expect(mask.points[0].x).toBeGreaterThan(0);
+    expect(mask.points[1].x).toBeLessThan(1);
+    expect(mask.feather).toBe(35);
   });
 });

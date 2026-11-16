@@ -24,6 +24,7 @@ pub(super) fn rasterize(
             for x in 0..width {
                 let px = (f64::from(x) + 0.5) / f64::from(width) * f64::from(output_width) - left;
                 let distance = match mask.shape {
+                    MaskShape::Polygon => polygon_distance(px, py, w, h, &mask.points),
                     MaskShape::Rectangle => px.min(w - px).min(py.min(h - py)),
                     MaskShape::Ellipse => {
                         let u = (px - w / 2.0) / (w / 2.0);
@@ -63,6 +64,39 @@ pub(super) fn rasterize(
     Some(alpha)
 }
 
+fn polygon_distance(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    points: &[crate::config::video::MaskPoint],
+) -> f64 {
+    let mut inside = false;
+    let mut distance = f64::INFINITY;
+    for i in 0..points.len() {
+        let a = &points[i];
+        let b = &points[(i + 1) % points.len()];
+        let (ax, ay, bx, by) = (a.x * w, a.y * h, b.x * w, b.y * h);
+        if (ay > y) != (by > y) && x < (bx - ax) * (y - ay) / (by - ay) + ax {
+            inside = !inside;
+        }
+        let (dx, dy) = (bx - ax, by - ay);
+        let length = dx * dx + dy * dy;
+        let t = if length > 0.0 {
+            ((x - ax) * dx + (y - ay) * dy) / length
+        } else {
+            0.0
+        }
+        .clamp(0.0, 1.0);
+        distance = distance.min((x - ax - t * dx).hypot(y - ay - t * dy));
+    }
+    if inside {
+        distance
+    } else {
+        -distance
+    }
+}
+
 pub(super) fn apply(pixels: &mut [u8], mask: &[u8]) {
     for (pixel, alpha) in pixels.chunks_exact_mut(4).zip(mask) {
         pixel[3] = ((u16::from(pixel[3]) * u16::from(*alpha) + 127) / 255) as u8;
@@ -75,6 +109,7 @@ mod tests {
     fn rectangle() -> VideoMask {
         VideoMask {
             shape: MaskShape::Rectangle,
+            points: vec![],
             x: 0.25,
             y: 0.25,
             width: 0.5,
@@ -83,6 +118,37 @@ mod tests {
             invert: false,
             opacity: 1.0,
         }
+    }
+    #[test]
+    fn polygon_handles_concavity_feather_and_inversion() {
+        use crate::config::video::MaskPoint;
+        let mut m = rectangle();
+        m.shape = MaskShape::Polygon;
+        m.x = 0.0;
+        m.y = 0.0;
+        m.width = 1.0;
+        m.height = 1.0;
+        m.points = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 0.5),
+            (0.5, 0.5),
+            (0.5, 1.0),
+            (0.0, 1.0),
+        ]
+        .into_iter()
+        .map(|(x, y)| MaskPoint { x, y })
+        .collect();
+        let raster = rasterize(&[m.clone()], 16, 16, 16, 16, &AtomicBool::new(false)).unwrap();
+        assert_eq!(raster[4 * 16 + 4], 255);
+        assert_eq!(raster[12 * 16 + 12], 0);
+        m.feather = 2.0;
+        let raster = rasterize(&[m.clone()], 16, 16, 16, 16, &AtomicBool::new(false)).unwrap();
+        assert!(raster[7 * 16 + 12] > 0 && raster[7 * 16 + 12] < 255);
+        m.invert = true;
+        let inverse = rasterize(&[m], 16, 16, 16, 16, &AtomicBool::new(false)).unwrap();
+        assert_eq!(inverse[12 * 16 + 12], 255);
+        assert_eq!(inverse[4 * 16 + 4], 0);
     }
     #[test]
     fn feather_preserves_source_alpha_and_softens_edges() {

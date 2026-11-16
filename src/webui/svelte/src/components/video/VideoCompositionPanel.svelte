@@ -8,11 +8,13 @@
     clip,
     canvas,
     selectedMask = $bindable(-1),
+    drawingMask = $bindable(false),
     onpatch,
   }: {
     clip: VideoClip;
     canvas: VideoCanvas;
     selectedMask?: number;
+    drawingMask?: boolean;
     onpatch: (patch: Partial<VideoClip>) => void;
   } = $props();
   const fields = [
@@ -46,6 +48,7 @@
     );
   }
   function addMask(shape: VideoMask["shape"]) {
+    drawingMask = false;
     const masks = [
       ...(clip.masks ?? []),
       {
@@ -75,6 +78,7 @@
       class="btn btn-sm"
       onclick={() => {
         selectedMask = -1;
+        drawingMask = false;
       }}>Move / resize clip</button
     ><button
       class="btn btn-sm"
@@ -87,20 +91,18 @@
     Select a clip on the timeline, then drag its outline or corner handles in
     the preview. Shift keeps the aspect ratio. Masks move with the clip.
   </p>
-  <div class="fields">
-    {#each fields as field (field)}
-      <label
-        >{labels[field]}<input
-          type="number"
-          step={field === "opacity" || field.startsWith("fade") ? 0.01 : 1}
-          value={value(field)}
-          data-testid={`video-composition-${field}`}
-          onchange={(e) => onpatch({ [field]: Number(e.currentTarget.value) })}
-        /></label
-      >
-    {/each}
-  </div>
   <div class="actions">
+    <button
+      class="btn btn-sm"
+      disabled={(clip.masks?.length ?? 0) >= 8}
+      onclick={() => {
+        drawingMask = !drawingMask;
+      }}>{drawingMask ? "Cancel drawing" : "Draw freeform mask"}</button
+    >
+    {#if drawingMask}<p>
+        Click points in the preview. Click the first point or press Enter to
+        close (3–64 points). Escape cancels.
+      </p>{/if}
     <button
       class="btn btn-sm"
       disabled={(clip.masks?.length ?? 0) >= 8}
@@ -117,8 +119,10 @@
         <button
           class="btn btn-sm"
           aria-pressed={selectedMask === index}
-          onclick={() => (selectedMask = index)}
-          >Edit mask {index + 1} · {mask.shape}</button
+          onclick={() => {
+            selectedMask = index;
+            drawingMask = false;
+          }}>Edit mask {index + 1} · {mask.shape}</button
         ><button
           class="btn btn-sm"
           aria-label={`Remove mask ${index + 1}`}
@@ -128,6 +132,10 @@
           }}>Remove</button
         >
       </header>
+      {#if mask.shape === "polygon"}<p>
+          Drag points to reshape. Arrow keys nudge; Delete removes a focused
+          point (minimum 3).
+        </p>{/if}
       <div class="fields">
         {#each ["x", "y", "width", "height"] as field (field)}
           <label
@@ -177,6 +185,20 @@
       </div>
     </div>
   {/each}
+  <strong>Clip transform</strong>
+  <div class="fields">
+    {#each fields as field (field)}
+      <label
+        >{labels[field]}<input
+          type="number"
+          step={field === "opacity" || field.startsWith("fade") ? 0.01 : 1}
+          value={value(field)}
+          data-testid={`video-composition-${field}`}
+          onchange={(e) => onpatch({ [field]: Number(e.currentTarget.value) })}
+        /></label
+      >
+    {/each}
+  </div>
   {#if clip.masks?.length}<p>
       Masks keep the inside of their shape; invert cuts a hole. Feather softens
       inward in output pixels. Multiple masks intersect; strength 0 disables a
