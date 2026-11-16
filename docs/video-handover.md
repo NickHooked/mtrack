@@ -43,10 +43,37 @@ The updated app was also exercised with the two-clip demo: preview start,
 play, pause and seek produced frames. Packaging metadata checks passed;
 the full Debian package and the full repository test suite were not run.
 
-The existing editor still drops per-clip composition properties such as
-position, size, opacity and fades when parsing its editable configuration.
-The demo's overlay therefore fills the preview; this refresh does not fix
-that earlier prototype limitation.
+## Media pool and direct timeline editing — 2026-11-16
+
+The video editor now has a song-scoped media pool alongside a compact preview.
+The layout follows the media pool/viewer/timeline pattern described in the
+[DaVinci Resolve Edit overview](https://www.blackmagicdesign.com/products/davinciresolve/edit/).
+
+- Import multiple videos by file picker or dropping files into the pool. This
+  reuses the song upload/claim API and the existing filename/path validation.
+  The client skips duplicate names, rather than replacing existing media.
+- Drag a pool item onto a lane at a chosen time, or onto the new-track area to
+  create a track automatically. Clicking a pool item appends to the selected
+  clip's track, or the first track. Manual placement remains in a disclosure.
+- Move clips between tracks, trim their edges, snap to clip boundaries, and
+  bypass snapping with Shift. Overlaps on one track are rejected.
+- Undo/redo keeps the last 50 local timeline edits; Ctrl/Cmd+Z and Shift+Z
+  work outside text fields. File uploads are not undone, and history resets
+  when leaving the editor. Changes still use the song's Save button.
+- Click the timeline ruler to seek the preview; the playhead follows playback.
+  Import and editing honor the player's lock.
+- Composition settings (position, size, opacity and fades) now survive parsing,
+  moving and saving. The earlier property-dropping limitation is fixed.
+
+The pool lists videos stored with this song, including referenced nested files.
+It is not a project-wide asset database. Browser-readable imports supply their
+source duration for this editing session; otherwise new clips use the manual
+placement duration (10 seconds initially). Source metadata for existing files,
+thumbnail generation, ripple/roll edits and transitions remain future work.
+
+Validation: 39 video browser tests, frontend type checking and targeted lint,
+production frontend and video backend builds, and backend tests covering video
+upload filename confinement and unchanged song config after import.
 
 ## Repository and branch
 

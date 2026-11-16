@@ -16,6 +16,7 @@
     stale?: boolean;
     available?: boolean | null;
     onreloaded?: () => void;
+    onposition?: (milliseconds: number) => void;
   }
 
   let {
@@ -25,6 +26,7 @@
     stale = false,
     available = null,
     onreloaded,
+    onposition,
   }: Props = $props();
 
   let client: VideoPreviewClient | null = null;
@@ -174,6 +176,20 @@
         frameBeforeAcknowledgement: null,
       };
     });
+  }
+
+  $effect(() => {
+    onposition?.(positionMs);
+  });
+
+  export function seekTo(milliseconds: number) {
+    if (controlsDisabled) return;
+    positionMs = Math.min(
+      Math.max(0, Math.round(milliseconds)),
+      Math.max(0, durationMs),
+    );
+    if (!hasStarted || stale) reload();
+    else seek();
   }
 
   function seek() {
@@ -403,7 +419,8 @@
     position: relative;
     display: grid;
     width: 100%;
-    aspect-ratio: 16 / 9;
+    height: clamp(160px, 28vh, 300px);
+    aspect-ratio: auto;
     place-items: center;
     overflow: hidden;
     background-color: #15171a;
@@ -432,6 +449,8 @@
     opacity: 0.85;
   }
   img {
+    position: absolute;
+    inset: 0;
     width: 100%;
     height: 100%;
     object-fit: contain;

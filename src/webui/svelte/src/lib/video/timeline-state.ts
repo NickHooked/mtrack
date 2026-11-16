@@ -64,6 +64,7 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
 
   return {
     canvas: {
+      ...canvas,
       width: positiveNumber(canvas.width, DEFAULT_VIDEO_CANVAS.width),
       height: positiveNumber(canvas.height, DEFAULT_VIDEO_CANVAS.height),
       frame_rate: positiveNumber(
@@ -83,6 +84,7 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
           : {};
       const clips = Array.isArray(track.clips) ? track.clips : [];
       return {
+        ...track,
         name:
           typeof track.name === "string" && track.name.trim()
             ? track.name
@@ -93,6 +95,7 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
               ? (clipEntry as Record<string, unknown>)
               : {};
           return {
+            ...clip,
             id: normalizedId(clip.id, trackIndex, clipIndex),
             start: Math.max(0, finiteNumber(clip.start, 0)),
             duration: Math.max(
@@ -257,4 +260,23 @@ export function normalizeClipPatch(
       finiteNumber(patch.source_in ?? clip.source_in, clip.source_in),
     ),
   };
+}
+
+/** Snap a boundary to nearby edit points using a constant screen-space tolerance. */
+export function snapTime(
+  value: number,
+  points: number[],
+  pixelsPerSecond: number,
+): number {
+  const nearest = points.reduce(
+    (best, point) =>
+      Math.abs(point - value) < Math.abs(best - value) ? point : best,
+    Infinity,
+  );
+  return Math.max(
+    0,
+    roundTimelineValue(
+      Math.abs(nearest - value) <= 8 / pixelsPerSecond ? nearest : value,
+    ),
+  );
 }

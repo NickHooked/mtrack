@@ -943,6 +943,19 @@ fn song_has_file(
             .is_ok_and(|dir| dir.join_filename(filename).exists())
 }
 
+/// Video media uses the same song-scoped upload/import path as audio, but
+/// remains an unassigned file until placed on the video timeline.
+fn is_video_file(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "mp4" | "mov" | "mkv" | "webm" | "ogv" | "avi" | "m4v" | "mpeg" | "mpg" | "mxf"
+            )
+        })
+}
+
 /// Validates that a track filename is safe and has a supported extension.
 /// One not already in the song (`exists` false) is a new file, and must also
 /// pass the rules for new names; one there is replaced under its own name.
@@ -952,7 +965,7 @@ pub(super) fn validate_track_filename(filename: &str, exists: bool) -> Result<()
     }
 
     let path = std::path::Path::new(filename);
-    if FileKind::of(path) == FileKind::Other {
+    if FileKind::of(path) == FileKind::Other && !is_video_file(path) {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         return Err(SongError::Invalid(format!("Unsupported file type: .{ext}")));
     }
@@ -962,6 +975,31 @@ pub(super) fn validate_track_filename(filename: &str, exists: bool) -> Result<()
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn video_media_upload_names_stay_song_scoped() {
+        for name in [
+            "clip.mp4",
+            "Camera.MOV",
+            "clip.mkv",
+            "clip.webm",
+            "clip.ogv",
+        ] {
+            assert!(super::validate_track_filename(name, false).is_ok());
+        }
+        for name in [
+            "../clip.mp4",
+            "/clip.mp4",
+            "sub/clip.mp4",
+            "clip.exe",
+            ".hidden.mp4",
+        ] {
+            assert!(
+                super::validate_track_filename(name, false).is_err(),
+                "{name}"
+            );
+        }
+    }
+
     /// A deleted song comes off each playlist's file as the loader reads
     /// it: a `.yml` alone is edited, and with both `.yaml` and `.yml` only
     /// the `.yaml`. `loud.YAML` is no playlist and `all_songs.yaml` no file

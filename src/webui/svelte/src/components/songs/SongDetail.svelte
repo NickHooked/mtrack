@@ -1409,6 +1409,7 @@
         {/if}
       {:else if activeTab === "video"}
         <VideoTimelineEditor
+          locked={$playbackStore.locked}
           previewAvailable={videoPreviewAvailable}
           video={videoConfig}
           {songName}

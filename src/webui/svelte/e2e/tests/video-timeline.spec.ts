@@ -76,6 +76,7 @@ async function openVideo(page: Page, yaml = INITIAL_YAML, songName = SONG) {
   await page.goto(`/#/songs/${encodeURIComponent(songName)}`);
   await page.getByRole("tab", { name: "Video" }).click();
   await expect(page.getByTestId("video-timeline-editor")).toBeVisible();
+  await page.getByText("Manual placement", { exact: true }).click();
   return state;
 }
 
@@ -605,4 +606,150 @@ video:
     await page.getByRole("tab", { name: "Tracks" }).click();
     await expect(closed).resolves.toBe(true);
   });
+});
+
+test.describe("Video media pool", () => {
+  test.use({ viewport: { width: 1280, height: 1000 } });
+
+  test("drags media onto a new track and supports undo and redo", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByText("Manual placement", { exact: true }).click();
+    await expect(page.getByTestId("video-add-file")).not.toBeVisible();
+    await page
+      .getByTestId("video-media-item")
+      .filter({ hasText: "camera-b.mp4" })
+      .dragTo(page.getByTestId("video-new-track-drop"));
+    await expect(page.getByTestId("video-track")).toHaveCount(2);
+    await expect(page.getByTestId("video-clip")).toHaveCount(2);
+    await page.getByRole("button", { name: "Undo video edit" }).click();
+    await expect(page.getByTestId("video-track")).toHaveCount(1);
+    await page.getByRole("button", { name: "Redo video edit" }).click();
+    await expect(page.getByTestId("video-track")).toHaveCount(2);
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    expect(parse(state.currentYaml()).video.tracks[1].clips[0].file).toBe(
+      "camera-b.mp4",
+    );
+    expect(parse(state.currentYaml()).tracks[0].file).toBe("kick.wav");
+  });
+
+  test("snaps a dropped file to an edit and rejects overlap without losing media", async ({
+    page,
+  }) => {
+    await openVideo(page);
+    await page.getByText("Manual placement", { exact: true }).click();
+    const file = page
+      .getByTestId("video-media-item")
+      .filter({ hasText: "camera-b.mp4" });
+    const lane = page.getByTestId("video-lane");
+    await file.dragTo(lane, { targetPosition: { x: 104, y: 25 } });
+    await expect(page.getByTestId("video-clip-start")).toHaveValue("10");
+    await expect(page.getByTestId("video-clip")).toHaveCount(2);
+    await file.dragTo(lane, { targetPosition: { x: 50, y: 25 } });
+    await expect(page.getByTestId("video-error")).toContainText("overlaps");
+    await expect(page.getByTestId("video-clip")).toHaveCount(2);
+    await expect(file).toBeVisible();
+  });
+
+  test("moves between tracks and preserves composition properties when saved", async ({
+    page,
+  }) => {
+    const yaml = INITIAL_YAML.replace(
+      "source_in: 0",
+      "source_in: 0\n          x: 32\n          width: 320\n          opacity: 0.6\n          fade_in: 1",
+    );
+    const state = await openVideo(page, yaml);
+    await page.getByText("Manual placement", { exact: true }).click();
+    await page.getByTestId("video-add-track").click();
+    await page.getByTestId("video-clip").scrollIntoViewIfNeeded();
+    const source = await page.getByTestId("video-clip").boundingBox();
+    const target = await page.getByTestId("video-lane").nth(1).boundingBox();
+    if (!source || !target) throw new Error("missing timeline geometry");
+    await page.mouse.move(
+      source.x + source.width / 2,
+      source.y + source.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(source.x + source.width / 2 + 30, target.y + 25, {
+      steps: 8,
+    });
+    await page.mouse.up();
+    await expect(page.getByTestId("video-track")).toHaveCount(1);
+    await expect(page.getByTestId("video-track-name")).toHaveValue("Video 2");
+    await expect(page.getByTestId("video-clip-start")).toHaveValue("3");
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect.poll(() => state.writes.length).toBe(1);
+    expect(parse(state.currentYaml()).video.tracks[0].clips[0]).toMatchObject({
+      x: 32,
+      width: 320,
+      opacity: 0.6,
+      fade_in: 1,
+      start: 3,
+    });
+  });
+
+  test("imports into the song media pool, without adding an audio track", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    state.rpc.unary(ConfigService.method.beginUpload, {
+      uploadId: "video-import",
+      path: "/uploads/video-import",
+    });
+    state.rpc.unary(ConfigService.method.addTrackFiles, {
+      song: SONG,
+      files: [{ file: "new.webm", replaced: false }],
+    });
+    await page.route("**/uploads/video-import", (route) =>
+      route.fulfill({ status: 200, body: "" }),
+    );
+    await page.getByLabel("Import video files", { exact: true }).setInputFiles({
+      name: "new.webm",
+      mimeType: "video/webm",
+      buffer: Buffer.from("fake video for upload transport test"),
+    });
+    await expect(
+      page.getByTestId("video-media-item").filter({ hasText: "new.webm" }),
+    ).toBeVisible();
+    await expect(page.getByTestId("video-import-status")).toContainText(
+      "1 video imported",
+    );
+    expect(state.rpc.calls(ConfigService.method.beginUpload)[0].song).toBe(
+      SONG,
+    );
+    expect(state.writes).toHaveLength(0);
+    await expect(page.getByTestId("video-clip")).toHaveCount(1);
+  });
+
+  test("refuses duplicate import and leaves existing files intact", async ({
+    page,
+  }) => {
+    const state = await openVideo(page);
+    await page.getByLabel("Import video files", { exact: true }).setInputFiles({
+      name: "opening.mp4",
+      mimeType: "video/mp4",
+      buffer: Buffer.from("duplicate"),
+    });
+    await expect(page.getByTestId("video-import-status")).toContainText(
+      "kept the existing file",
+    );
+    expect(state.rpc.calls(ConfigService.method.beginUpload)).toHaveLength(0);
+  });
+});
+
+test("video ruler seeks the preview and moves its playhead", async ({
+  page,
+}) => {
+  await openVideo(page);
+  await page.getByTestId("video-preview-start").click();
+  await expect(page.getByTestId("video-preview-image")).toBeVisible();
+  await page
+    .getByRole("button", { name: "Seek video timeline" })
+    .click({ position: { x: 50, y: 10 } });
+  await expect(page.getByTestId("video-preview-time")).toContainText(
+    "00:05.000",
+  );
+  await expect(page.locator(".ruler-playhead")).toHaveCSS("left", "50px");
 });

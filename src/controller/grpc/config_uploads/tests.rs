@@ -1026,3 +1026,28 @@ async fn sample_names_that_are_not_safe_are_refused_at_both_steps() {
     assert!(!p.samples().exists(), "no samples directory for a bad name");
     assert_eq!(p.staged(), 0);
 }
+
+/// Video imports are media only; placement must not rewrite audio tracks.
+#[tokio::test]
+async fn video_import_preserves_song_config_and_file_bytes() {
+    let p = project();
+    let yaml = "name: VideoSong\ntracks: []\n";
+    p.server
+        .create_song(Request::new(proto::CreateSongRequest {
+            name: "VideoSong".to_string(),
+            yaml: yaml.to_string(),
+        }))
+        .await
+        .unwrap();
+    let bytes = b"video container bytes are stored without audio decoding";
+    let added = p.add_one("VideoSong", "clip.webm", bytes).await.unwrap();
+    assert_eq!(added.files[0].file, "clip.webm");
+    assert_eq!(
+        std::fs::read(p.songs().join("VideoSong/clip.webm")).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.songs().join("VideoSong/song.yaml")).unwrap(),
+        yaml
+    );
+}

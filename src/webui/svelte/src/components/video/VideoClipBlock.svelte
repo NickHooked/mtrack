@@ -3,6 +3,7 @@
   import type { VideoClip } from "../../lib/video/types";
   import {
     MIN_CLIP_DURATION,
+    snapTime,
     moveClip,
     trimClipLeft,
     trimClipRight,
@@ -13,6 +14,10 @@
     pixelsPerSecond: number;
     timelineDuration: number;
     selected?: boolean;
+    trackIndex: number;
+    snapping?: boolean;
+    snapPoints?: { time: number; id: string }[];
+    onmove?: (clip: VideoClip, targetIndex: number) => void;
     onselect?: () => void;
     oncommit?: (clip: VideoClip) => void;
     ondelete?: () => void;
@@ -23,6 +28,10 @@
     pixelsPerSecond,
     timelineDuration,
     selected = false,
+    trackIndex,
+    snapping = true,
+    snapPoints = [],
+    onmove,
     onselect,
     oncommit,
     ondelete,
@@ -31,6 +40,10 @@
   type DragMode = "move" | "left" | "right";
   let dragMode = $state<DragMode | null>(null);
   let originX = 0;
+  let originY = 0;
+  let originScroll = 0;
+  let scroller: HTMLElement | null = null;
+  let targetIndex = $state<number | null>(null);
   let originClip: VideoClip;
   let preview = $state<VideoClip | null>(null);
   let shown = $derived(preview ?? clip);
@@ -40,11 +53,16 @@
   }
 
   function beginDrag(event: PointerEvent, mode: DragMode) {
+    if (event.button !== 0) return;
     event.stopPropagation();
     const target = event.currentTarget as HTMLElement;
     target.setPointerCapture(event.pointerId);
     dragMode = mode;
     originX = event.clientX;
+    originY = event.clientY;
+    scroller = target.closest(".timeline-scroll");
+    originScroll = scroller?.scrollLeft ?? 0;
+    targetIndex = trackIndex;
     originClip = { ...clip };
     preview = { ...clip };
     onselect?.();
@@ -53,25 +71,63 @@
 
   function drag(event: PointerEvent) {
     if (!dragMode || !preview) return;
-    const delta = (event.clientX - originX) / pixelsPerSecond;
+    const delta =
+      (event.clientX - originX + (scroller?.scrollLeft ?? 0) - originScroll) /
+      pixelsPerSecond;
+    const points = [
+      0,
+      ...snapPoints
+        .filter((point) => point.id !== clip.id)
+        .map((point) => point.time),
+    ];
+    const snap = (time: number) =>
+      snapping && !event.shiftKey
+        ? snapTime(time, points, pixelsPerSecond)
+        : rounded(time);
     if (dragMode === "move") {
-      preview = moveClip(originClip, rounded(originClip.start + delta));
+      const lane = document
+        .elementFromPoint(event.clientX, event.clientY)
+        ?.closest<HTMLElement>("[data-video-track-index]");
+      targetIndex = lane ? Number(lane.dataset.videoTrackIndex) : null;
+      const start = Math.max(0, originClip.start + delta);
+      const snapped =
+        snapping && !event.shiftKey
+          ? snapTime(
+              start,
+              [
+                ...points,
+                ...points
+                  .map((point) => point - originClip.duration)
+                  .filter((point) => point >= 0),
+              ],
+              pixelsPerSecond,
+            )
+          : rounded(start);
+      preview = moveClip(originClip, snapped);
     } else if (dragMode === "left") {
-      preview = trimClipLeft(originClip, rounded(originClip.start + delta));
+      preview = trimClipLeft(originClip, snap(originClip.start + delta));
     } else {
       preview = trimClipRight(
         originClip,
-        rounded(originClip.start + originClip.duration + delta),
+        snap(originClip.start + originClip.duration + delta),
       );
     }
   }
 
-  function finishDrag() {
+  function finishDrag(event: PointerEvent) {
     if (!dragMode || !preview) return;
     const result = preview;
+    const mode = dragMode;
     dragMode = null;
     preview = null;
-    oncommit?.(result);
+    if (
+      Math.abs(event.clientX - originX) < 2 &&
+      Math.abs(event.clientY - originY) < 2
+    )
+      return;
+    if (mode === "move") {
+      if (targetIndex !== null) onmove?.(result, targetIndex);
+    } else oncommit?.(result);
   }
 
   function cancelDrag() {
@@ -142,7 +198,14 @@
     onpointercancel={cancelDrag}
     onkeydown={(event) => trimKeydown(event, "left")}
   ></span>
-  <span class="clip-label">{clip.file}</span>
+  <span class="clip-label"
+    >{clip.file}{#if dragMode}<small
+        >{shown.start.toFixed(2)}s{#if dragMode === "move"}
+          · {targetIndex === null
+            ? "outside timeline"
+            : `Track ${targetIndex + 1}`}{/if}</small
+      >{/if}</span
+  >
   <span
     class="trim-handle trim-right"
     data-testid="video-trim-right"
@@ -198,6 +261,11 @@
     font-family: var(--nc-font-mono);
     font-size: 11px;
     pointer-events: none;
+  }
+  .clip-label small {
+    display: block;
+    font-size: 9px;
+    margin-top: 3px;
   }
   .trim-handle {
     width: 7px;

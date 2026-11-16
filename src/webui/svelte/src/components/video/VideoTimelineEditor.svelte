@@ -1,6 +1,18 @@
 <!-- Copyright (C) 2026 Michael Wilson <mike@mdwn.dev> -->
 <script lang="ts">
-  import type { SongFile } from "../../lib/api/songs";
+  import { onMount } from "svelte";
+  import { SvelteSet } from "svelte/reactivity";
+  import {
+    fetchSongFiles,
+    uploadTrack,
+    type SongFile,
+  } from "../../lib/api/songs";
+  import VideoMediaPool from "./VideoMediaPool.svelte";
+  import {
+    isVideoFile,
+    localVideoDuration,
+    VIDEO_MEDIA_TYPE,
+  } from "../../lib/video/media";
   import type {
     VideoClip,
     VideoConfig,
@@ -21,6 +33,7 @@
   interface Props {
     video: VideoConfig | null;
     songName: string;
+    locked?: boolean;
     songDurationSeconds?: number;
     files?: SongFile[];
     previewAvailable?: boolean | null;
@@ -32,6 +45,7 @@
   let {
     video,
     songName,
+    locked = false,
     songDurationSeconds = 0,
     files = [],
     previewAvailable = null,
@@ -40,7 +54,207 @@
     onvaliditychange,
   }: Props = $props();
 
+  let config = $derived(video ?? createVideoConfig());
   let error = $state("");
+  let playhead = $state(0);
+  let previewControl: VideoPreview;
+  onMount(() => {
+    let active = true;
+    fetchSongFiles(songName)
+      .then((result) => {
+        if (active)
+          mediaFiles = result
+            .filter((file) => isVideoFile(file.name))
+            .map((file) => file.name);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  });
+  let mediaFiles = $state<string[]>([]);
+  let mediaDurations = $state<Record<string, number>>({});
+  let importing = $state(false);
+  let importMessage = $state("");
+  let snapping = $state(true);
+  let undoStack = $state<VideoConfig[]>([]);
+  let redoStack = $state<VideoConfig[]>([]);
+  let media = $derived(
+    [
+      ...new Set([
+        ...files
+          .filter((file) => isVideoFile(file.name))
+          .map((file) => file.name),
+        ...mediaFiles,
+        ...config.tracks.flatMap((track) =>
+          track.clips.map((clip) => clip.file),
+        ),
+      ]),
+    ].sort((a, b) => a.localeCompare(b)),
+  );
+
+  function copy(value: VideoConfig): VideoConfig {
+    return JSON.parse(JSON.stringify(value));
+  }
+  function undo() {
+    const previous = undoStack.at(-1);
+    if (!previous || locked) return;
+    redoStack = [...redoStack, copy(config)];
+    undoStack = undoStack.slice(0, -1);
+    error = "";
+    previewStale = true;
+    onchange?.(previous);
+  }
+  function redo() {
+    const next = redoStack.at(-1);
+    if (!next || locked) return;
+    undoStack = [...undoStack, copy(config)];
+    redoStack = redoStack.slice(0, -1);
+    error = "";
+    previewStale = true;
+    onchange?.(next);
+  }
+  function historyKey(event: KeyboardEvent) {
+    if (
+      !(event.ctrlKey || event.metaKey) ||
+      !(event.target instanceof HTMLElement)
+    )
+      return;
+    if (event.target.closest("input, textarea, select, [contenteditable=true]"))
+      return;
+    if (event.key.toLowerCase() === "z") {
+      event.preventDefault();
+      if (event.shiftKey) redo();
+      else undo();
+    } else if (event.key.toLowerCase() === "y") {
+      event.preventDefault();
+      redo();
+    }
+  }
+
+  async function importMedia(incoming: File[]) {
+    if (importing || locked) return;
+    importing = true;
+    importMessage = "";
+    const messages: string[] = [];
+    try {
+      const refreshed = await fetchSongFiles(songName);
+      const existing = new SvelteSet([
+        ...refreshed.map((file) => file.name),
+        ...media,
+      ]);
+      let count = 0;
+      for (const file of incoming) {
+        if (!isVideoFile(file.name)) {
+          messages.push(`${file.name}: choose a video file.`);
+          continue;
+        }
+        if (existing.has(file.name)) {
+          messages.push(
+            `${file.name} is already in this song; kept the existing file.`,
+          );
+          continue;
+        }
+        try {
+          await uploadTrack(songName, file);
+          existing.add(file.name);
+          mediaFiles = [...mediaFiles, file.name];
+          const duration = await localVideoDuration(file);
+          if (duration !== null)
+            mediaDurations = { ...mediaDurations, [file.name]: duration };
+          count++;
+        } catch (cause) {
+          messages.push(
+            `${file.name}: ${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        }
+      }
+      importMessage = [
+        `${count} video${count === 1 ? "" : "s"} imported.`,
+        ...messages,
+      ].join(" ");
+    } catch (cause) {
+      importMessage = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      importing = false;
+    }
+  }
+
+  function nextTrackName(): string {
+    let number = config.tracks.length + 1;
+    while (config.tracks.some((track) => track.name === `Video ${number}`))
+      number++;
+    return `Video ${number}`;
+  }
+  function placeMedia(file: string, trackIndex: number, start?: number) {
+    if (locked || !media.includes(file)) return;
+    const track = config.tracks[trackIndex] ?? {
+      name: nextTrackName(),
+      clips: [],
+    };
+    const position =
+      start ??
+      track.clips.reduce(
+        (end, clip) => Math.max(end, clip.start + clip.duration),
+        0,
+      );
+    const clip: VideoClip = {
+      id: uniqueClipId(config, file),
+      file,
+      start: position,
+      duration:
+        mediaDurations[file] ?? Math.max(0.01, Number(addDuration) || 10),
+      source_in: 0,
+    };
+    const overlap = overlapError(track, clip);
+    if (overlap) {
+      error = overlap;
+      return;
+    }
+    const next = { ...track, clips: [...track.clips, clip] };
+    emit(
+      config.tracks[trackIndex]
+        ? replaceTrack(trackIndex, next)
+        : { ...config, tracks: [...config.tracks, next] },
+    );
+    selectedClipId = clip.id;
+  }
+  function moveAcrossTracks(
+    sourceIndex: number,
+    targetIndex: number,
+    clip: VideoClip,
+  ) {
+    if (sourceIndex === targetIndex) {
+      commitClip(sourceIndex, clip);
+      return;
+    }
+    const target = config.tracks[targetIndex];
+    if (!target) return;
+    const overlap = overlapError(target, clip);
+    if (overlap) {
+      error = overlap;
+      return;
+    }
+    // Remove the now-empty source, since persisted video tracks must have clips.
+    emit({
+      ...config,
+      tracks: config.tracks
+        .map((track, index) => {
+          if (index === sourceIndex)
+            return {
+              ...track,
+              clips: track.clips.filter((item) => item.id !== clip.id),
+            };
+          if (index === targetIndex)
+            return { ...track, clips: [...track.clips, clip] };
+          return track;
+        })
+        .filter(
+          (track, index) => index !== sourceIndex || track.clips.length > 0,
+        ),
+    });
+  }
+
   let pixelsPerSecond = $state(10);
   let addTrackIndex = $state(0);
   let addFile = $state("");
@@ -49,7 +263,6 @@
   let addSourceIn = $state(0);
   let previewStale = $state(false);
 
-  let config = $derived(video ?? createVideoConfig());
   let validationError = $derived(videoConfigError(config));
   let displayedError = $derived(error || validationError || "");
 
@@ -85,6 +298,9 @@
   );
 
   function emit(next: VideoConfig) {
+    if (locked || JSON.stringify(config) === JSON.stringify(next)) return;
+    undoStack = [...undoStack.slice(-49), copy(config)];
+    redoStack = [];
     error = "";
     previewStale = true;
     onchange?.(next);
@@ -212,165 +428,307 @@
   }
 </script>
 
+<svelte:window onkeydown={historyKey} />
 <div class="video-editor" data-testid="video-timeline-editor">
-  <VideoPreview
-    {songName}
-    {config}
-    durationMs={songDurationSeconds * 1000}
-    stale={previewStale}
-    available={previewAvailable}
-    onreloaded={() => (previewStale = false)}
-  />
-
-  <div class="toolbar">
-    <div>
-      <strong>Video timeline</strong>
-      <span class="canvas-summary"
-        >{config.canvas.width}×{config.canvas.height} · {config.canvas
-          .frame_rate} fps</span
-      >
-    </div>
-    <div class="toolbar-actions">
-      <button
-        type="button"
-        class="btn btn-sm"
-        aria-label="Zoom out video timeline"
-        onclick={() => (pixelsPerSecond = Math.max(2, pixelsPerSecond / 1.25))}
-        >−</button
-      >
-      <button
-        type="button"
-        class="btn btn-sm"
-        aria-label="Zoom in video timeline"
-        onclick={() => (pixelsPerSecond = Math.min(80, pixelsPerSecond * 1.25))}
-        >+</button
-      >
-      <button
-        type="button"
-        class="btn btn-sm"
-        data-testid="video-add-track"
-        onclick={addTrack}>Add track</button
-      >
+  <div class="workspace">
+    <VideoMediaPool
+      files={media}
+      busy={importing}
+      {locked}
+      onimport={importMedia}
+      onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
+    />
+    <div class="viewer">
+      <VideoPreview
+        bind:this={previewControl}
+        onposition={(ms) => (playhead = ms / 1000)}
+        {songName}
+        {config}
+        durationMs={Math.max(songDurationSeconds, videoEnd(config)) * 1000}
+        stale={previewStale}
+        available={previewAvailable}
+        onreloaded={() => (previewStale = false)}
+      />
     </div>
   </div>
+  {#if importMessage}<div
+      class="import-message"
+      role="status"
+      data-testid="video-import-status"
+    >
+      {importMessage}
+    </div>{/if}
+  {#if locked}<div class="import-message">
+      Unlock the player to edit the timeline.
+    </div>{/if}
+  <div class="edit-controls" inert={locked}>
+    <div class="toolbar">
+      <div>
+        <strong>Video timeline</strong>
+        <span class="canvas-summary"
+          >{config.canvas.width}×{config.canvas.height} · {config.canvas
+            .frame_rate} fps</span
+        >
+      </div>
+      <div class="toolbar-actions">
+        <button
+          class="btn btn-sm"
+          type="button"
+          aria-label="Undo video edit"
+          disabled={!undoStack.length}
+          onclick={undo}>↶ Undo</button
+        >
+        <button
+          class="btn btn-sm"
+          type="button"
+          aria-label="Redo video edit"
+          disabled={!redoStack.length}
+          onclick={redo}>↷ Redo</button
+        >
+        <button
+          class="btn btn-sm"
+          type="button"
+          aria-pressed={snapping}
+          onclick={() => (snapping = !snapping)}>Snap</button
+        >
+        <button
+          type="button"
+          class="btn btn-sm"
+          aria-label="Zoom out video timeline"
+          onclick={() =>
+            (pixelsPerSecond = Math.max(2, pixelsPerSecond / 1.25))}>−</button
+        >
+        <button
+          type="button"
+          class="btn btn-sm"
+          aria-label="Zoom in video timeline"
+          onclick={() =>
+            (pixelsPerSecond = Math.min(80, pixelsPerSecond * 1.25))}>+</button
+        >
+        <button
+          type="button"
+          class="btn btn-sm"
+          data-testid="video-add-track"
+          onclick={addTrack}>Add track</button
+        >
+      </div>
+    </div>
 
-  <div class="add-panel">
-    <label class="file-control">
-      <span>File</span>
-      <input
-        type="text"
-        list="video-song-files"
-        placeholder="video.mp4"
-        data-testid="video-add-file"
-        bind:value={addFile}
-      />
-      <datalist id="video-song-files">
-        {#each files as file (file.name)}
-          <option value={file.name}></option>
+    <p class="editing-hint">
+      Drag media onto a track. Drag clips to move them, or their edges to trim.
+      Hold Shift to bypass snapping. New clips use the imported duration when
+      available; otherwise the manual duration (default 10s).
+    </p>
+    <details class="manual-placement">
+      <summary>Manual placement</summary>
+      <div class="add-panel">
+        <label class="file-control">
+          <span>File</span>
+          <input
+            type="text"
+            list="video-song-files"
+            placeholder="video.mp4"
+            data-testid="video-add-file"
+            bind:value={addFile}
+          />
+          <datalist id="video-song-files">
+            {#each files as file (file.name)}
+              <option value={file.name}></option>
+            {/each}
+          </datalist>
+        </label>
+        <label>
+          <span>Track</span>
+          <select
+            data-testid="video-add-track-select"
+            value={addTrackIndex}
+            disabled={config.tracks.length === 0}
+            onchange={(event) =>
+              (addTrackIndex = Number(event.currentTarget.value))}
+          >
+            {#each config.tracks as track, index (index)}
+              <option value={index}>{track.name}</option>
+            {/each}
+          </select>
+        </label>
+        <label>
+          <span>Start (s)</span>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            data-testid="video-add-start"
+            bind:value={addStart}
+          />
+        </label>
+        <label>
+          <span>Duration (s)</span>
+          <input
+            type="number"
+            min="0.01"
+            step="0.01"
+            data-testid="video-add-duration"
+            bind:value={addDuration}
+          />
+        </label>
+        <label>
+          <span>Source in (s)</span>
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            data-testid="video-add-source-in"
+            bind:value={addSourceIn}
+          />
+        </label>
+        <button
+          type="button"
+          class="btn btn-sm btn-primary"
+          data-testid="video-add-clip"
+          onclick={addClip}>Add clip</button
+        >
+      </div>
+    </details>
+
+    {#if displayedError}
+      <div class="video-error" data-testid="video-error" role="alert">
+        {displayedError}
+      </div>
+    {/if}
+
+    {#if config.tracks.length === 0}
+      <p class="empty">Drag media below to create your first video track.</p>
+    {:else}
+      <div class="timeline-scroll">
+        <div class="ruler-row">
+          <div class="ruler-label">Time</div>
+          <button
+            type="button"
+            class="ruler"
+            style:width="{timelineWidth}px"
+            aria-label="Seek video timeline"
+            onclick={(event) =>
+              previewControl?.seekTo(
+                ((event.clientX -
+                  event.currentTarget.getBoundingClientRect().left) /
+                  pixelsPerSecond) *
+                  1000,
+              )}
+          >
+            <i
+              class="ruler-playhead"
+              style:left="{playhead * pixelsPerSecond}px"
+            ></i>
+            {#each rulerTicks as second (second)}
+              <span style:left="{second * pixelsPerSecond}px">{second}s</span>
+            {/each}
+          </button>
+        </div>
+        {#each config.tracks as track, trackIndex (trackIndex)}
+          <VideoTrackLane
+            {track}
+            {trackIndex}
+            {pixelsPerSecond}
+            {timelineWidth}
+            timelineDuration={clipTimelineDuration}
+            {selectedClipId}
+            {snapping}
+            {playhead}
+            snapPoints={config.tracks.flatMap((item) =>
+              item.clips.flatMap((clip) => [
+                { time: clip.start, id: clip.id },
+                { time: clip.start + clip.duration, id: clip.id },
+              ]),
+            )}
+            ondropmedia={(file, start) => placeMedia(file, trackIndex, start)}
+            onmoveclip={(clip, targetIndex) =>
+              moveAcrossTracks(trackIndex, targetIndex, clip)}
+            onrename={(name) => renameTrack(trackIndex, name)}
+            onremove={() => removeTrack(trackIndex)}
+            onselectclip={(id) => {
+              error = "";
+              selectedClipId = id;
+            }}
+            oncommitclip={(clip) => commitClip(trackIndex, clip)}
+            ondeleteclip={(id) => deleteClip(trackIndex, id)}
+          />
         {/each}
-      </datalist>
-    </label>
-    <label>
-      <span>Track</span>
-      <select
-        data-testid="video-add-track-select"
-        value={addTrackIndex}
-        disabled={config.tracks.length === 0}
-        onchange={(event) =>
-          (addTrackIndex = Number(event.currentTarget.value))}
-      >
-        {#each config.tracks as track, index (index)}
-          <option value={index}>{track.name}</option>
-        {/each}
-      </select>
-    </label>
-    <label>
-      <span>Start (s)</span>
-      <input
-        type="number"
-        min="0"
-        step="0.01"
-        data-testid="video-add-start"
-        bind:value={addStart}
-      />
-    </label>
-    <label>
-      <span>Duration (s)</span>
-      <input
-        type="number"
-        min="0.01"
-        step="0.01"
-        data-testid="video-add-duration"
-        bind:value={addDuration}
-      />
-    </label>
-    <label>
-      <span>Source in (s)</span>
-      <input
-        type="number"
-        min="0"
-        step="0.01"
-        data-testid="video-add-source-in"
-        bind:value={addSourceIn}
-      />
-    </label>
+      </div>
+    {/if}
+
     <button
       type="button"
-      class="btn btn-sm btn-primary"
-      data-testid="video-add-clip"
-      onclick={addClip}>Add clip</button
+      class="new-track-drop"
+      data-testid="video-new-track-drop"
+      ondragover={(event) => {
+        if (event.dataTransfer?.types.includes(VIDEO_MEDIA_TYPE))
+          event.preventDefault();
+      }}
+      ondrop={(event) => {
+        event.preventDefault();
+        const file = event.dataTransfer?.getData(VIDEO_MEDIA_TYPE);
+        if (file) placeMedia(file, config.tracks.length, 0);
+      }}
+      onclick={addTrack}
+      >＋ Drop media here to create a track · or click to add an empty track</button
     >
+    {#if selected}
+      <VideoPropertiesPanel
+        clip={selected.clip}
+        onpatch={patchSelected}
+        ondelete={deleteSelected}
+      />
+    {/if}
   </div>
-
-  {#if displayedError}
-    <div class="video-error" data-testid="video-error" role="alert">
-      {displayedError}
-    </div>
-  {/if}
-
-  {#if config.tracks.length === 0}
-    <div class="empty">Add a track, then place file-backed clips on it.</div>
-  {:else}
-    <div class="timeline-scroll">
-      <div class="ruler-row">
-        <div class="ruler-label">Time</div>
-        <div class="ruler" style:width="{timelineWidth}px">
-          {#each rulerTicks as second (second)}
-            <span style:left="{second * pixelsPerSecond}px">{second}s</span>
-          {/each}
-        </div>
-      </div>
-      {#each config.tracks as track, trackIndex (trackIndex)}
-        <VideoTrackLane
-          {track}
-          {trackIndex}
-          {pixelsPerSecond}
-          {timelineWidth}
-          timelineDuration={clipTimelineDuration}
-          {selectedClipId}
-          onrename={(name) => renameTrack(trackIndex, name)}
-          onremove={() => removeTrack(trackIndex)}
-          onselectclip={(id) => {
-            error = "";
-            selectedClipId = id;
-          }}
-          oncommitclip={(clip) => commitClip(trackIndex, clip)}
-          ondeleteclip={(id) => deleteClip(trackIndex, id)}
-        />
-      {/each}
-    </div>
-  {/if}
-
-  {#if selected}
-    <VideoPropertiesPanel
-      clip={selected.clip}
-      onpatch={patchSelected}
-      ondelete={deleteSelected}
-    />
-  {/if}
 </div>
 
 <style>
+  .workspace {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    gap: 12px;
+    align-items: stretch;
+  }
+  .viewer {
+    min-width: 0;
+  }
+  .edit-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .editing-hint,
+  .import-message {
+    margin: 0;
+    color: var(--nc-fg-3);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .manual-placement summary {
+    cursor: pointer;
+    color: var(--nc-fg-3);
+    font-size: 12px;
+    padding: 4px 0;
+  }
+  .new-track-drop {
+    padding: 16px;
+    border: 1px dashed var(--card-border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--nc-fg-3);
+    cursor: pointer;
+  }
+  .new-track-drop:hover {
+    border-color: var(--nc-cyan-400);
+  }
+  @media (max-width: 760px) {
+    .workspace {
+      grid-template-columns: 1fr;
+    }
+    .toolbar {
+      flex-wrap: wrap;
+    }
+  }
   .video-editor {
     display: flex;
     min-width: 0;
@@ -475,7 +833,19 @@
     font-weight: 700;
     text-transform: uppercase;
   }
+  .ruler-playhead {
+    position: absolute;
+    z-index: 2;
+    top: 0;
+    bottom: 0;
+    border-left: 2px solid var(--nc-cyan-400);
+    pointer-events: none;
+  }
   .ruler {
+    padding: 0;
+    border: 0;
+    text-align: left;
+    cursor: crosshair;
     position: relative;
     height: 28px;
     background: var(--nc-bg-2);
