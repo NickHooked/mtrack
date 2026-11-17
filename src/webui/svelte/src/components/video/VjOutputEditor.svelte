@@ -30,6 +30,9 @@
   let imageUrl = $state<string | null>(null);
   let socket: WebSocket | null = null;
   let output = $derived(outputs.find((o) => o.id === selected) ?? outputs[0]);
+  // Status arrives every 100ms. Only reconnect when this primitive key changes,
+  // not whenever the parent replaces its status object with another running state.
+  let streamId = $derived(running ? output?.id : undefined);
   let slice = $derived(
     output?.slices.find((s) => s.id === selectedSlice) ?? output?.slices[0],
   );
@@ -42,12 +45,11 @@
     imageUrl = null;
   }
   $effect(() => {
-    const id = output?.id;
-    const active = running;
+    const id = streamId;
     socket?.close();
     socket = null;
     untrack(clearImage);
-    if (id && active) {
+    if (id) {
       const ws = new WebSocket(
         `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/video/vj/output/${encodeURIComponent(id)}/ws`,
       );
@@ -60,8 +62,9 @@
           return;
         }
         const url = URL.createObjectURL(e.data);
-        clearImage();
+        const previous = imageUrl;
         imageUrl = url;
+        if (previous) URL.revokeObjectURL(previous);
       };
       return () => {
         ws.onmessage = null;

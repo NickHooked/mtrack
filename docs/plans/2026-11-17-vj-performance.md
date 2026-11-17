@@ -73,6 +73,8 @@ Official references: [clips](https://resolume.com/support/en/clips),
    test-camera compound plus a masked live layer at roughly 20–21 fps on this
    host (configured 25 fps). Confirmed recorded-video launching, isolated-layer
    output and blackout clearing both independent viewer windows. Hardware was
-   not attached. During screenshot review, SVG frame replacement visibly
-   flickered; use a separate HTML image under the mapping handles so the browser
-   retains the previous decoded frame while loading the next.
+   not attached. Screenshot review revealed a mapping-preview reconnect on
+   every parent status update. Derive a stable stream identity before opening
+   the socket, and replace images without clearing the current frame first.
+   A sixth browser regression verifies one output connection across repeated
+   running-status updates. The preview uses an HTML image under SVG handles.

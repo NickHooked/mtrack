@@ -312,3 +312,46 @@ test("reconnect keeps the draft and song navigation opens a fresh session", asyn
     .poll(() => state.connections.at(-1))
     .toContain("Test%20Song%20Beta/vj/ws");
 });
+
+test("mapping preview keeps one stream across repeated running status updates", async ({
+  page,
+}) => {
+  let outputConnections = 0;
+  let frames = 0;
+  await page.routeWebSocket("**/api/video/vj/output/**/ws", (ws) => {
+    outputConnections += 1;
+    const timer = setInterval(() => {
+      frames += 1;
+      ws.send(
+        Buffer.from(
+          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+          "base64",
+        ),
+      );
+    }, 30);
+    ws.onClose(() => clearInterval(timer));
+  });
+  const state = await open(page);
+  await page.getByRole("button", { name: "Start VJ output" }).click();
+  const preview = page.getByRole("img", {
+    name: "Mapped output preview",
+    exact: true,
+  });
+  await expect(preview).toBeVisible();
+  for (let i = 0; i < 10; i++) {
+    state.send({
+      type: "state",
+      running: true,
+      starting: false,
+      fps: 20 + i / 10,
+    });
+    await expect.poll(() => frames).toBeGreaterThan(i);
+  }
+  await expect.poll(() => frames).toBeGreaterThan(15);
+  await expect(preview).toBeVisible();
+  expect(outputConnections).toBe(1);
+  await page
+    .getByRole("button", { name: "■ Stop output", exact: true })
+    .click();
+  await expect(preview).toHaveCount(0);
+});
