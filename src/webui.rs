@@ -22,4 +22,6 @@ pub mod state;
 pub mod transfer_routes;
 pub mod transfers;
 pub mod video_preview;
+#[cfg(feature = "video")]
+pub mod video_vj;
 pub mod wire;

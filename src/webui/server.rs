@@ -78,6 +78,8 @@ impl Default for WebConfig {
 #[derive(Clone)]
 pub struct WebUiState {
     pub player: Arc<Player>,
+    #[cfg(feature = "video")]
+    pub(crate) vj: Arc<super::video_vj::VjHub>,
     /// Canonicalized path to the player config file (mtrack.yaml).
     pub config_path: PathBuf,
     /// The hub's waveform cache.
@@ -121,6 +123,8 @@ impl WebUiState {
         WebUiState {
             waveform_cache: params.player.watch_hub().waveform_cache().clone(),
             player: params.player,
+            #[cfg(feature = "video")]
+            vj: Arc::new(super::video_vj::VjHub::default()),
             config_path: canonicalize_or_keep(params.config_path),
             video_preview_permit: process_video_preview_permit(),
         }
@@ -197,7 +201,10 @@ pub async fn start(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     // Build the app router
-    let app = Router::new()
+    let video_routes = Router::new();
+    #[cfg(feature = "video")]
+    let video_routes = video_routes.merge(super::video_vj::router());
+    let app = Router::new().merge(video_routes)
         // File bytes (the id was issued under the lock policy) and the
         // asset store's reads: not behind the lock, which the gRPC services
         // enforce for themselves.
@@ -220,7 +227,7 @@ pub async fn start(
         .route(
             "/api/video/capabilities",
             get(|| async {
-                axum::Json(serde_json::json!({"video_preview": cfg!(feature = "video")}))
+                axum::Json(serde_json::json!({"video_preview": cfg!(feature = "video"), "vj": cfg!(feature = "video")}))
             }),
         )
         .route("/api/video/sources", get(|| async {

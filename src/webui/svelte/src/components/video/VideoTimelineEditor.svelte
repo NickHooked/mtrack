@@ -1,6 +1,9 @@
 <!-- Copyright (C) 2026 Michael Wilson <mike@mdwn.dev> -->
 <script lang="ts">
   import { onMount } from "svelte";
+  import { reconcileDeck } from "../../lib/video/vj";
+  import VjWorkspace from "./VjWorkspace.svelte";
+  let editorMode = $state<"timeline" | "vj">("timeline");
   import { SvelteSet } from "svelte/reactivity";
   import {
     fetchSongFiles,
@@ -81,7 +84,7 @@
         ...rootConfig,
         compounds: { ...library, [editingCompound]: definition },
       });
-    } else onchange?.(next);
+    } else onchange?.(reconcileDeck(rootConfig, next));
   }
   function openCompound(id: string | null) {
     editingCompound = id;
@@ -178,6 +181,7 @@
     publish(next);
   }
   function historyKey(event: KeyboardEvent) {
+    if (editorMode !== "timeline") return;
     if (
       !(event.ctrlKey || event.metaKey) ||
       !(event.target instanceof HTMLElement)
@@ -548,368 +552,407 @@
 
 <svelte:window onkeydown={historyKey} />
 <div class="video-editor" data-testid="video-timeline-editor">
-  {#if editingCompound}<div class="compound-navigation">
-      <button class="btn btn-sm" onclick={() => openCompound(null)}
-        >← Main timeline</button
-      ><strong>Compound · {editingCompound}</strong>
-    </div>{/if}
-  <div class="workspace">
-    <div class="source-library">
-      <div class="library-tabs" role="tablist" aria-label="Video sources">
-        <button
-          role="tab"
-          aria-selected={libraryTab === "media"}
-          onclick={() => (libraryTab = "media")}>Media files</button
-        >
-        <button
-          role="tab"
-          aria-selected={libraryTab === "live"}
-          onclick={() => (libraryTab = "live")}>Live sources</button
-        >
-        <button
-          role="tab"
-          aria-selected={libraryTab === "compounds"}
-          onclick={() => (libraryTab = "compounds")}>Compounds</button
-        >
-      </div>
-      <div hidden={libraryTab !== "compounds"} class="compound-library">
-        <input
-          aria-label="New compound name"
-          placeholder="Compound name"
-          bind:value={compoundName}
-          disabled={locked}
-        />
-        <button class="btn btn-sm" disabled={locked} onclick={createCompound}
-          >＋ New compound</button
-        >
-        {#each Object.entries(rootConfig.compounds ?? {}) as [id, compound] (id)}
-          <div class="compound-source">
-            <button
-              class="btn btn-sm"
-              disabled={locked || id === editingCompound}
-              draggable={!locked && id !== editingCompound}
-              title="Drag onto a video track or click to append."
-              ondragstart={(e) => {
-                e.dataTransfer?.setData(
-                  VIDEO_MEDIA_TYPE,
-                  `mtrack-live:${JSON.stringify({ type: "compound", id })}`,
-                );
-                if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
-              }}
-              onclick={() =>
-                placeMedia(
-                  `mtrack-live:${JSON.stringify({ type: "compound", id })}`,
-                  selected?.trackIndex ?? 0,
-                )}>{id} · {videoEnd(compound).toFixed(1)}s</button
-            ><button
-              class="btn btn-sm"
-              disabled={locked}
-              aria-label={`Edit compound ${id}`}
-              onclick={() => openCompound(id)}>Edit</button
-            >
-          </div>
-        {/each}
-      </div>
-      <div hidden={libraryTab !== "media"}>
-        <VideoMediaPool
-          files={media}
-          busy={importing}
-          {locked}
-          onimport={importMedia}
-          onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
-        />
-      </div>
-      <div hidden={libraryTab !== "live"}>
-        <VideoLiveSources
-          {locked}
-          onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
-        />
-      </div>
-    </div>
-    <div class="viewer">
-      {#key editingCompound}<VideoPreview
-          bind:this={previewControl}
-          editingClip={locked || !selected
-            ? null
-            : evaluatedClip(
-                selected.clip,
-                config.canvas,
-                Math.max(0, playhead - selected.clip.start),
-              )}
-          bind:selectedMask
-          bind:drawingMask
-          onpatch={patchComposition}
-          onposition={(ms) => (playhead = ms / 1000)}
-          {songName}
-          {config}
-          durationMs={Math.max(
-            editingCompound ? 0 : songDurationSeconds,
-            videoEnd(config),
-          ) * 1000}
-          stale={previewStale}
-          available={previewAvailable}
-          onreloaded={() => (previewStale = false)}
-        />{/key}
-    </div>
-    <aside class="inspector" aria-label="Video properties" inert={locked}>
-      {#if selected}
-        <VideoCompositionPanel
-          clip={evaluatedClip(
-            selected.clip,
-            config.canvas,
-            Math.max(0, playhead - selected.clip.start),
-          )}
-          canvas={config.canvas}
-          bind:selectedMask
-          bind:drawingMask
-          onpatch={patchComposition}
-        />
-        <VideoPropertiesPanel
-          clip={selected.clip}
-          onpatch={patchSelected}
-          ondelete={deleteSelected}
-        />
-      {/if}
-      {#if !selected}<p>Select a clip to edit its position and masks.</p>{/if}
-    </aside>
-  </div>
-  {#if importMessage}<div
-      class="import-message"
-      role="status"
-      data-testid="video-import-status"
+  <div class="editor-modes">
+    <button
+      class="btn btn-sm"
+      class:active={editorMode === "timeline"}
+      onclick={() => (editorMode = "timeline")}>Timeline</button
+    ><button
+      class="btn btn-sm"
+      class:active={editorMode === "vj"}
+      disabled={previewAvailable === false}
+      title={previewAvailable === false
+        ? "VJ output requires a build with the video feature"
+        : "Live clip launching, projection mapping and MIDI"}
+      onclick={() => {
+        openCompound(null);
+        editorMode = "vj";
+      }}>Live / VJ</button
     >
-      {importMessage}
-    </div>{/if}
-  {#if locked}<div class="import-message">
-      Unlock the player to edit the timeline.
-    </div>{/if}
-  <div class="edit-controls" inert={locked}>
-    <div class="toolbar">
-      <div>
-        <strong
-          title="Drag media onto a track. Drag clips to move them or their edges to trim. Hold Shift to bypass snapping. New clips use the imported duration when available; otherwise the manual duration (default 10s)."
-          >Video timeline</strong
-        >
-        <span class="canvas-summary"
-          >{config.canvas.width}×{config.canvas.height} · {config.canvas
-            .frame_rate} fps</span
-        >
-      </div>
-      <div class="toolbar-actions">
-        <button
-          class="btn btn-sm"
-          type="button"
-          aria-label="Undo video edit"
-          disabled={!undoStack.length}
-          onclick={undo}>↶ Undo</button
-        >
-        <button
-          class="btn btn-sm"
-          type="button"
-          aria-label="Redo video edit"
-          disabled={!redoStack.length}
-          onclick={redo}>↷ Redo</button
-        >
-        <button
-          class="btn btn-sm"
-          type="button"
-          aria-pressed={snapping}
-          onclick={() => (snapping = !snapping)}>Snap</button
-        >
-        <button
-          type="button"
-          class="btn btn-sm"
-          aria-label="Zoom out video timeline"
-          onclick={() =>
-            (pixelsPerSecond = Math.max(2, pixelsPerSecond / 1.25))}>−</button
-        >
-        <button
-          type="button"
-          class="btn btn-sm"
-          aria-label="Zoom in video timeline"
-          onclick={() =>
-            (pixelsPerSecond = Math.min(80, pixelsPerSecond * 1.25))}>+</button
-        >
-        <button
-          type="button"
-          class="btn btn-sm"
-          data-testid="video-add-track"
-          onclick={addTrack}>Add track</button
-        >
-      </div>
-    </div>
-
-    <details class="manual-placement">
-      <summary>Manual placement</summary>
-      <div class="add-panel">
-        <label class="file-control">
-          <span>File</span>
-          <input
-            type="text"
-            list="video-song-files"
-            placeholder="video.mp4"
-            data-testid="video-add-file"
-            bind:value={addFile}
-          />
-          <datalist id="video-song-files">
-            {#each files as file (file.name)}
-              <option value={file.name}></option>
-            {/each}
-          </datalist>
-        </label>
-        <label>
-          <span>Track</span>
-          <select
-            data-testid="video-add-track-select"
-            value={addTrackIndex}
-            disabled={config.tracks.length === 0}
-            onchange={(event) =>
-              (addTrackIndex = Number(event.currentTarget.value))}
+  </div>
+  {#if editorMode === "vj"}
+    {#key songName}<VjWorkspace
+        video={rootConfig}
+        {songName}
+        files={media}
+        {locked}
+        {importing}
+        onimport={importMedia}
+        onchange={(next) => onchange?.(next)}
+      />{/key}
+  {:else}
+    {#if editingCompound}<div class="compound-navigation">
+        <button class="btn btn-sm" onclick={() => openCompound(null)}
+          >← Main timeline</button
+        ><strong>Compound · {editingCompound}</strong>
+      </div>{/if}
+    <div class="workspace">
+      <div class="source-library">
+        <div class="library-tabs" role="tablist" aria-label="Video sources">
+          <button
+            role="tab"
+            aria-selected={libraryTab === "media"}
+            onclick={() => (libraryTab = "media")}>Media files</button
           >
-            {#each config.tracks as track, index (index)}
-              <option value={index}>{track.name}</option>
-            {/each}
-          </select>
-        </label>
-        <label>
-          <span>Start (s)</span>
+          <button
+            role="tab"
+            aria-selected={libraryTab === "live"}
+            onclick={() => (libraryTab = "live")}>Live sources</button
+          >
+          <button
+            role="tab"
+            aria-selected={libraryTab === "compounds"}
+            onclick={() => (libraryTab = "compounds")}>Compounds</button
+          >
+        </div>
+        <div hidden={libraryTab !== "compounds"} class="compound-library">
           <input
-            type="number"
-            min="0"
-            step="0.01"
-            data-testid="video-add-start"
-            bind:value={addStart}
+            aria-label="New compound name"
+            placeholder="Compound name"
+            bind:value={compoundName}
+            disabled={locked}
           />
-        </label>
-        <label>
-          <span>Duration (s)</span>
-          <input
-            type="number"
-            min="0.01"
-            step="0.01"
-            data-testid="video-add-duration"
-            bind:value={addDuration}
+          <button class="btn btn-sm" disabled={locked} onclick={createCompound}
+            >＋ New compound</button
+          >
+          {#each Object.entries(rootConfig.compounds ?? {}) as [id, compound] (id)}
+            <div class="compound-source">
+              <button
+                class="btn btn-sm"
+                disabled={locked || id === editingCompound}
+                draggable={!locked && id !== editingCompound}
+                title="Drag onto a video track or click to append."
+                ondragstart={(e) => {
+                  e.dataTransfer?.setData(
+                    VIDEO_MEDIA_TYPE,
+                    `mtrack-live:${JSON.stringify({ type: "compound", id })}`,
+                  );
+                  if (e.dataTransfer) e.dataTransfer.effectAllowed = "copy";
+                }}
+                onclick={() =>
+                  placeMedia(
+                    `mtrack-live:${JSON.stringify({ type: "compound", id })}`,
+                    selected?.trackIndex ?? 0,
+                  )}>{id} · {videoEnd(compound).toFixed(1)}s</button
+              ><button
+                class="btn btn-sm"
+                disabled={locked}
+                aria-label={`Edit compound ${id}`}
+                onclick={() => openCompound(id)}>Edit</button
+              >
+            </div>
+          {/each}
+        </div>
+        <div hidden={libraryTab !== "media"}>
+          <VideoMediaPool
+            files={media}
+            busy={importing}
+            {locked}
+            onimport={importMedia}
+            onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
           />
-        </label>
-        <label>
-          <span>Source in (s)</span>
-          <input
-            type="number"
-            min="0"
-            step="0.01"
-            data-testid="video-add-source-in"
-            bind:value={addSourceIn}
+        </div>
+        <div hidden={libraryTab !== "live"}>
+          <VideoLiveSources
+            {locked}
+            onadd={(file) => placeMedia(file, selected?.trackIndex ?? 0)}
           />
-        </label>
-        <button
-          type="button"
-          class="btn btn-sm btn-primary"
-          data-testid="video-add-clip"
-          onclick={addClip}>Add clip</button
-        >
+        </div>
       </div>
-    </details>
-
-    {#if displayedError}
-      <div class="video-error" data-testid="video-error" role="alert">
-        {displayedError}
+      <div class="viewer">
+        {#key editingCompound}<VideoPreview
+            bind:this={previewControl}
+            editingClip={locked || !selected
+              ? null
+              : evaluatedClip(
+                  selected.clip,
+                  config.canvas,
+                  Math.max(0, playhead - selected.clip.start),
+                )}
+            bind:selectedMask
+            bind:drawingMask
+            onpatch={patchComposition}
+            onposition={(ms) => (playhead = ms / 1000)}
+            {songName}
+            {config}
+            durationMs={Math.max(
+              editingCompound ? 0 : songDurationSeconds,
+              videoEnd(config),
+            ) * 1000}
+            stale={previewStale}
+            available={previewAvailable}
+            onreloaded={() => (previewStale = false)}
+          />{/key}
       </div>
-    {/if}
-
-    {#if config.tracks.length === 0}
-      <p class="empty">Drag media below to create your first video track.</p>
-    {:else}
-      <div class="timeline-scroll">
-        <div class="ruler-row">
-          <div class="ruler-label">Time</div>
+      <aside class="inspector" aria-label="Video properties" inert={locked}>
+        {#if selected}
+          <VideoCompositionPanel
+            clip={evaluatedClip(
+              selected.clip,
+              config.canvas,
+              Math.max(0, playhead - selected.clip.start),
+            )}
+            canvas={config.canvas}
+            bind:selectedMask
+            bind:drawingMask
+            onpatch={patchComposition}
+          />
+          <VideoPropertiesPanel
+            clip={selected.clip}
+            onpatch={patchSelected}
+            ondelete={deleteSelected}
+          />
+        {/if}
+        {#if !selected}<p>Select a clip to edit its position and masks.</p>{/if}
+      </aside>
+    </div>
+    {#if importMessage}<div
+        class="import-message"
+        role="status"
+        data-testid="video-import-status"
+      >
+        {importMessage}
+      </div>{/if}
+    {#if locked}<div class="import-message">
+        Unlock the player to edit the timeline.
+      </div>{/if}
+    <div class="edit-controls" inert={locked}>
+      <div class="toolbar">
+        <div>
+          <strong
+            title="Drag media onto a track. Drag clips to move them or their edges to trim. Hold Shift to bypass snapping. New clips use the imported duration when available; otherwise the manual duration (default 10s)."
+            >Video timeline</strong
+          >
+          <span class="canvas-summary"
+            >{config.canvas.width}×{config.canvas.height} · {config.canvas
+              .frame_rate} fps</span
+          >
+        </div>
+        <div class="toolbar-actions">
+          <button
+            class="btn btn-sm"
+            type="button"
+            aria-label="Undo video edit"
+            disabled={!undoStack.length}
+            onclick={undo}>↶ Undo</button
+          >
+          <button
+            class="btn btn-sm"
+            type="button"
+            aria-label="Redo video edit"
+            disabled={!redoStack.length}
+            onclick={redo}>↷ Redo</button
+          >
+          <button
+            class="btn btn-sm"
+            type="button"
+            aria-pressed={snapping}
+            onclick={() => (snapping = !snapping)}>Snap</button
+          >
           <button
             type="button"
-            class="ruler"
-            style:width="{timelineWidth}px"
-            aria-label="Seek video timeline"
-            onclick={(event) =>
-              previewControl?.seekTo(
-                ((event.clientX -
-                  event.currentTarget.getBoundingClientRect().left) /
-                  pixelsPerSecond) *
-                  1000,
-              )}
+            class="btn btn-sm"
+            aria-label="Zoom out video timeline"
+            onclick={() =>
+              (pixelsPerSecond = Math.max(2, pixelsPerSecond / 1.25))}>−</button
           >
-            <i
-              class="ruler-playhead"
-              style:left="{playhead * pixelsPerSecond}px"
-            ></i>
-            {#each rulerTicks as second (second)}
-              <span style:left="{second * pixelsPerSecond}px">{second}s</span>
-            {/each}
-          </button>
+          <button
+            type="button"
+            class="btn btn-sm"
+            aria-label="Zoom in video timeline"
+            onclick={() =>
+              (pixelsPerSecond = Math.min(80, pixelsPerSecond * 1.25))}
+            >+</button
+          >
+          <button
+            type="button"
+            class="btn btn-sm"
+            data-testid="video-add-track"
+            onclick={addTrack}>Add track</button
+          >
         </div>
-        {#each config.tracks as track, trackIndex (trackIndex)}
-          <VideoTrackLane
-            {track}
-            {trackIndex}
-            {pixelsPerSecond}
-            {timelineWidth}
-            timelineDuration={clipTimelineDuration}
-            {selectedClipId}
-            {snapping}
-            {playhead}
-            snapPoints={config.tracks.flatMap((item) =>
-              item.clips.flatMap((clip) => [
-                { time: clip.start, id: clip.id },
-                { time: clip.start + clip.duration, id: clip.id },
-              ]),
-            )}
-            ondropmedia={(file, start) => placeMedia(file, trackIndex, start)}
-            onmoveclip={(clip, targetIndex) =>
-              moveAcrossTracks(trackIndex, targetIndex, clip)}
-            onrename={(name) => renameTrack(trackIndex, name)}
-            onremove={() => removeTrack(trackIndex)}
-            onselectclip={(id) => {
-              error = "";
-              selectedClipId = id;
-            }}
-            oncommitclip={(clip) => commitClip(trackIndex, clip)}
-            ondeleteclip={(id) => deleteClip(trackIndex, id)}
-          />
-          <VideoTrackAutomation
-            {track}
-            canvas={config.canvas}
-            {selectedClipId}
-            {pixelsPerSecond}
-            {timelineWidth}
-            position={playhead}
-            onselectclip={(id) => (selectedClipId = id)}
-            onpatch={(clip, patch) => {
-              commitClip(trackIndex, normalizeClipPatch(clip, patch));
-              previewControl?.refreshComposition();
-            }}
-            onseek={(time) => previewControl?.seekTo(time * 1000)}
-          />
-        {/each}
       </div>
-    {/if}
 
-    <button
-      type="button"
-      class="new-track-drop"
-      data-testid="video-new-track-drop"
-      ondragover={(event) => {
-        if (event.dataTransfer?.types.includes(VIDEO_MEDIA_TYPE))
+      <details class="manual-placement">
+        <summary>Manual placement</summary>
+        <div class="add-panel">
+          <label class="file-control">
+            <span>File</span>
+            <input
+              type="text"
+              list="video-song-files"
+              placeholder="video.mp4"
+              data-testid="video-add-file"
+              bind:value={addFile}
+            />
+            <datalist id="video-song-files">
+              {#each files as file (file.name)}
+                <option value={file.name}></option>
+              {/each}
+            </datalist>
+          </label>
+          <label>
+            <span>Track</span>
+            <select
+              data-testid="video-add-track-select"
+              value={addTrackIndex}
+              disabled={config.tracks.length === 0}
+              onchange={(event) =>
+                (addTrackIndex = Number(event.currentTarget.value))}
+            >
+              {#each config.tracks as track, index (index)}
+                <option value={index}>{track.name}</option>
+              {/each}
+            </select>
+          </label>
+          <label>
+            <span>Start (s)</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              data-testid="video-add-start"
+              bind:value={addStart}
+            />
+          </label>
+          <label>
+            <span>Duration (s)</span>
+            <input
+              type="number"
+              min="0.01"
+              step="0.01"
+              data-testid="video-add-duration"
+              bind:value={addDuration}
+            />
+          </label>
+          <label>
+            <span>Source in (s)</span>
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              data-testid="video-add-source-in"
+              bind:value={addSourceIn}
+            />
+          </label>
+          <button
+            type="button"
+            class="btn btn-sm btn-primary"
+            data-testid="video-add-clip"
+            onclick={addClip}>Add clip</button
+          >
+        </div>
+      </details>
+
+      {#if displayedError}
+        <div class="video-error" data-testid="video-error" role="alert">
+          {displayedError}
+        </div>
+      {/if}
+
+      {#if config.tracks.length === 0}
+        <p class="empty">Drag media below to create your first video track.</p>
+      {:else}
+        <div class="timeline-scroll">
+          <div class="ruler-row">
+            <div class="ruler-label">Time</div>
+            <button
+              type="button"
+              class="ruler"
+              style:width="{timelineWidth}px"
+              aria-label="Seek video timeline"
+              onclick={(event) =>
+                previewControl?.seekTo(
+                  ((event.clientX -
+                    event.currentTarget.getBoundingClientRect().left) /
+                    pixelsPerSecond) *
+                    1000,
+                )}
+            >
+              <i
+                class="ruler-playhead"
+                style:left="{playhead * pixelsPerSecond}px"
+              ></i>
+              {#each rulerTicks as second (second)}
+                <span style:left="{second * pixelsPerSecond}px">{second}s</span>
+              {/each}
+            </button>
+          </div>
+          {#each config.tracks as track, trackIndex (trackIndex)}
+            <VideoTrackLane
+              {track}
+              {trackIndex}
+              {pixelsPerSecond}
+              {timelineWidth}
+              timelineDuration={clipTimelineDuration}
+              {selectedClipId}
+              {snapping}
+              {playhead}
+              snapPoints={config.tracks.flatMap((item) =>
+                item.clips.flatMap((clip) => [
+                  { time: clip.start, id: clip.id },
+                  { time: clip.start + clip.duration, id: clip.id },
+                ]),
+              )}
+              ondropmedia={(file, start) => placeMedia(file, trackIndex, start)}
+              onmoveclip={(clip, targetIndex) =>
+                moveAcrossTracks(trackIndex, targetIndex, clip)}
+              onrename={(name) => renameTrack(trackIndex, name)}
+              onremove={() => removeTrack(trackIndex)}
+              onselectclip={(id) => {
+                error = "";
+                selectedClipId = id;
+              }}
+              oncommitclip={(clip) => commitClip(trackIndex, clip)}
+              ondeleteclip={(id) => deleteClip(trackIndex, id)}
+            />
+            <VideoTrackAutomation
+              {track}
+              canvas={config.canvas}
+              {selectedClipId}
+              {pixelsPerSecond}
+              {timelineWidth}
+              position={playhead}
+              onselectclip={(id) => (selectedClipId = id)}
+              onpatch={(clip, patch) => {
+                commitClip(trackIndex, normalizeClipPatch(clip, patch));
+                previewControl?.refreshComposition();
+              }}
+              onseek={(time) => previewControl?.seekTo(time * 1000)}
+            />
+          {/each}
+        </div>
+      {/if}
+
+      <button
+        type="button"
+        class="new-track-drop"
+        data-testid="video-new-track-drop"
+        ondragover={(event) => {
+          if (event.dataTransfer?.types.includes(VIDEO_MEDIA_TYPE))
+            event.preventDefault();
+        }}
+        ondrop={(event) => {
           event.preventDefault();
-      }}
-      ondrop={(event) => {
-        event.preventDefault();
-        const file = event.dataTransfer?.getData(VIDEO_MEDIA_TYPE);
-        if (file) placeMedia(file, config.tracks.length, 0);
-      }}
-      onclick={addTrack}
-      >＋ Drop media here to create a track · or click to add an empty track</button
-    >
-  </div>
+          const file = event.dataTransfer?.getData(VIDEO_MEDIA_TYPE);
+          if (file) placeMedia(file, config.tracks.length, 0);
+        }}
+        onclick={addTrack}
+        >＋ Drop media here to create a track · or click to add an empty track</button
+      >
+    </div>
+  {/if}
 </div>
 
 <style>
+  .editor-modes {
+    display: flex;
+    gap: 8px;
+  }
+  .editor-modes .active {
+    border-color: #6ee7cc;
+    color: #9eebdb;
+  }
   .compound-navigation,
   .compound-source {
     display: flex;

@@ -1,0 +1,286 @@
+{
+  "kind": "song",
+  "name": "VJ Demo (test sources)",
+  "tracks": [],
+  "video": {
+    "canvas": {
+      "width": 640,
+      "height": 360,
+      "frame_rate": 25,
+      "background": "#000000"
+    },
+    "compounds": {
+      "Dual cameras": {
+        "canvas": {
+          "width": 640,
+          "height": 360,
+          "frame_rate": 25,
+          "background": "#000000"
+        },
+        "tracks": [
+          {
+            "name": "Camera left (test)",
+            "clips": [
+              {
+                "id": "left",
+                "start": 0,
+                "duration": 12,
+                "source_in": 0,
+                "source": {
+                  "type": "test_pattern"
+                },
+                "x": 0,
+                "y": 90,
+                "width": 320,
+                "height": 180
+              }
+            ]
+          },
+          {
+            "name": "Camera right (test)",
+            "clips": [
+              {
+                "id": "right",
+                "start": 0,
+                "duration": 12,
+                "source_in": 0,
+                "source": {
+                  "type": "test_pattern"
+                },
+                "x": 320,
+                "y": 90,
+                "width": 320,
+                "height": 180
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "tracks": [
+      {
+        "name": "Main visuals",
+        "clips": [
+          {
+            "id": "dual",
+            "source": {
+              "type": "compound",
+              "id": "Dual cameras"
+            },
+            "start": 0,
+            "duration": 12,
+            "source_in": 0
+          },
+          {
+            "id": "recorded",
+            "start": 12,
+            "duration": 8,
+            "source_in": 0,
+            "source": {
+              "type": "test_pattern"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Live detail",
+        "clips": [
+          {
+            "id": "detail",
+            "start": 0,
+            "duration": 12,
+            "source_in": 0,
+            "source": {
+              "type": "test_pattern"
+            },
+            "x": 200,
+            "y": 20,
+            "width": 240,
+            "height": 135,
+            "masks": [
+              {
+                "shape": "ellipse",
+                "x": 0,
+                "y": 0,
+                "width": 1,
+                "height": 1,
+                "feather": 15,
+                "invert": false,
+                "opacity": 1
+              }
+            ]
+          },
+          {
+            "id": "full",
+            "start": 12,
+            "duration": 12,
+            "source_in": 0,
+            "source": {
+              "type": "test_pattern"
+            }
+          }
+        ]
+      }
+    ],
+    "vj": {
+      "bpm": 120,
+      "quantize": 1,
+      "columns": 6,
+      "grid": [
+        [
+          "dual",
+          "recorded",
+          null,
+          null,
+          null,
+          null
+        ],
+        [
+          "detail",
+          "full",
+          null,
+          null,
+          null,
+          null
+        ]
+      ],
+      "layers": [
+        {
+          "opacity": 1,
+          "mute": false,
+          "solo": false,
+          "blend": "normal",
+          "crossfader": "a",
+          "brightness": 0,
+          "contrast": 1,
+          "saturation": 1,
+          "invert": 0
+        },
+        {
+          "opacity": 1,
+          "mute": false,
+          "solo": false,
+          "blend": "normal",
+          "crossfader": "b",
+          "brightness": 0,
+          "contrast": 1,
+          "saturation": 1,
+          "invert": 0
+        }
+      ],
+      "clips": {},
+      "outputs": [
+        {
+          "id": "stage-left",
+          "name": "Stage left",
+          "width": 640,
+          "height": 360,
+          "enabled": true,
+          "opacity": 1,
+          "gamma": 1,
+          "brightness": 1,
+          "flip_x": false,
+          "flip_y": false,
+          "test_pattern": false,
+          "slices": [
+            {
+              "id": "slice-1",
+              "name": "Stage surface",
+              "source": {
+                "type": "composition"
+              },
+              "input": {
+                "x": 0,
+                "y": 0,
+                "width": 1,
+                "height": 1
+              },
+              "corners": [
+                {
+                  "x": 0.06,
+                  "y": 0.08
+                },
+                {
+                  "x": 0.94,
+                  "y": 0.03
+                },
+                {
+                  "x": 0.99,
+                  "y": 0.94
+                },
+                {
+                  "x": 0.02,
+                  "y": 0.91
+                }
+              ],
+              "feather": [
+                0.12,
+                0,
+                0.12,
+                0
+              ],
+              "opacity": 1,
+              "enabled": true
+            }
+          ]
+        },
+        {
+          "id": "stage-right",
+          "name": "Stage right",
+          "width": 640,
+          "height": 360,
+          "enabled": true,
+          "opacity": 1,
+          "gamma": 1,
+          "brightness": 1,
+          "flip_x": false,
+          "flip_y": false,
+          "test_pattern": false,
+          "slices": [
+            {
+              "id": "slice-1",
+              "name": "Stage surface",
+              "source": {
+                "type": "layer",
+                "index": 1
+              },
+              "input": {
+                "x": 0,
+                "y": 0,
+                "width": 1,
+                "height": 1
+              },
+              "corners": [
+                {
+                  "x": 0.06,
+                  "y": 0.08
+                },
+                {
+                  "x": 0.94,
+                  "y": 0.03
+                },
+                {
+                  "x": 0.99,
+                  "y": 0.94
+                },
+                {
+                  "x": 0.02,
+                  "y": 0.91
+                }
+              ],
+              "feather": [
+                0.12,
+                0,
+                0.12,
+                0
+              ],
+              "opacity": 1,
+              "enabled": true
+            }
+          ]
+        }
+      ],
+      "midi": []
+    }
+  }
+}

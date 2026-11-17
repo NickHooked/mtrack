@@ -7,6 +7,7 @@
 //! Optional, worker-threaded GStreamer file-video output.
 
 mod compound;
+pub(crate) mod vj;
 
 use std::{
     path::{Path, PathBuf},

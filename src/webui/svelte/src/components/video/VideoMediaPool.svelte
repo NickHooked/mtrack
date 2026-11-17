@@ -5,6 +5,8 @@
     files: string[];
     busy?: boolean;
     locked?: boolean;
+    placementHint?: string;
+    disabledMessage?: string;
     onimport: (files: File[]) => void;
     onadd: (file: string) => void;
   }
@@ -12,6 +14,8 @@
     files,
     busy = false,
     locked = false,
+    placementHint = "Drag to a track or click to append",
+    disabledMessage = "Unlock to import media",
     onimport,
     onadd,
   }: Props = $props();
@@ -26,7 +30,7 @@
   }
 </script>
 
-<section class="media-pool" aria-label="Video media pool">
+<section class="media-pool" aria-label="Video media pool" title={placementHint}>
   <header><strong>Media pool</strong><span>{files.length} files</span></header>
   <input
     class="search"
@@ -55,7 +59,7 @@
     }}
   >
     {busy ? "Importing…" : "＋ Import videos"}
-    <small>{locked ? "Unlock to import media" : "or drop files here"}</small>
+    <small>{locked ? disabledMessage : "or drop files here"}</small>
   </button>
   <input
     bind:this={input}
@@ -78,7 +82,7 @@
         disabled={locked}
         data-testid="video-media-item"
         data-file={file}
-        title={`Drag ${file} to a track, or click to append`}
+        title={`${file} · ${placementHint}`}
         ondragstart={(event) => {
           if (event.dataTransfer) {
             event.dataTransfer.setData(VIDEO_MEDIA_TYPE, file);
@@ -96,9 +100,6 @@
       <p>{query ? "No matching videos." : "Import a video to get started."}</p>
     {/each}
   </div>
-  <footer>
-    Drag to a track · Click to append<br />Files stay in this song’s folder.
-  </footer>
 </section>
 
 <style>
@@ -119,7 +120,6 @@
     font-size: 13px;
   }
   header span,
-  footer,
   p {
     font-size: 11px;
     color: var(--nc-fg-3);
@@ -197,9 +197,5 @@
   button:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-  footer {
-    line-height: 1.6;
-    margin-top: auto;
   }
 </style>

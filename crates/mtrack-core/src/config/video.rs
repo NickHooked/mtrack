@@ -15,6 +15,7 @@ use std::{collections::HashSet, path::Path};
 
 use serde::{Deserialize, Serialize};
 pub mod automation;
+pub mod vj;
 use automation::Automation;
 
 /// Timeline comparisons tolerate one nanosecond so ordinary decimal seconds
@@ -39,6 +40,9 @@ pub const MAX_VIDEO_CLIPS: usize = 512;
 /// A song's linear video timeline.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct VideoConfig {
+    /// Live performance deck and independently mapped output canvases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vj: Option<vj::VjConfig>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     compounds: std::collections::BTreeMap<String, VideoConfig>,
     /// Output canvas shared by every video track.
@@ -50,6 +54,9 @@ pub struct VideoConfig {
 }
 
 impl VideoConfig {
+    pub fn vj(&self) -> Option<&vj::VjConfig> {
+        self.vj.as_ref()
+    }
     pub fn compounds(&self) -> &std::collections::BTreeMap<String, VideoConfig> {
         &self.compounds
     }
@@ -67,10 +74,18 @@ impl VideoConfig {
     }
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = self.validate_timeline().err().unwrap_or_default();
+        if let Some(vj) = &self.vj {
+            errors.extend(vj.validate(self));
+        }
         if self.compounds.len() > 32 || self.all_clips().count() > MAX_VIDEO_CLIPS {
             errors.push("compound library exceeds 32 sources or 512 total clips".into());
         }
         for (id, c) in &self.compounds {
+            if c.vj.is_some() {
+                errors.push(format!(
+                    "compound {id}: VJ settings belong on the main composition"
+                ));
+            }
             if id.trim().is_empty() || id.len() > 128 || !c.compounds.is_empty() {
                 errors.push("compound ids must be nonempty, at most 128 bytes; definitions belong in the root library".into());
             }

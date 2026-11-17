@@ -51,6 +51,7 @@ export interface VideoTrack {
 }
 
 export interface VideoConfig {
+  vj?: import("./vj").VjConfig;
   compounds?: Record<string, VideoConfig>;
   canvas: VideoCanvas;
   tracks: VideoTrack[];

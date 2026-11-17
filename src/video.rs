@@ -15,6 +15,8 @@ pub mod gstreamer;
 #[cfg(feature = "video")]
 pub(crate) mod media_binding;
 #[cfg(feature = "video")]
+pub(crate) use engine::vj;
+#[cfg(feature = "video")]
 pub use engine::*;
 
 #[cfg(feature = "video")]

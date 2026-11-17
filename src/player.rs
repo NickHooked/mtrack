@@ -272,6 +272,9 @@ impl LightingVenueStatus {
 /// Plays back individual wav files as multichannel audio for the configured audio interface.
 #[derive(Clone)]
 pub struct Player {
+    /// Non-blocking copy of host MIDI input for live-video control/learn.
+    #[cfg(feature = "video")]
+    video_midi: tokio::sync::broadcast::Sender<Vec<u8>>,
     /// All hardware device state, behind a lock so it can be atomically swapped on reload.
     hardware: Arc<parking_lot::RwLock<HardwareState>>,
     /// Base path for resolving sample/DMX config files. None in test paths.
@@ -720,6 +723,8 @@ impl Player {
         };
 
         Ok(Player {
+            #[cfg(feature = "video")]
+            video_midi: tokio::sync::broadcast::channel(256).0,
             hardware: Arc::new(parking_lot::RwLock::new(hw)),
             base_path: base_path.map(Path::to_path_buf),
             playlists: Arc::new(parking_lot::RwLock::new(playlists)),
@@ -816,7 +821,16 @@ impl Player {
     /// Processes a MIDI event for triggered samples.
     /// This should be called by the MIDI controller when events are received.
     /// Uses std::sync::RwLock for minimal latency (no async overhead).
+    #[cfg(feature = "video")]
+    pub(crate) fn video_midi_input(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
+        self.video_midi.subscribe()
+    }
+
     pub fn process_sample_trigger(&self, raw_event: &[u8]) {
+        #[cfg(feature = "video")]
+        if mtrack_core::video::vj::MidiInput::parse(raw_event).is_some() {
+            let _ = self.video_midi.send(raw_event.to_vec());
+        }
         let sample_engine = self.hardware.read().sample_engine.clone();
         if let Some(ref sample_engine) = sample_engine {
             let engine = sample_engine.read();

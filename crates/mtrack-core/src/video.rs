@@ -6,4 +6,6 @@
 
 //! Pure video timeline model and optional GStreamer backend.
 
+pub mod mapping;
 pub mod timeline;
+pub mod vj;

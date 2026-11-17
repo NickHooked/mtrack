@@ -1,3 +1,4 @@
+import { deckConfig, vjConfigError } from "./vj";
 import { automationError, trimAutomation } from "./automation.svelte";
 // Copyright (C) 2026 Michael Wilson <mike@mdwn.dev>
 //
@@ -63,7 +64,10 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
     return id;
   }
 
-  return {
+  const parsed: VideoConfig = {
+    ...(raw.vj && typeof raw.vj === "object"
+      ? { vj: raw.vj as import("./vj").VjConfig }
+      : {}),
     ...(raw.compounds && typeof raw.compounds === "object"
       ? {
           compounds: Object.fromEntries(
@@ -150,6 +154,8 @@ export function parseVideoConfig(value: unknown): VideoConfig | null {
       };
     }),
   };
+  if (parsed.vj) parsed.vj = deckConfig(parsed);
+  return parsed;
 }
 
 export function createVideoConfig(): VideoConfig {
@@ -168,6 +174,8 @@ function isSafeRelativePath(value: string): boolean {
 }
 
 export function videoConfigError(config: VideoConfig): string | null {
+  const deckError = vjConfigError(config);
+  if (deckError) return deckError;
   const library = config.compounds ?? {};
   if (Object.keys(library).length > 32)
     return "At most 32 compound sources are supported.";

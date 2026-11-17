@@ -5,6 +5,9 @@ use std::collections::{HashMap, HashSet};
 pub(super) struct CompoundRenderer {
     files: HashMap<String, ClipDecoder>,
     used: HashSet<String>,
+    positions: HashMap<String, Duration>,
+    decoded_positions: HashMap<String, Duration>,
+    frames: HashMap<String, Vec<u8>>,
     masks: HashMap<String, (String, Vec<u8>)>,
 }
 impl CompoundRenderer {
@@ -14,6 +17,10 @@ impl CompoundRenderer {
     pub fn end_frame(&mut self) {
         self.files.retain(|key, _| self.used.contains(key));
         self.masks.retain(|key, _| self.used.contains(key));
+        self.positions.retain(|key, _| self.used.contains(key));
+        self.decoded_positions
+            .retain(|key, _| self.used.contains(key));
+        self.frames.retain(|key, _| self.used.contains(key));
     }
     #[allow(clippy::too_many_arguments)]
     pub fn render(
@@ -29,10 +36,44 @@ impl CompoundRenderer {
         live_decoders: &mut HashMap<String, ClipDecoder>,
         live_frames: &mut HashMap<String, Vec<u8>>,
     ) -> Result<DecoderPoll<Vec<u8>>, VideoError> {
-        let config = &request.config.compounds()[id];
-        let timeline = &request.timeline.compounds()[id];
+        self.render_scope(
+            Some(id),
+            None,
+            instance,
+            position,
+            request,
+            width,
+            height,
+            fps_n,
+            fps_d,
+            live_decoders,
+            live_frames,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_scope(
+        &mut self,
+        scope: Option<&str>,
+        layer: Option<usize>,
+        instance: &str,
+        position: Duration,
+        request: &WorkerRequest,
+        width: u32,
+        height: u32,
+        fps_n: i32,
+        fps_d: i32,
+        live_decoders: &mut HashMap<String, ClipDecoder>,
+        live_frames: &mut HashMap<String, Vec<u8>>,
+    ) -> Result<DecoderPoll<Vec<u8>>, VideoError> {
+        let config = scope.map_or(&request.config, |id| &request.config.compounds()[id]);
+        let timeline = scope.map_or(&request.timeline, |id| &request.timeline.compounds()[id]);
+        let id = scope.unwrap_or("");
         let mut output = vec![0; width as usize * height as usize * 4];
-        for original in timeline.active_clips_at(position) {
+        for original in timeline
+            .active_clips_at(position)
+            .into_iter()
+            .filter(|c| layer.is_none_or(|i| c.z_order() == i))
+        {
             if request.cancel.load(Ordering::Acquire) {
                 return Ok(DecoderPoll::Cancelled);
             }
@@ -101,6 +142,23 @@ impl CompoundRenderer {
                 }
                 live_frames[&source_key].clone()
             } else {
+                // Real-time deck transport may loop, retrigger, freeze or skip frames.
+                // Compare against decoded media time, not the last requested time:
+                // small frame overruns otherwise accumulate unnoticed forever.
+                let frame_period = Duration::from_secs_f64(f64::from(fps_d) / f64::from(fps_n));
+                let backwards = self
+                    .positions
+                    .get(&key)
+                    .is_some_and(|last| position < *last);
+                let drifted = self.decoded_positions.get(&key).is_some_and(|decoded| {
+                    position.saturating_sub(*decoded).as_secs_f64()
+                        > 1.8 * frame_period.as_secs_f64()
+                });
+                if backwards || drifted {
+                    self.files.remove(&key);
+                    self.frames.remove(&key);
+                    self.decoded_positions.remove(&key);
+                }
                 if !self.files.contains_key(&key) {
                     match ClipDecoder::open(
                         configured,
@@ -119,14 +177,26 @@ impl CompoundRenderer {
                         DecoderPoll::Cancelled => return Ok(DecoderPoll::Cancelled),
                     }
                 }
-                match self
-                    .files
-                    .get_mut(&key)
-                    .unwrap()
-                    .next_frame(&request.cancel)?
-                {
-                    DecoderPoll::Ready(frame) => frame.unwrap_or_else(|| vec![0; output.len()]),
-                    DecoderPoll::Cancelled => return Ok(DecoderPoll::Cancelled),
+                if self.positions.get(&key) == Some(&position) && self.frames.contains_key(&key) {
+                    self.frames[&key].clone()
+                } else {
+                    let frame = match self
+                        .files
+                        .get_mut(&key)
+                        .unwrap()
+                        .next_frame(&request.cancel)?
+                    {
+                        DecoderPoll::Ready(frame) => frame.unwrap_or_else(|| vec![0; output.len()]),
+                        DecoderPoll::Cancelled => return Ok(DecoderPoll::Cancelled),
+                    };
+                    let decoded_position = self
+                        .decoded_positions
+                        .get(&key)
+                        .map_or(position, |last| last.saturating_add(frame_period));
+                    self.decoded_positions.insert(key.clone(), decoded_position);
+                    self.positions.insert(key.clone(), position);
+                    self.frames.insert(key.clone(), frame.clone());
+                    frame
                 }
             };
             let cw = clip.width().unwrap_or(config.canvas().width());
