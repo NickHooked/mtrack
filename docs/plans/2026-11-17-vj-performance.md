@@ -68,3 +68,11 @@ Official references: [clips](https://resolume.com/support/en/clips),
    when it falls behind. A real lossless red/blue video fixture now verifies
    the correct frame after a sequence of small overruns; all 79 backend video
    tests pass with this regression included.
+9. Final native integration run: 31/31 passed. Release build completed and the
+   real browser demo rendered two 640×360 warped/feathered outputs with a dual
+   test-camera compound plus a masked live layer at roughly 20–21 fps on this
+   host (configured 25 fps). Confirmed recorded-video launching, isolated-layer
+   output and blackout clearing both independent viewer windows. Hardware was
+   not attached. During screenshot review, SVG frame replacement visibly
+   flickered; use a separate HTML image under the mapping handles so the browser
+   retains the previous decoded frame while loading the next.

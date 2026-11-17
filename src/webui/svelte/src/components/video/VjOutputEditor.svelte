@@ -254,6 +254,7 @@
       class="mapping-preview"
       style:aspect-ratio={`${output.width}/${output.height}`}
     >
+      {#if imageUrl}<img src={imageUrl} alt="Mapped output preview" />{/if}
       <svg
         viewBox="0 0 1000 1000"
         preserveAspectRatio="none"
@@ -273,12 +274,10 @@
             /></pattern
           ></defs
         >
-        <rect width="1000" height="1000" fill="url(#vj-map-grid)" />
-        {#if imageUrl}<image
-            href={imageUrl}
+        {#if !imageUrl}<rect
             width="1000"
             height="1000"
-            preserveAspectRatio="none"
+            fill="url(#vj-map-grid)"
           />{/if}
         {#each output.slices as s (s.id)}<polygon
             points={(s.id === slice?.id && draft ? draft : s.corners)
@@ -602,11 +601,21 @@
     gap: 8px;
   }
   .mapping-preview {
+    position: relative;
     background: #070b11;
     border: 1px solid #384b63;
     overflow: hidden;
   }
+  .mapping-preview img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: fill;
+    pointer-events: none;
+  }
   .mapping-preview svg {
+    position: relative;
     display: block;
     width: 100%;
     height: 100%;

@@ -69,6 +69,11 @@ and capture hardware still require testing on the intended rig. CPU rendering
 and encoding cost scale with resolution, layers and slices; use the live FPS
 indicator to size the show. Compositions support 1–60 fps, 4096-pixel output
 edges, 16 megapixels across output canvases and 64 megapixels of layer frames.
+The development machine reached roughly 20–21 fps with two mapped 640×360
+canvases, a two-camera test-pattern compound and a masked live layer. This was
+below the configured 25 fps; higher resolutions and file decoding can reduce
+throughput further. This is a functional first version, not a guaranteed
+real-time multi-projector performance target.
 
 ## MIDI
 
